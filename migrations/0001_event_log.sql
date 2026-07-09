@@ -1,7 +1,7 @@
 -- The event log: the spine every subsystem consumes
 -- (design: ADR-003, as amended by red-team findings F-1/F-4/F-11).
 --
--- Two constraints this schema exists to enforce:
+-- Constraints this schema enforces:
 --   1. txid gates consumption (F-1): identity ids are assigned at insert but
 --      commit in arbitrary order; a consumer that reads past an uncommitted
 --      lower id loses that event forever. Readers must bound scans by the
@@ -10,9 +10,15 @@
 --      REFERENCES to content revisions (+ content_hash) — never the only copy
 --      of user content. Erasure/retention purge deletes the referenced
 --      revisions without touching log ordering or hash-chain validity.
+--   3. Partitioned by id range: retention/compaction (ADR-003 E6) is a
+--      partition drop, not a DELETE. id correlates with time, so ranges map
+--      to time windows. A maintenance job pre-creates partitions; the DEFAULT
+--      partition guarantees inserts never fail if the job lags.
+
+CREATE SEQUENCE event_log_id_seq;
 
 CREATE TABLE event_log (
-    id            BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    id            BIGINT NOT NULL DEFAULT nextval('event_log_id_seq'),
     txid          XID8 NOT NULL DEFAULT pg_current_xact_id(),
     org_id        BIGINT NOT NULL,
     -- NULL for org-scoped entities: DMs, org-level channels (CC-OQ1).
@@ -30,8 +36,13 @@ CREATE TABLE event_log (
     recorded_at   TIMESTAMPTZ NOT NULL DEFAULT now(),
     -- Provenance, ALWAYS stamped by the receiver, never trusted from the
     -- wire (F-11).
-    origin        JSONB
-);
+    origin        JSONB,
+    PRIMARY KEY (id)
+) PARTITION BY RANGE (id);
+
+CREATE TABLE event_log_p1 PARTITION OF event_log
+    FOR VALUES FROM (1) TO (10000000);
+CREATE TABLE event_log_default PARTITION OF event_log DEFAULT;
 
 CREATE INDEX event_log_org_consume_idx ON event_log (org_id, id);
 
