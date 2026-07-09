@@ -36,6 +36,10 @@ internal/
 - `transport → domain → platform`. Never sideways at the store level: a module
   may not touch another module's tables; cross-module reads go through the
   other module's service API, cross-module reactions go through the event log.
+- **The cell invariant (SCHEMA.md scale contract): no cross-org global state,
+  sequences, transactions, or coordination — ever.** Capacity scales by adding
+  cells; any feature needing cross-org anything uses projection (ADR-004
+  style) or the routing directory, never shared state.
 - Table ownership is written in each module's doc.go and mirrors SCHEMA.md.
 - A module = `service.go` (exported API, takes ctx + domain types),
   `store.go` (all SQL — pgx directly, no ORM), `types.go`, `*_test.go`
