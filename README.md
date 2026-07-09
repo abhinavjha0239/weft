@@ -71,4 +71,5 @@ commit/PR title `messaging: Add thread endpoints.` → REALITY.md row
 malformed branch names and PR titles and fails any PR that touches
 `internal/` without updating `docs/REALITY.md`; `dev` is branch-protected
 (required checks: `test` + `conventions`, admins included, no force pushes);
-merges are auto-merge-on-green; merged branches auto-delete.
+merges are auto-merge-on-green. **Branches are never deleted** — the branch
+list is part of the permanent history trail.
