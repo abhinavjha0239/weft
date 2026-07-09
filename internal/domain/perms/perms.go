@@ -1,0 +1,219 @@
+// Package perms is the permission resolver (ADR-006, red-team F-16): every
+// permission is (verb, scope) → group; groups nest; membership resolves
+// through the flattened user_group_closure so the hot-path check is ONE
+// indexed statement, never a recursive query.
+//
+// Resolution: the MOST SPECIFIC scope with an assignment for the verb wins
+// (item > space/channel > workspace > org); if no scope in the chain has an
+// assignment, the answer is DENY (secure default — bootstrap seeds org
+// defaults so normal orgs never hit it).
+//
+// Owns tables: user_group, user_group_member, user_group_subgroup,
+// user_group_closure, permission_assignment, permission_profile*.
+package perms
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/platform/apperr"
+)
+
+type Service struct {
+	pool *pgxpool.Pool
+}
+
+func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+
+// ScopeType mirrors permission_assignment.scope_type.
+type ScopeType int16
+
+const (
+	ScopeOrg       ScopeType = 1
+	ScopeWorkspace ScopeType = 2
+	ScopeChannel   ScopeType = 3
+	ScopeSpace     ScopeType = 4
+	ScopeItem      ScopeType = 5
+)
+
+// ChannelScope builds the scope chain for a channel by resolving its
+// containers; org-level channels (NULL workspace) skip the workspace hop.
+func (s *Service) ChannelScope(ctx context.Context, tx pgx.Tx, orgID, channelID int64) ([]scopeRef, error) {
+	var workspaceID *int64
+	err := tx.QueryRow(ctx,
+		`SELECT workspace_id FROM channel WHERE id = $1 AND org_id = $2`,
+		channelID, orgID).Scan(&workspaceID)
+	if err != nil {
+		return nil, apperr.NotFound("channel not found")
+	}
+	chain := []scopeRef{{ScopeChannel, channelID}}
+	if workspaceID != nil {
+		chain = append(chain, scopeRef{ScopeWorkspace, *workspaceID})
+	}
+	return append(chain, scopeRef{ScopeOrg, orgID}), nil
+}
+
+// OrgScope is the trivial chain.
+func OrgScope(orgID int64) []scopeRef { return []scopeRef{{ScopeOrg, orgID}} }
+
+type scopeRef struct {
+	Type ScopeType
+	ID   int64
+}
+
+// Require answers "may actor do verb here" inside the caller's transaction
+// (same snapshot as the write it guards). CC-6 hook: capability grants for
+// agent principals intersect here when the automation milestone lands.
+func (s *Service) Require(ctx context.Context, tx pgx.Tx, actor auth.Identity, verb string, chain []scopeRef) error {
+	if len(chain) == 0 {
+		return apperr.Forbidden("no scope")
+	}
+	// One statement: find the most specific assignment for the verb in the
+	// chain, then test closure membership of exactly that assignment's group.
+	types := make([]int16, len(chain))
+	ids := make([]int64, len(chain))
+	for i, sc := range chain {
+		types[i] = int16(sc.Type)
+		ids[i] = sc.ID
+	}
+	var allowed bool
+	err := tx.QueryRow(ctx, `
+		WITH chain AS (
+		  SELECT unnest($3::smallint[]) AS scope_type, unnest($4::bigint[]) AS scope_id
+		),
+		best AS (
+		  SELECT pa.group_id
+		  FROM permission_assignment pa
+		  JOIN chain c ON c.scope_type = pa.scope_type AND c.scope_id = pa.scope_id
+		  WHERE pa.org_id = $1 AND pa.verb = $2
+		  ORDER BY pa.scope_type DESC
+		  LIMIT 1
+		)
+		SELECT EXISTS (
+		  SELECT 1 FROM best b
+		  JOIN user_group_closure gc ON gc.group_id = b.group_id AND gc.user_id = $5
+		)`,
+		actor.OrgID, verb, types, ids, actor.UserID).Scan(&allowed)
+	if err != nil {
+		return apperr.Internal("permission check", err)
+	}
+	if !allowed {
+		return apperr.Forbidden("missing permission: " + verb)
+	}
+	return nil
+}
+
+// SeedOrg creates the system role groups (nested), places the owner, seeds
+// default org-scope assignments, and builds the closure. Runs in the
+// bootstrap transaction.
+func (s *Service) SeedOrg(ctx context.Context, tx pgx.Tx, orgID, ownerUserID int64) error {
+	names := []string{GroupEveryone, GroupMembers, GroupModerators, GroupAdmins, GroupOwners}
+	ids := map[string]int64{}
+	for _, n := range names {
+		var id int64
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO user_group (org_id, name, is_system) VALUES ($1, $2, true)
+			RETURNING id`, orgID, n).Scan(&id); err != nil {
+			return apperr.Internal("create system group", err)
+		}
+		ids[n] = id
+	}
+	// owners ⊂ admins ⊂ moderators ⊂ members ⊂ everyone
+	nesting := [][2]string{
+		{GroupAdmins, GroupOwners}, {GroupModerators, GroupAdmins},
+		{GroupMembers, GroupModerators}, {GroupEveryone, GroupMembers},
+	}
+	for _, n := range nesting {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO user_group_subgroup (group_id, subgroup_id) VALUES ($1, $2)`,
+			ids[n[0]], ids[n[1]]); err != nil {
+			return apperr.Internal("nest system groups", err)
+		}
+	}
+	if _, err := tx.Exec(ctx,
+		`INSERT INTO user_group_member (group_id, user_id) VALUES ($1, $2)`,
+		ids[GroupOwners], ownerUserID); err != nil {
+		return apperr.Internal("add owner", err)
+	}
+	for verb, group := range defaultAssignments {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO permission_assignment (org_id, verb, scope_type, scope_id, group_id)
+			VALUES ($1, $2, $3, $4, $5)`,
+			orgID, verb, ScopeOrg, orgID, ids[group]); err != nil {
+			return apperr.Internal("seed assignment", err)
+		}
+	}
+	return s.RebuildClosure(ctx, tx, orgID)
+}
+
+// AddUserToGroup adds membership and maintains the closure.
+func (s *Service) AddUserToGroup(ctx context.Context, tx pgx.Tx, orgID, groupID, userID int64) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO user_group_member (group_id, user_id) VALUES ($1, $2)
+		ON CONFLICT DO NOTHING`, groupID, userID); err != nil {
+		return apperr.Internal("add group member", err)
+	}
+	return s.RebuildClosure(ctx, tx, orgID)
+}
+
+// RebuildClosure recomputes the org's flattened closure with a recursive CTE.
+//
+// Scale note (docs/SCHEMA.md contract): a full-org rebuild on every group
+// edit is the accepted first tier — correct and simple. The scale-tier
+// replacement (incremental delta maintenance, or async rebuild behind a
+// version fence) keeps this exact table and call site.
+func (s *Service) RebuildClosure(ctx context.Context, tx pgx.Tx, orgID int64) error {
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM user_group_closure gc
+		USING user_group g
+		WHERE gc.group_id = g.id AND g.org_id = $1`, orgID); err != nil {
+		return apperr.Internal("clear closure", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH RECURSIVE reach (group_id, via_group) AS (
+		  SELECT id, id FROM user_group WHERE org_id = $1
+		  UNION
+		  SELECT r.group_id, s.subgroup_id
+		  FROM reach r
+		  JOIN user_group_subgroup s ON s.group_id = r.via_group
+		)
+		INSERT INTO user_group_closure (group_id, user_id)
+		SELECT DISTINCT r.group_id, m.user_id
+		FROM reach r
+		JOIN user_group_member m ON m.group_id = r.via_group`, orgID); err != nil {
+		return apperr.Internal("rebuild closure", err)
+	}
+	return nil
+}
+
+// SystemGroupID looks up a seeded role group.
+func (s *Service) SystemGroupID(ctx context.Context, tx pgx.Tx, orgID int64, name string) (int64, error) {
+	var id int64
+	if err := tx.QueryRow(ctx,
+		`SELECT id FROM user_group WHERE org_id = $1 AND name = $2`,
+		orgID, name).Scan(&id); err != nil {
+		return 0, apperr.Internal(fmt.Sprintf("lookup group %s", name), err)
+	}
+	return id, nil
+}
+
+// Assign sets (verb, scope) → group, replacing any existing assignment.
+func (s *Service) Assign(ctx context.Context, tx pgx.Tx, orgID int64, verb string, scope scopeRef, groupID int64) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO permission_assignment (org_id, verb, scope_type, scope_id, group_id)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (org_id, verb, scope_type, scope_id)
+		DO UPDATE SET group_id = EXCLUDED.group_id`,
+		orgID, verb, scope.Type, scope.ID, groupID); err != nil {
+		return apperr.Internal("assign permission", err)
+	}
+	return nil
+}
+
+// ChannelRef and OrgRef build scope refs for Assign callers.
+func ChannelRef(id int64) scopeRef { return scopeRef{ScopeChannel, id} }
+func OrgRef(id int64) scopeRef     { return scopeRef{ScopeOrg, id} }

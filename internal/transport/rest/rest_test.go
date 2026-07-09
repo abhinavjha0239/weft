@@ -20,6 +20,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
 
@@ -47,8 +48,8 @@ func TestMessageEndToEnd(t *testing.T) {
 	go hub.Run(ctx)
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
-		Identity:  identity.New(pool),
-		Messaging: messaging.New(pool),
+		Identity:  identity.New(pool, perms.New(pool)),
+		Messaging: messaging.New(pool, perms.New(pool)),
 	}))
 	defer ts.Close()
 
@@ -235,7 +236,7 @@ func TestAuthRateLimit(t *testing.T) {
 	hub := gateway.NewHub(pool, slog.Default())
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
-		Identity: identity.New(pool), Messaging: messaging.New(pool),
+		Identity: identity.New(pool, perms.New(pool)), Messaging: messaging.New(pool, perms.New(pool)),
 	}))
 	defer ts.Close()
 
@@ -280,7 +281,7 @@ func TestErrorTaxonomy(t *testing.T) {
 	hub := gateway.NewHub(pool, slog.Default())
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
-		Identity: identity.New(pool), Messaging: messaging.New(pool),
+		Identity: identity.New(pool, perms.New(pool)), Messaging: messaging.New(pool, perms.New(pool)),
 	}))
 	defer ts.Close()
 

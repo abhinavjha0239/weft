@@ -11,16 +11,20 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	perms *perms.Service
 }
 
-func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func New(pool *pgxpool.Pool, p *perms.Service) *Service {
+	return &Service{pool: pool, perms: p}
+}
 
 type BootstrapParams struct {
 	OrgName  string
@@ -82,6 +86,10 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 			`INSERT INTO membership (user_id, workspace_id, role) VALUES ($1, $2, 10)`,
 			out.UserID, out.WorkspaceID); err != nil {
 			return apperr.Internal("create membership", err)
+		}
+		// System role groups + default verb assignments + closure (ADR-006).
+		if err := s.perms.SeedOrg(ctx, tx, out.OrgID, out.UserID); err != nil {
+			return err
 		}
 		var rootThreadID int64
 		if err := tx.QueryRow(ctx, `
