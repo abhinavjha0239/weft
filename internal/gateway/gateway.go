@@ -20,6 +20,7 @@ import (
 
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"golang.org/x/time/rate"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 )
@@ -46,11 +47,19 @@ type client struct {
 	// Channel-membership view for ACL filtering; refreshed when a membership
 	// event for this user arrives (F-2 replay rule, M0 slice).
 	channels map[int64]bool
+	// Inbound signal-frame budget (typing storms, abuse).
+	frameLimit *rate.Limiter
+	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
+	writeMu sync.Mutex
 }
 
 type Hub struct {
 	pool *pgxpool.Pool
 	log  *slog.Logger
+
+	// Durable read-state dependency for the read_marker signal; optional
+	// (nil = signal ignored), set via SetMarkReader at wiring time.
+	markReader MarkReader
 
 	mu    sync.Mutex
 	conns map[int64]map[*client]struct{} // orgID → clients
@@ -59,6 +68,10 @@ type Hub struct {
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
 	return &Hub{pool: pool, log: log, conns: map[int64]map[*client]struct{}{}}
 }
+
+// SetMarkReader wires the durable read-state service (rest layer adapts
+// auth.Identity ↔ Actor).
+func (h *Hub) SetMarkReader(m MarkReader) { h.markReader = m }
 
 // Run is the dispatcher: LISTEN on the event-log channel and wake that org's
 // connections; a slow sweep covers missed notifications. Blocks until ctx ends.
@@ -131,26 +144,20 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	if err != nil {
 		return
 	}
-	c := &client{conn: ws, id: id, lastID: lastID, wake: make(chan struct{}, 1)}
+	c := &client{conn: ws, id: id, lastID: lastID,
+		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter()}
 
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
-	// The client never sends application frames (writes are REST, ADR-002 P3),
-	// but reading is how we learn about disconnects promptly instead of at the
-	// next checkpoint write.
-	go func() {
-		for {
-			if _, _, err := ws.Read(ctx); err != nil {
-				cancel()
-				return
-			}
-		}
-	}()
+
+	// Setup order matters (fixes a startup race): load the membership view and
+	// register the connection BEFORE reading any client frame, so the sender's
+	// own ACL view is populated and the connection is discoverable as a
+	// fan-out target. Only then start the reader and announce `ready`.
 	if err := c.loadChannels(ctx, h.pool); err != nil {
 		ws.Close(websocket.StatusInternalError, "membership load failed")
 		return
 	}
-
 	h.mu.Lock()
 	if h.conns[id.OrgID] == nil {
 		h.conns[id.OrgID] = map[*client]struct{}{}
@@ -166,6 +173,28 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		h.mu.Unlock()
 		ws.CloseNow()
 	}()
+
+	// The reader goroutine serves two jobs: prompt disconnect detection, and
+	// the ephemeral signal plane (typing, read_marker — ADR-002 P5). Durable
+	// writes remain REST (P3).
+	go func() {
+		for {
+			_, data, err := ws.Read(ctx)
+			if err != nil {
+				cancel()
+				return
+			}
+			if len(data) > 0 {
+				h.handleClientFrame(ctx, c, data)
+			}
+		}
+	}()
+
+	// `ready` (ADR-002 P4 hello): the connection is registered and its ACL
+	// view is loaded — clients wait for this before sending signal frames.
+	if err := h.send(ctx, c, Envelope{Type: "ready", OrgID: id.OrgID}); err != nil {
+		return
+	}
 
 	// Immediate pump serves the resume gap before any live traffic.
 	c.wake <- struct{}{}
@@ -287,12 +316,19 @@ func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
 	return rows.Err()
 }
 
-func (h *Hub) send(ctx context.Context, c *client, e Envelope) error {
+// send serializes writes per connection: coder/websocket forbids concurrent
+// Write on one conn, and a client is written to from several goroutines (its
+// pump, its reader's signal replies, and other connections' ephemeral
+// fan-out). The write uses a fresh timeout (not the caller's context) so
+// cross-connection fan-out is never cancelled by the sender disconnecting.
+func (h *Hub) send(_ context.Context, c *client, e Envelope) error {
 	data, err := json.Marshal(e)
 	if err != nil {
 		return err
 	}
-	wctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	c.writeMu.Lock()
+	defer c.writeMu.Unlock()
+	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	return c.conn.Write(wctx, websocket.MessageText, data)
 }
