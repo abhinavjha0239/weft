@@ -28,3 +28,10 @@ go build ./...
 
 Server: AGPL-3.0-only (LICENSE file pending; SPDX headers to follow).
 Clients will be MIT.
+
+## Development workflow
+
+- `main` — stable; only receives merges from `dev` at milestone cuts.
+- `dev` — integration branch and the repo default; all work lands here.
+- Every change goes through a feature branch (`area/short-name`) and a PR
+  into `dev`. No direct pushes to `dev` or `main`.
