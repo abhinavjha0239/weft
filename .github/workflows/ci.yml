@@ -24,14 +24,25 @@ jobs:
           go-version-file: go.mod
       - run: go build ./...
       - run: go vet ./...
-      - run: gofmt -l . && test -z "$(gofmt -l .)"
+      - run: test -z "$(gofmt -l .)"
       - name: Integration tests (real Postgres)
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:55432/postgres
         run: go test ./... -count=1
       - name: Brand-token rule (docs/BRANDING.md)
+        # No \b in patterns: git grep's word-boundary escape is not portable
+        # across platforms (silently matches nothing on macOS libc).
         run: |
-          ! git grep -ilE '\bweft\b' -- \
-            ':!internal/brand' ':!docs/BRANDING.md' ':!README.md' \
-            ':!go.mod' ':!go.sum' ':!cmd/weftd' ':!.github' \
-            || (echo 'brand literal outside allowed locations' && exit 1)
+          set -e
+          # Go: UI strings must come from internal/brand — no inline brand
+          # literals. Module-path imports are the documented exception and
+          # never match these patterns.
+          if git grep -nE '"[^"]*Weft[^"]*"|"weft"' -- '*.go' ':(exclude)internal/brand'; then
+            echo 'brand literal in Go outside internal/brand'; exit 1
+          fi
+          # Non-Go surfaces: only the documented locations may name the brand.
+          if git grep -liw weft -- ':(exclude)*.go' ':(exclude)docs/BRANDING.md' \
+              ':(exclude)README.md' ':(exclude)go.mod' ':(exclude)go.sum' \
+              ':(exclude).github'; then
+            echo 'brand literal outside allowed non-Go locations'; exit 1
+          fi
