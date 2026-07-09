@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"sort"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -25,6 +26,24 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("db: connect: %w", err)
 	}
 	return pool, nil
+}
+
+// WithTx owns the transaction lifecycle (ARCHITECTURE.md §2): services run
+// their write path inside fn; commit happens iff fn returns nil. Transactions
+// must stay short (scale contract — the event-log xmin gate).
+func WithTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) error {
+	tx, err := pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("db: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(tx); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("db: commit: %w", err)
+	}
+	return nil
 }
 
 // Migrate applies migrations/*.sql in filename order, tracking applied files

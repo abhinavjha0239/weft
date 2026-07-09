@@ -15,7 +15,8 @@ subsystem's reality. Ratings:*
 | Gateway resume (F-2) | **PROVEN** | `TestMessageEndToEnd`: disconnect → send-while-away → reconnect(last_id) → gap replays; checkpoint heartbeats |
 | Outbox rule (write+event, one tx) | **PROVEN** | send path in `server.sendMessage`, asserted via live delivery in e2e |
 | Schema (all 7 migrations) | **PROVEN to apply** / **DORMANT in bulk** | applies clean on PG17 + constraint smoke tests; but work-tracking, automations, files, notifications, compliance tables have ZERO code exercising them — shape bugs there are undiscovered by definition |
-| Auth | WORKS-THIN | bcrypt + hashed bearer sessions, 401 negative tested. Gaps: no rate limiting (login brute-force), no session revocation endpoint, no 2FA (M4+) |
+| Auth | WORKS-THIN | bcrypt + hashed bearer sessions, 401 negative tested; **login brute-force rate-limited (PROVEN: `TestAuthRateLimit`)**. Gaps: session revocation endpoint, 2FA (M4+) |
+| Transport quality (errors, limits, middleware) | **PROVEN** | error taxonomy via one mapper (`TestErrorTaxonomy`), per-IP pre-auth + per-user API limiters with bounded memory (janitor), request-id/logging/panic-recovery middleware, 1 MiB body caps |
 | Permission model | PLACEHOLDER | send = channel-membership check only. The (verb,scope)→group resolver + closure lookup (ADR-006/F-16) is schema-only — **top M1 priority; security claims are not real until this lands** |
 | Message rendering | PLACEHOLDER | HTML-escaped paragraph; Portable AST engine (ADR-007) not started. `message.ast` content is a stub shape |
 | Gateway ACL filter | WORKS-THIN | membership-set filter + refresh on membership events. Missing: history_mode/protected floor, VisibilityScope, the client-side snapshot-refetch rule (no client exists) |

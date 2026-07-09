@@ -107,11 +107,13 @@ load harness with a CI floor is an M1 exit criterion (blueprint §3.6).
 
 ## 8. Known debt against this document
 
-M0 predates the LLD, deliberately small: `internal/server` mixes transport
-and messaging domain (sendMessage + SQL in the handler package), and
-platform packages sit directly under `internal/`. First M1 PR extracts
-`domain/messaging` + `transport/rest` and introduces `db.WithTx` +
-`perms.Require`; the move is mechanical and the e2e test pins behavior.
+~~M0's `internal/server` mixed transport and domain~~ — resolved by the M1
+opener: `domain/identity` + `domain/messaging` + `transport/rest` with
+`db.WithTx`, the apperr taxonomy, and rate-limited middleware. Remaining
+debt: `perms.Require` is still the membership placeholder (next PR), and
+legacy platform packages (db, eventlog, auth, config, enum, brand) sit at
+`internal/*` rather than `internal/platform/*` — move opportunistically,
+never in a feature PR.
 
 ## 9. How a feature gets built (the loop)
 

@@ -1,4 +1,4 @@
-package server
+package rest
 
 import (
 	"bytes"
@@ -18,6 +18,8 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/domain/identity"
+	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
 
@@ -43,7 +45,11 @@ func TestMessageEndToEnd(t *testing.T) {
 
 	hub := gateway.NewHub(pool, slog.Default())
 	go hub.Run(ctx)
-	ts := httptest.NewServer(New(pool, hub).Handler())
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool),
+		Messaging: messaging.New(pool),
+	}))
 	defer ts.Close()
 
 	// 1. Bootstrap org.
@@ -151,7 +157,7 @@ func resetAndMigrate(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	files, _ := filepath.Glob("../../migrations/0*.sql")
+	files, _ := filepath.Glob("../../../migrations/0*.sql")
 	if len(files) == 0 {
 		t.Fatal("no migrations found")
 	}
@@ -207,5 +213,115 @@ func readEnvelope(t *testing.T, ctx context.Context, conn *websocket.Conn) gatew
 			continue
 		}
 		return e
+	}
+}
+
+// TestAuthRateLimit: the pre-auth limiter must trip on brute-force pace and
+// return the taxonomy's 429.
+func TestAuthRateLimit(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity: identity.New(pool), Messaging: messaging.New(pool),
+	}))
+	defer ts.Close()
+
+	body := []byte(`{"org_slug":"none","email":"x@x.test","password":"wrongwrong"}`)
+	var got429 bool
+	for i := 0; i < 30; i++ {
+		resp, err := http.Post(ts.URL+"/api/v1/auth/login", "application/json",
+			bytes.NewReader(body))
+		if err != nil {
+			t.Fatalf("post: %v", err)
+		}
+		resp.Body.Close()
+		if resp.StatusCode == http.StatusTooManyRequests {
+			got429 = true
+			break
+		}
+		if resp.StatusCode != http.StatusUnauthorized {
+			t.Fatalf("unexpected status %d", resp.StatusCode)
+		}
+	}
+	if !got429 {
+		t.Fatal("expected 429 after hammering login; limiter never tripped")
+	}
+}
+
+// TestErrorTaxonomy: not-found and malformed-body map through the single
+// error path; a request id header is always present.
+func TestErrorTaxonomy(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity: identity.New(pool), Messaging: messaging.New(pool),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "tax", "email": "t@t.test", "password": "password123",
+	}, &boot)
+
+	// Not found → 404 with error envelope + request id.
+	req, _ := http.NewRequest("GET", ts.URL+"/api/v1/messages/999999", nil)
+	req.Header.Set("Authorization", "Bearer "+boot.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusNotFound {
+		t.Fatalf("want 404, got %d", resp.StatusCode)
+	}
+	if resp.Header.Get("X-Request-Id") == "" {
+		t.Fatal("missing X-Request-Id header")
+	}
+	var e struct {
+		Error string `json:"error"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&e)
+	if e.Error != "message not found" {
+		t.Fatalf("unexpected error message %q", e.Error)
+	}
+
+	// Malformed body → 400.
+	resp2, err := http.Post(ts.URL+"/api/v1/orgs/bootstrap", "application/json",
+		strings.NewReader("{not json"))
+	if err != nil {
+		t.Fatalf("post: %v", err)
+	}
+	resp2.Body.Close()
+	if resp2.StatusCode != http.StatusBadRequest {
+		t.Fatalf("want 400, got %d", resp2.StatusCode)
 	}
 }
