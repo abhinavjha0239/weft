@@ -9,12 +9,15 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
 	"github.com/abhinavjha0239/weft/internal/brand"
 	"github.com/abhinavjha0239/weft/internal/config"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/identity"
+	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/gateway"
-	"github.com/abhinavjha0239/weft/internal/server"
+	"github.com/abhinavjha0239/weft/internal/transport/rest"
 )
 
 // version is stamped by the build (-ldflags "-X main.version=...").
@@ -73,8 +76,13 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go hub.Run(ctx)
 
 	srv := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: server.New(pool, hub).Handler(),
+		Addr: cfg.ListenAddr,
+		Handler: rest.Handler(ctx, rest.Deps{
+			Pool: pool, Hub: hub, Log: log,
+			Identity:  identity.New(pool),
+			Messaging: messaging.New(pool),
+		}),
+		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
 		<-ctx.Done()

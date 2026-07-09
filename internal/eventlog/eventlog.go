@@ -21,6 +21,16 @@ import (
 // NotifyChannel is the LISTEN/NOTIFY channel that wakes consumers.
 const NotifyChannel = "event_log"
 
+// MustPayload marshals a payload map; keys and shapes are wire contract.
+// Panics only on unmarshalable input, which is a programming error.
+func MustPayload(v any) json.RawMessage {
+	b, err := json.Marshal(v)
+	if err != nil {
+		panic(fmt.Sprintf("eventlog: marshal payload: %v", err))
+	}
+	return b
+}
+
 // Event is one entry to append. Payload carries structural deltas plus
 // references to content revisions — never the only copy of user content
 // (F-4 payload indirection; erasure = scrub the referenced revisions).
