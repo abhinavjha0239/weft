@@ -245,7 +245,7 @@ type mentionNode struct {
 	label string
 }
 
-var kindMention = gast.NewNodeKind("WeftMention")
+var kindMention = gast.NewNodeKind("ContentMention")
 
 func (n *mentionNode) Kind() gast.NodeKind { return kindMention }
 func (n *mentionNode) Dump(src []byte, level int) {
@@ -279,7 +279,7 @@ type emojiNode struct {
 	unicode   string
 }
 
-var kindEmoji = gast.NewNodeKind("WeftEmoji")
+var kindEmoji = gast.NewNodeKind("ContentEmoji")
 
 func (n *emojiNode) Kind() gast.NodeKind { return kindEmoji }
 func (n *emojiNode) Dump(src []byte, level int) {
