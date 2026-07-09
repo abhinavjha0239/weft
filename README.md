@@ -53,7 +53,7 @@ Categories (fixed vocabulary):
 
 Modules: the ARCHITECTURE.md map (`eventlog`, `gateway`, `rest`, `identity`,
 `perms`, `messaging`, `content`, `worktrack`, `files`, `notify`, `importer`,
-`automation`, `compliance`, `platform`) plus `schema`, `repo` for repo-wide.
+`automation`, `compliance`, `platform`, `loadtest`) plus `schema`, `repo`.
 
 Examples:
 - `feat/messaging-thread-endpoints`

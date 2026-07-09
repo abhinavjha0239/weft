@@ -24,7 +24,9 @@ subsystem's reality. Ratings:*
 | Read state | DORMANT | watermark tables exist; no API reads/writes them |
 | Search / notifications / files / work items / automations / compliance | DORMANT | schema + ADRs only |
 | Importers (founding requirement) | DORMANT | zero code; Zulip importer is the M1 showcase |
-| Scale claims | **DESIGNED, NOT MEASURED** | scale contract documented; no load test, no benchmark. Connection/node and msg/s numbers are targets until a perf harness exists (M1 exit criterion: CI perf floor per blueprint §3.6) |
+| Load generator | **PROVEN** | `cmd/loadgen` + `internal/loadtest`: many-tenant HTTP+WS load, id-correlated delivery latency, histogram percentiles. Unit-tested (`histogram_test.go`); used for the numbers below |
+| Scale — code path | **MEASURED** | uncontended full send = ~3.8 ms (auth+perms+AST+insert+event+notify+commit). Stable under 150 tenants / 450 concurrent WS with **zero errors**. See docs/PERF.md |
+| Scale — per-node capacity | **NOT YET MEASURED (rig-bound)** | laptop rig conflates loadgen+server+Docker-VM Postgres on 8 cores (VM at 228% CPU was the ceiling, not weftd at 63%). A true per-cell number needs dedicated hosts (PERF.md has the procedure). No CI perf floor yet — would be environment-bound on the shared runner |
 | Clients | ABSENT | curl + tests are the only consumers; every UI claim is future |
 
 ## Standing rules

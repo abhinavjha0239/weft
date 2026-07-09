@@ -21,6 +21,15 @@ func Connect(ctx context.Context, url string) (*pgxpool.Pool, error) {
 		return nil, fmt.Errorf("db: parse url: %w", err)
 	}
 	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "10000" // 10s
+	// pgx defaults MaxConns to max(4, numCPU) — far too low for a server
+	// fronting many concurrent tenants (load testing showed pool-wait
+	// dominating latency at the default). Set a sane floor; operators raise it
+	// per cell via ?pool_max_conns=N in the URL. One Postgres tops out in the
+	// low hundreds of active connections — beyond that a cell adds PgBouncer
+	// or splits (scale contract).
+	if cfg.MaxConns < 25 {
+		cfg.MaxConns = 25
+	}
 	pool, err := pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
 		return nil, fmt.Errorf("db: connect: %w", err)
