@@ -6,6 +6,37 @@ on:
   pull_request:
 
 jobs:
+  conventions:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    env:
+      PR_TITLE: ${{ github.event.pull_request.title }}
+      HEAD_REF: ${{ github.head_ref }}
+      BASE_REF: ${{ github.base_ref }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Branch name is category/module-slug
+        run: |
+          if ! echo "$HEAD_REF" | grep -qE '^(feat|fix|perf|refactor|schema|test|docs|ci|sec|chore)/[a-z0-9]+(-[a-z0-9]+)*$'; then
+            echo "branch '$HEAD_REF' violates <category>/<module>-<slug> (README: Development workflow)"
+            exit 1
+          fi
+      - name: PR title is 'module: Summary.'
+        run: |
+          if ! echo "$PR_TITLE" | grep -qE '^[a-z][a-z0-9]*: [A-Z].+\.$'; then
+            echo "PR title '$PR_TITLE' must be 'module: Summary.' (capitalized, trailing period)"
+            exit 1
+          fi
+      - name: Code changes update the reality ledger
+        run: |
+          files=$(git diff --name-only "origin/$BASE_REF"...HEAD)
+          if echo "$files" | grep -qE '^internal/' && ! echo "$files" | grep -q '^docs/REALITY.md$'; then
+            echo "internal/ changed without docs/REALITY.md — update the subsystem's row in the same PR (rating may stay, evidence/gaps must be current)"
+            exit 1
+          fi
+
   test:
     runs-on: ubuntu-latest
     services:
