@@ -57,6 +57,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/channels/{id}/threads", a.withAuth(a.handleListThreads))
 	mux.HandleFunc("PATCH /api/v1/threads/{id}", a.withAuth(a.handleUpdateThread))
 	mux.HandleFunc("GET /api/v1/threads/{id}/messages", a.withAuth(a.handleListThreadMessages))
+	mux.HandleFunc("POST /api/v1/threads/{id}/read", a.withAuth(a.handleMarkRead))
+	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
