@@ -73,9 +73,11 @@ jobs:
           if git grep -nE '"[^"]*Weft[^"]*"|"weft"' -- '*.go' ':(exclude)internal/brand'; then
             echo 'brand literal in Go outside internal/brand'; exit 1
           fi
-          # Non-Go surfaces: only the documented locations may name the brand.
-          if git grep -liw weft -- ':(exclude)*.go' ':(exclude)docs/BRANDING.md' \
+          # Non-Go MACHINE surfaces (config, migrations, manifests) must not
+          # name the brand. Prose (docs/, README) and package metadata may —
+          # the rule protects rebrandability of code/config, not documentation.
+          if git grep -liw weft -- ':(exclude)*.go' ':(exclude)docs/' \
               ':(exclude)README.md' ':(exclude)go.mod' ':(exclude)go.sum' \
               ':(exclude).github'; then
-            echo 'brand literal outside allowed non-Go locations'; exit 1
+            echo 'brand literal in a non-Go machine surface (config/migration/manifest)'; exit 1
           fi

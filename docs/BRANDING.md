@@ -4,10 +4,12 @@ The product name is a launch-time requirement to keep **easily changeable**.
 Rules that make that true:
 
 1. **One source of truth in code:** `internal/brand/brand.go` (`Name`, `Slug`,
-   `EnvPrefix`, `Tagline`). No other file — code, templates, UI copy, errors,
-   docs generators — may contain the product name as a literal. CI will grep for
-   violations (`git grep -i weft -- ':!internal/brand' ':!docs/BRANDING.md'`
-   must return only the module path and binary directory, see below).
+   `EnvPrefix`, `Tagline`). No **code or machine surface** — Go source, config,
+   migrations, manifests, UI copy, errors — may contain the product name as a
+   literal. The CI `conventions` job enforces this (a Go grep for quoted brand
+   strings outside `internal/brand`, and a non-Go grep over machine surfaces).
+   **Prose is exempt**: `docs/` and `README.md` naturally name the product;
+   the rule protects rebrandability of code/config, not documentation.
 2. **Env vars** all read through `brand.EnvPrefix`.
 3. **Database, schema, and wire protocol are name-free**: no table, column,
    event type, or API path contains the brand. (They never should anyway.)
