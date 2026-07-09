@@ -13,16 +13,20 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	perms *perms.Service
 }
 
-func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func New(pool *pgxpool.Pool, p *perms.Service) *Service {
+	return &Service{pool: pool, perms: p}
+}
 
 type SendParams struct {
 	ChannelID int64
@@ -32,9 +36,6 @@ type SendParams struct {
 
 // Send is the canonical write path (ARCHITECTURE.md §2): permission check,
 // domain writes, event append — one transaction.
-//
-// TODO(perms): the membership check below is the M0 slice; it is replaced by
-// perms.Require(tx, actor, "send_message", channel) in the perms PR.
 func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (int64, error) {
 	if p.Content == "" {
 		return 0, apperr.Invalid("content required")
@@ -44,6 +45,18 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 	}
 	var msgID int64
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		// The (verb,scope)→group check (ADR-006): most-specific assignment in
+		// the channel→workspace→org chain, membership via the closure.
+		chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, p.ChannelID)
+		if err != nil {
+			return err
+		}
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
+			return err
+		}
+		// Visibility gate, separate from the verb: private-channel content is
+		// member-only (ADR-008 C-2 read model; conservative for public too
+		// until the read model lands).
 		var member bool
 		if err := tx.QueryRow(ctx, `
 			SELECT EXISTS (SELECT 1 FROM channel_member

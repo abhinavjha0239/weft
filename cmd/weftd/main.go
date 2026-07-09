@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 )
@@ -79,8 +80,8 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Addr: cfg.ListenAddr,
 		Handler: rest.Handler(ctx, rest.Deps{
 			Pool: pool, Hub: hub, Log: log,
-			Identity:  identity.New(pool),
-			Messaging: messaging.New(pool),
+			Identity:  identity.New(pool, perms.New(pool)),
+			Messaging: messaging.New(pool, perms.New(pool)),
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
