@@ -101,6 +101,27 @@ system means descriptions get AST, edit revisions, search, and mentions for
 free; Jira import writes description → root message and comments → replies.
 The item view renders the root message as the description block.
 
+## Scale contract (target: Slack scale — millions of active users)
+
+Standing rule: every PR gets an explicit scale review at millions of actives.
+The schema's sharding seam is `org_id` on every row (Slack shards by team the
+same way); a single Postgres serves the small case, org-hash sharding is the
+growth path with no query changes. Known accepted-for-now items, each with its
+scale-tier replacement designed:
+
+- **xmin gate is DB-global** (`eventlog.Consumer`): one long transaction
+  anywhere stalls all delivery. Contract: short write transactions +
+  `idle_in_transaction_session_timeout` + analytics on replicas. Scale tier:
+  logical-decoding feed (WAL order = commit order) behind the same interface.
+- **Per-org consumption** must be NOTIFY-scheduled at runtime — idle orgs
+  cost zero; a dispatcher polls only signaled orgs. Never one loop per org.
+- **NOTIFY per append** is fine to ~10k events/s; beyond that, coalesce
+  notifications per (tx, org) — payloads are already just the org id.
+- **Fan-out ceilings** are designed away up front: read state is O(threads)
+  (F-7), notification candidates come from the materialized deliverability
+  set (F-17), ACL checks are one closure join (F-16) — these are the three
+  places 10k-member channels kill naive designs.
+
 ## What is intentionally absent (each is a named deferral, not an oversight)
 
 - Interactive-block state, canvas, MCP registries, DLP rules — their ADR hooks
