@@ -93,10 +93,30 @@ log (ADR-002 P5), no WAL cost for heartbeats. Everything else durable.
 - **No FKs into `event_log`** — partitions get dropped; references are by id
   with no integrity dependency (e.g. `automation_run.trigger_event_id`).
 
-## What is intentionally absent
+## WorkItem description = the thread's root message
+
+Jira's description field gets no column: an item's description IS the root
+message of its owned thread (ADR-001 D2 taken to its conclusion). One content
+system means descriptions get AST, edit revisions, search, and mentions for
+free; Jira import writes description → root message and comments → replies.
+The item view renders the root message as the description block.
+
+## What is intentionally absent (each is a named deferral, not an oversight)
 
 - Interactive-block state, canvas, MCP registries, DLP rules — their ADR hooks
   are JSONB fields or future tables; adding tables later is cheap, removing
   wrong ones is not.
 - Dense per-user-per-message anything. If a feature seems to need it, it needs
   a design pass first (see F-7).
+- **App platform tables** (manifest registry, event-subscription endpoints with
+  delivery-health state, slash-command registry) — M3 with the automations
+  engine; incoming write-only webhooks already work via `capability_grant`.
+- **Peer-instance registry** (allowlist, keys, per-peer sync cursors) — lands
+  with cross-instance sharing T2; `shared_channel.peer_instance` is the seam.
+- **Hash-chain head + SIEM stream config** (ADR-013 AD-2, v1-hook) — one tiny
+  table each when the compliance surfaces land.
+- **Search-side stores** (pgvector embeddings, cross-entity search index,
+  materialized notification deliverability sets — F-16/F-17) — implementation-
+  stage caches/indexes owned by their milestones; the source columns exist.
+- **SSO/SCIM/2FA tables** — M4+ per MILESTONES.md; `user_credential` +
+  `auth_session` are deliberately minimal for M0.
