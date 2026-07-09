@@ -5,6 +5,9 @@ package perms
 // verb not in defaultAssignments and not explicitly assigned is DENIED.
 const (
 	VerbSendMessage       = "send_message"
+	VerbCreateThread      = "create_thread"     // Zulip can_create_topic_group
+	VerbEditThreadTitle   = "edit_thread_title" // thread-as-container: rename is an UPDATE, not a message move
+	VerbResolveThreads    = "resolve_threads"   // Zulip can_resolve_topics_group
 	VerbCreateChannel     = "create_channel"
 	VerbInviteMembers     = "invite_members"
 	VerbAdministerChannel = "administer_channel"
@@ -27,6 +30,9 @@ const (
 // conservative; admins can reassign any verb to any group later.
 var defaultAssignments = map[string]string{
 	VerbSendMessage:       GroupMembers,
+	VerbCreateThread:      GroupMembers,
+	VerbEditThreadTitle:   GroupMembers,
+	VerbResolveThreads:    GroupMembers,
 	VerbCreateChannel:     GroupMembers,
 	VerbInviteMembers:     GroupMembers,
 	VerbAdministerChannel: GroupAdmins,
