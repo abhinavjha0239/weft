@@ -23,7 +23,7 @@ jobs:
             echo "branch '$HEAD_REF' violates <category>/<module>-<slug> (README: Development workflow)"
             exit 1
           fi
-      - name: PR title is 'module: Summary.'
+      - name: "PR title is 'module: Summary.'"
         run: |
           if ! echo "$PR_TITLE" | grep -qE '^[a-z][a-z0-9]*: [A-Z].+\.$'; then
             echo "PR title '$PR_TITLE' must be 'module: Summary.' (capitalized, trailing period)"
