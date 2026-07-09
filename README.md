@@ -26,8 +26,11 @@ go build ./...
 
 ## License
 
-Server: AGPL-3.0-only (LICENSE file pending; SPDX headers to follow).
-Clients will be MIT.
+**TBD — deliberately undecided** while the commercial model is chosen
+(dual-license w/ CLA vs open-core vs BSL). No LICENSE file is committed on
+purpose; all rights reserved by the sole author until then. **No external
+contributions are accepted before the licensing decision** — outside code
+without a CLA would foreclose the proprietary/dual-license options.
 
 ## Development workflow
 

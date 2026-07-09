@@ -101,13 +101,28 @@ system means descriptions get AST, edit revisions, search, and mentions for
 free; Jira import writes description → root message and comments → replies.
 The item view renders the root message as the description block.
 
-## Scale contract (target: Slack scale — millions of active users)
+## Scale contract (target: no architectural ceiling — "Slack × 100")
 
-Standing rule: every PR gets an explicit scale review at millions of actives.
-The schema's sharding seam is `org_id` on every row (Slack shards by team the
-same way); a single Postgres serves the small case, org-hash sharding is the
-growth path with no query changes. Known accepted-for-now items, each with its
-scale-tier replacement designed:
+Standing rule: every PR gets an explicit scale review. The target is not a
+number, it's the absence of a ceiling: capacity must scale by ADDING CELLS,
+where a cell = one full deployment of this design (app nodes + Postgres)
+owning a set of orgs. This is how Slack itself scales (cell/shard by team);
+billions of actives = thousands of cells, each running the schema below.
+
+**The cell invariant (the one rule that makes ×100 possible):**
+NO cross-org global state or coordination may ever enter the design — no
+global sequences, no cross-org transactions, no global uniqueness except at
+the routing layer (org slug → cell, a directory service when multi-cell
+arrives). Everything already complies: the event log orders per-org, every
+row carries org_id, and cross-org sharing (ADR-004) works by PROJECTION
+between orgs — peer-style, never shared state — which is exactly
+cell-compatible. A PR that introduces cross-org coordination fails review
+regardless of how convenient it is.
+
+Within a cell, the schema's sharding seam is `org_id` on every row; a single
+Postgres serves the small case, org-hash sharding inside a cell is the
+intermediate step, cells are the endgame. Known accepted-for-now items, each
+with its scale-tier replacement designed:
 
 - **xmin gate is DB-global** (`eventlog.Consumer`): one long transaction
   anywhere stalls all delivery. Contract: short write transactions +
