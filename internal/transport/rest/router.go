@@ -53,6 +53,10 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.Handle("POST /api/v1/auth/login", preAuth(http.HandlerFunc(a.handleLogin)))
 	mux.HandleFunc("POST /api/v1/channels/{id}/messages", a.withAuth(a.handleSendMessage))
 	mux.HandleFunc("GET /api/v1/messages/{id}", a.withAuth(a.handleGetMessage))
+	mux.HandleFunc("POST /api/v1/channels/{id}/threads", a.withAuth(a.handleCreateThread))
+	mux.HandleFunc("GET /api/v1/channels/{id}/threads", a.withAuth(a.handleListThreads))
+	mux.HandleFunc("PATCH /api/v1/threads/{id}", a.withAuth(a.handleUpdateThread))
+	mux.HandleFunc("GET /api/v1/threads/{id}/messages", a.withAuth(a.handleListThreadMessages))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
