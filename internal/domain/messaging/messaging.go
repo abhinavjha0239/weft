@@ -6,13 +6,13 @@ package messaging
 import (
 	"context"
 	"errors"
-	"html"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/content"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
@@ -84,18 +84,27 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 			}
 		}
 
-		// Placeholder renderer until domain/content lands (ADR-007;
-		// REALITY.md keeps this rated PLACEHOLDER).
-		rendered := "<p>" + html.EscapeString(p.Content) + "</p>"
-		ast := eventlog.MustPayload(map[string]any{"doc": []any{map[string]any{
-			"type": "paragraph", "text": p.Content}}})
+		// The Portable AST engine (ADR-007): parse → typed AST (stored) →
+		// sanitized render. Mentions resolve against the org directory
+		// inside this transaction.
+		doc := content.Parse(p.Content, func(label string) (int64, bool) {
+			var uid int64
+			err := tx.QueryRow(ctx, `
+				SELECT id FROM user_account
+				WHERE org_id = $1 AND full_name = $2 AND deactivated_at IS NULL
+				ORDER BY id LIMIT 1`, actor.OrgID, label).Scan(&uid)
+			return uid, err == nil
+		})
+		rendered := content.RenderHTML(doc)
+		mentions := doc.Mentions()
 
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO message (org_id, thread_id, channel_id, author_id,
-				source, ast, rendered, render_version)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,1) RETURNING id`,
+				source, ast, rendered, render_version, has_link)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING id`,
 			actor.OrgID, threadID, p.ChannelID, actor.UserID,
-			p.Content, ast, rendered).Scan(&msgID); err != nil {
+			p.Content, doc.JSON(), rendered, content.RenderVersion,
+			doc.HasLink()).Scan(&msgID); err != nil {
 			return apperr.Internal("insert message", err)
 		}
 		// F-15: channel-root threads carry no denormalized counters.
@@ -107,12 +116,14 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 				return apperr.Internal("bump thread", err)
 			}
 		}
-		// F-4 payload indirection: ids only, never content.
+		// F-4 payload indirection: ids only, never content. Mention ids ride
+		// along for the notification pipeline (ADR-011 candidates).
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 			EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
 			Payload: eventlog.MustPayload(map[string]any{
-				"message_id": msgID, "channel_id": p.ChannelID, "thread_id": threadID}),
+				"message_id": msgID, "channel_id": p.ChannelID,
+				"thread_id": threadID, "mentions": mentions}),
 		}); err != nil {
 			return apperr.Internal("append event", err)
 		}

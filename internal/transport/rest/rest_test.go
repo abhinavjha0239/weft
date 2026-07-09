@@ -326,3 +326,90 @@ func TestErrorTaxonomy(t *testing.T) {
 		t.Fatalf("want 400, got %d", resp2.StatusCode)
 	}
 }
+
+// TestRichContentEndToEnd: markdown + mention flow through the real engine —
+// stored AST, sanitized render, resolved mention id in both render and event
+// payload.
+func TestRichContentEndToEnd(t *testing.T) {
+	url := os.Getenv("TEST_DATABASE_URL")
+	if url == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	pool, err := pgxpool.New(ctx, url)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity: identity.New(pool, perms.New(pool)), Messaging: messaging.New(pool, perms.New(pool)),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		UserID    int64  `json:"user_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "rich", "email": "r@r.test", "password": "password123",
+		"full_name": "Rich Owner",
+	}, &boot)
+
+	wsURL := strings.Replace(ts.URL, "http://", "ws://", 1) +
+		"/api/v1/gateway?token=" + boot.Token + "&last_id=0"
+	conn, _, err := websocket.Dial(ctx, wsURL, nil)
+	if err != nil {
+		t.Fatalf("ws dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "bye")
+	_ = readEnvelope(t, ctx, conn) // channel.created replay
+
+	var sent struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
+		boot.Token, map[string]any{
+			"content": "**hi** @**Rich Owner** [x](javascript:alert(1)) :rocket:",
+		}, &sent)
+
+	ev := readEnvelope(t, ctx, conn)
+	var payload struct {
+		Mentions []int64 `json:"mentions"`
+	}
+	_ = json.Unmarshal(ev.Payload, &payload)
+	if len(payload.Mentions) != 1 || payload.Mentions[0] != boot.UserID {
+		t.Fatalf("event mentions = %v, want [%d]", payload.Mentions, boot.UserID)
+	}
+
+	req, _ := http.NewRequestWithContext(ctx, "GET",
+		fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, sent.MessageID), nil)
+	req.Header.Set("Authorization", "Bearer "+boot.Token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	defer resp.Body.Close()
+	var got struct {
+		Rendered string `json:"rendered"`
+	}
+	_ = json.NewDecoder(resp.Body).Decode(&got)
+	for _, want := range []string{
+		"<strong>hi</strong>",
+		fmt.Sprintf(`data-user-id="%d"`, boot.UserID),
+		"🚀",
+	} {
+		if !strings.Contains(got.Rendered, want) {
+			t.Fatalf("rendered missing %q:\n%s", want, got.Rendered)
+		}
+	}
+	if strings.Contains(got.Rendered, "javascript:") {
+		t.Fatalf("unsafe href survived:\n%s", got.Rendered)
+	}
+}
