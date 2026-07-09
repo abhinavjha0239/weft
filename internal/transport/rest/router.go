@@ -38,7 +38,18 @@ type api struct {
 
 // Handler builds the routed, middleware-wrapped HTTP handler. Limiter
 // janitors run until ctx ends.
+// markReadAdapter bridges gateway.MarkReader to the messaging service
+// (gateway.Actor ↔ auth.Identity).
+type markReadAdapter struct{ svc *messaging.Service }
+
+func (m markReadAdapter) MarkRead(ctx context.Context, actor gateway.Actor, threadID, upTo int64) (int64, error) {
+	return m.svc.MarkRead(ctx, auth.Identity{UserID: actor.UserID, OrgID: actor.OrgID}, threadID, upTo)
+}
+
 func Handler(ctx context.Context, d Deps) http.Handler {
+	if d.Hub != nil && d.Messaging != nil {
+		d.Hub.SetMarkReader(markReadAdapter{svc: d.Messaging})
+	}
 	a := &api{
 		Deps:      d,
 		authLimit: ratelimit.New(0.5, 10), // ~30/min burst 10 per IP

@@ -9,8 +9,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
@@ -151,6 +153,19 @@ func addChannelMember(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 		`INSERT INTO channel_member (channel_id, user_id) VALUES ($1, $2)`,
 		channelID, uid); err != nil {
 		t.Fatalf("join: %v", err)
+	}
+	// Grant the default member role so the user has send_message etc., then
+	// rebuild the org's group closure (perms resolve through it).
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_group_member (group_id, user_id)
+		SELECT id, $2 FROM user_group WHERE org_id = $1 AND name = 'role:members'`,
+		orgID, uid); err != nil {
+		t.Fatalf("grant role: %v", err)
+	}
+	if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		return perms.New(pool).RebuildClosure(ctx, tx, orgID)
+	}); err != nil {
+		t.Fatalf("closure: %v", err)
 	}
 	if _, err := pool.Exec(ctx, `
 		INSERT INTO auth_session (user_id, token_hash, expires_at)

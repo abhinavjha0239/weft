@@ -210,7 +210,7 @@ func readEnvelope(t *testing.T, ctx context.Context, conn *websocket.Conn) gatew
 		if err := json.Unmarshal(data, &e); err != nil {
 			t.Fatalf("bad envelope: %v", err)
 		}
-		if e.Type == "checkpoint" {
+		if e.Type == "checkpoint" || e.Type == "ready" {
 			continue
 		}
 		return e
