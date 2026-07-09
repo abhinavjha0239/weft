@@ -28,7 +28,9 @@ jobs:
       - name: Integration tests (real Postgres)
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:55432/postgres
-        run: go test ./... -count=1
+        # -p 1: test packages share one database and each resets the schema —
+        # parallel packages would clobber each other.
+        run: go test -p 1 ./... -count=1
       - name: Brand-token rule (docs/BRANDING.md)
         # No \b in patterns: git grep's word-boundary escape is not portable
         # across platforms (silently matches nothing on macOS libc).
