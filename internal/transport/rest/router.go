@@ -123,6 +123,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/legal-holds", a.withAuth(a.handleCreateLegalHold))
 	mux.HandleFunc("GET /api/v1/admin/legal-holds", a.withAuth(a.handleListLegalHolds))
 	mux.HandleFunc("POST /api/v1/admin/legal-holds/{id}/release", a.withAuth(a.handleReleaseLegalHold))
+	mux.HandleFunc("POST /api/v1/admin/exports", a.withAuth(a.handleRequestExport))
+	mux.HandleFunc("GET /api/v1/admin/exports", a.withAuth(a.handleListExports))
 	mux.HandleFunc("POST /api/v1/automations", a.withAuth(a.handleCreateAutomation))
 	mux.HandleFunc("GET /api/v1/automations", a.withAuth(a.handleListAutomations))
 	mux.HandleFunc("PATCH /api/v1/automations/{id}", a.withAuth(a.handleUpdateAutomation))

@@ -12,6 +12,7 @@ package compliance
 
 import (
 	"context"
+	"log/slog"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -28,10 +29,24 @@ import (
 type Service struct {
 	pool  *pgxpool.Pool
 	perms *perms.Service
+	// files backs the export lane (SetFiles); nil until wired.
+	files      ExportStore
+	exportWake chan struct{}
+	logger     *slog.Logger
 }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
-	return &Service{pool: pool, perms: p}
+	return &Service{pool: pool, perms: p, exportWake: make(chan struct{}, 1)}
+}
+
+// SetLogger overrides the default logger (weftd wires its own).
+func (s *Service) SetLogger(l *slog.Logger) { s.logger = l }
+
+func (s *Service) log() *slog.Logger {
+	if s.logger != nil {
+		return s.logger
+	}
+	return slog.Default()
 }
 
 // Retention scope types (retention_policy.scope_type). The AD-3 ladder is
