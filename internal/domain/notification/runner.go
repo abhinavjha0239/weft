@@ -28,8 +28,12 @@ type Fanout interface {
 
 // Runner is the materializer: a named, cursor-tracked, txid-gated event-log
 // consumer (the same Consumer the M0 spine shipped), NOTIFY-driven with a
-// slow sweep. Processing is idempotent — at-least-once replays hit the
-// dedupe key and vanish.
+// slow sweep. Resolution reads the CURRENT muting/level settings, so
+// replays are no-ops only while decisions are stable — the dedupe key
+// absorbs redelivery, not settings changes. The normal at-least-once window
+// is seconds wide; a deliberate full cursor reset re-evaluates history
+// under today's settings, which is exactly what "replay = reset cursor"
+// means for this consumer.
 type Runner struct {
 	pool     *pgxpool.Pool
 	consumer *eventlog.Consumer
@@ -172,6 +176,55 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 			return err
 		}
 	}
+	// Channel messages resolve N-1 steps 2–3 in one pass: followed threads
+	// boost (and override the channel level); level=all members get
+	// activity pings; the SEPARATE mute flag suppresses both — with an
+	// unmuted thread reviving activity inside a muted channel — while
+	// mentions and DMs break through mute (handled above/below, which is
+	// why the notified-set skip matters). More specific reasons win.
+	if p.ChannelID != 0 && p.ThreadID != 0 && ev.Verb == "message.created" {
+		rows, err := r.pool.Query(ctx, `
+			SELECT cm.user_id,
+			       CASE WHEN COALESCE(ts.state, 0) = 1 THEN true ELSE false END
+			FROM channel_member cm
+			LEFT JOIN thread_subscription ts
+			  ON ts.thread_id = $2 AND ts.user_id = cm.user_id
+			WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL
+			  AND cm.user_id <> $3
+			  AND (
+			    (COALESCE(ts.state, 0) = 1 AND NOT cm.muted)
+			    OR (cm.level = 1 AND COALESCE(ts.state, 0) <> 2
+			        AND (NOT cm.muted OR COALESCE(ts.state, 0) = 3))
+			  )`, p.ChannelID, p.ThreadID, author)
+		if err != nil {
+			return err
+		}
+		type rec struct {
+			uid      int64
+			followed bool
+		}
+		var recs []rec
+		for rows.Next() {
+			var x rec
+			if rows.Scan(&x.uid, &x.followed) == nil {
+				recs = append(recs, x)
+			}
+		}
+		rows.Close()
+		for _, x := range recs {
+			if mentioned[x.uid] {
+				continue // the more specific reason already fired
+			}
+			kind := int16(KindChannelActivity)
+			if x.followed {
+				kind = KindFollowedThread
+			}
+			if err := r.insert(ctx, ev, p, x.uid, kind, author); err != nil {
+				return err
+			}
+		}
+	}
+
 	// DM messages notify every OTHER participant; a mention in the same
 	// message wins (more specific reason), so those users are skipped.
 	// Edits never re-ping the conversation.

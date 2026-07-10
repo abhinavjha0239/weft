@@ -48,3 +48,49 @@ func (a *api) handleUnreads(w http.ResponseWriter, r *http.Request, id auth.Iden
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"channels": unreads, "dms": dmUnreads})
 }
+
+// handleThreadSubscription: PUT /threads/{id}/subscription {state} —
+// 0 clear · 1 followed · 2 muted · 3 unmuted.
+func (a *api) handleThreadSubscription(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	threadID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad thread id")
+		return
+	}
+	type req struct {
+		State int16 `json:"state"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Messaging.SetThreadSubscription(r.Context(), id, threadID, in.State); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+// handleChannelNotification: PUT /channels/{id}/notification — the caller's
+// own level (0 inherit · 1 all · 2 mentions · 3 nothing) and mute flag.
+func (a *api) handleChannelNotification(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	channelID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad channel id")
+		return
+	}
+	type req struct {
+		Level *int16 `json:"level"`
+		Muted *bool  `json:"muted"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Messaging.SetChannelNotification(r.Context(), id, channelID,
+		messaging.ChannelNotificationParams{Level: in.Level, Muted: in.Muted}); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
