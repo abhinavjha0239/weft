@@ -170,7 +170,7 @@
 
 <div id="app">
   <aside>
-    <div class="org"><div><b id="orgName"></b><div class="me" id="meName"></div></div><button id="logout">sign out</button></div>
+    <div class="org"><div><b id="orgName"></b><span id="notifBadge" class="badge" style="display:none;margin-left:8px;cursor:pointer" title="mark seen"></span><div class="me" id="meName"></div></div><button id="logout">sign out</button></div>
     <div class="chhead"><span>Channels</span><button id="newCh" title="New channel">+</button></div>
     <div id="chlist"></div>
     <div class="chhead"><span>Direct messages</span><button id="newDm" title="New conversation">+</button></div>
@@ -335,11 +335,25 @@ async function enter(){
   S.online = new Set(pres.online||[]);
   S.users[me.user_id] = {id: me.user_id, full_name: me.full_name};
   $("#meName").textContent = me.full_name;
-  await Promise.all([refreshChannels(), refreshSpaces(), refreshDMs()]);
+  await Promise.all([refreshChannels(), refreshSpaces(), refreshDMs(), refreshNotifBadge()]);
   const first = S.channels.find(c=>c.member);
   if (first) openChannel(first.id);
   connectWS();
 }
+
+/* ---------- notifications (minimal testing hook) ---------- */
+async function refreshNotifBadge(){
+  try {
+    const r = await api("/notifications?limit=1");
+    const b = $("#notifBadge");
+    b.textContent = r.unseen;
+    b.style.display = r.unseen ? "" : "none";
+  } catch {}
+}
+$("#notifBadge").onclick = async ()=>{
+  try { await post("/notifications/seen", {up_to: 0}); refreshNotifBadge(); }
+  catch(err){ toast(err.message); }
+};
 
 /* ---------- profiles ---------- */
 // Batch-resolve unknown user ids into S.users; renderers read from the
@@ -922,6 +936,7 @@ function connectWS(){
         refreshChannels(); break;
       case "space.created": refreshSpaces(); break;
       case "dm.opened": refreshDMs(); break;
+      case "notification.created": refreshNotifBadge(); break;
       case "presence.changed":
         if (p.state==="online") S.online.add(p.user_id);
         else S.online.delete(p.user_id);
