@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/search"
+	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
 
@@ -37,10 +38,13 @@ func TestSearch(t *testing.T) {
 
 	hub := gateway.NewHub(pool, slog.Default())
 	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	msgSvc := messaging.New(pool, permsSvc)
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
-		Identity:  identity.New(pool, perms.New(pool)),
-		Messaging: messaging.New(pool, perms.New(pool)),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: msgSvc,
+		Worktrack: worktrack.New(pool, permsSvc, msgSvc),
 	}))
 	defer ts.Close()
 
@@ -117,6 +121,71 @@ func TestSearch(t *testing.T) {
 	resp.Body.Close()
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("empty query = %d, want 400", resp.StatusCode)
+	}
+
+	// Item discussions join the search scope (the org-visible space rule):
+	// description and comments become findable, tagged with the item key.
+	var space struct {
+		ID int64 `json:"id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/spaces", boot.Token,
+		map[string]any{"key": "OPS", "name": "Ops Work"}, &space)
+	var item struct {
+		ID       int64  `json:"id"`
+		Key      string `json:"key"`
+		ThreadID int64  `json:"thread_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/spaces/%d/items", ts.URL, space.ID), boot.Token,
+		map[string]any{"title": "Deployment tracker",
+			"description": "deployment checklist for the beta"}, &item)
+	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, item.ThreadID),
+		boot.Token, map[string]any{"content": "deployment dry-run passed"}, nil)
+
+	// Alice: 3 channel hits + description + item comment = 5.
+	res = searchResults(t, ts.URL, boot.Token, "deployment")
+	if len(res) != 5 {
+		t.Fatalf(`post-item search "deployment" = %d results, want 5`, len(res))
+	}
+	itemHits := 0
+	for _, r := range res {
+		if r.ThreadID == item.ThreadID {
+			itemHits++
+			if r.ChannelID != 0 || r.ItemKey != item.Key || r.SpaceID != space.ID {
+				t.Fatalf("item hit not enriched: %+v", r)
+			}
+		}
+	}
+	if itemHits != 2 {
+		t.Fatalf("item-thread hits = %d, want 2 (description + comment)", itemHits)
+	}
+
+	// Bob shares no channel with the space, but space threads are
+	// org-visible: his 2 channel hits grow by the same 2 item hits, while
+	// the #ops channel message stays hidden from him.
+	if got := searchIDs(t, ts.URL, bobTok, "deployment"); len(got) != 4 {
+		t.Fatalf("bob's post-item search = %d, want 4 (still not the #ops message)", len(got))
+	}
+	// in: remains channel-scoped — item messages have no channel.
+	res = searchResults(t, ts.URL, boot.Token, "deployment in:ops")
+	if len(res) != 1 {
+		t.Fatalf("in:ops after items = %d, want 1", len(res))
+	}
+
+	// A promoted channel thread keeps channel scoping AND gains its key.
+	var th struct {
+		ThreadID int64 `json:"thread_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, boot.ChannelID),
+		boot.Token, map[string]any{"title": "postmortem",
+			"content": "deployment postmortem draft"}, &th)
+	var promoted struct {
+		Key string `json:"key"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/promote", ts.URL, th.ThreadID),
+		boot.Token, map[string]any{"space_id": space.ID}, &promoted)
+	res = searchResults(t, ts.URL, boot.Token, `"deployment postmortem"`)
+	if len(res) != 1 || res[0].ChannelID != boot.ChannelID || res[0].ItemKey != promoted.Key {
+		t.Fatalf("promoted-thread hit wrong: %+v", res)
 	}
 }
 
