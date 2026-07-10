@@ -15,13 +15,18 @@ import (
 //
 // Frames:
 //   {"type":"typing","channel_id":N,"state":"start"|"stop"}
+//   {"type":"typing","dm_space_id":N,"state":"start"|"stop"}
 //   {"type":"read_marker","thread_id":N,"up_to":N}
 //
 // Fan-out:
-//   typing      → org connections whose membership view contains channel_id,
-//                 excluding the sender's own connection
+//   typing      → org connections whose membership view contains the scope
+//                 (channel members / DM participants), excluding every one
+//                 of the sender's own connections
 //   read_marker → durable MarkRead, then readstate.synced to the SAME USER's
 //                 other connections (multi-device sync)
+//
+// Presence (online/offline) also lives on this plane but is server-derived
+// from the connection registry — see presence.go.
 
 // MarkReader is the durable read-state dependency (implemented by
 // messaging.Service); an interface keeps gateway free of a domain import.
@@ -39,6 +44,7 @@ type Actor struct {
 type clientFrame struct {
 	Type      string `json:"type"`
 	ChannelID int64  `json:"channel_id,omitempty"`
+	DMSpaceID int64  `json:"dm_space_id,omitempty"`
 	ThreadID  int64  `json:"thread_id,omitempty"`
 	State     string `json:"state,omitempty"`
 	UpTo      int64  `json:"up_to,omitempty"`
@@ -67,24 +73,38 @@ func (h *Hub) handleClientFrame(ctx context.Context, c *client, data []byte) {
 }
 
 func (h *Hub) handleTyping(ctx context.Context, c *client, f clientFrame) {
-	// Senders may only signal into channels their membership view contains —
-	// the same ACL surface the read side uses.
-	if f.ChannelID == 0 || !c.channels[f.ChannelID] {
-		return
-	}
 	verb := "typing.started"
 	if f.State == "stop" {
 		verb = "typing.stopped"
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"channel_id": f.ChannelID, "user_id": c.id.UserID,
-	})
-	// Exclude ALL of the sender's own connections, not just this one — a user
-	// never sees their own typing indicator on another device.
-	h.fanEphemeral(ctx, c.id.OrgID, Envelope{Type: verb, OrgID: c.id.OrgID, Payload: payload},
-		func(peer *client) bool {
-			return peer.id.UserID != c.id.UserID && peer.channels[f.ChannelID]
+	// Senders may only signal into scopes their own membership view contains
+	// — the same ACL surface the read side uses; targets are gated by THEIR
+	// view. Exclude ALL of the sender's own connections: a user never sees
+	// their own typing indicator on another device.
+	switch {
+	case f.ChannelID != 0:
+		if !c.channels[f.ChannelID] {
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"channel_id": f.ChannelID, "user_id": c.id.UserID,
 		})
+		h.fanEphemeral(ctx, c.id.OrgID, Envelope{Type: verb, OrgID: c.id.OrgID, Payload: payload},
+			func(peer *client) bool {
+				return peer.id.UserID != c.id.UserID && peer.channels[f.ChannelID]
+			})
+	case f.DMSpaceID != 0:
+		if !c.dms[f.DMSpaceID] {
+			return
+		}
+		payload, _ := json.Marshal(map[string]any{
+			"dm_space_id": f.DMSpaceID, "user_id": c.id.UserID,
+		})
+		h.fanEphemeral(ctx, c.id.OrgID, Envelope{Type: verb, OrgID: c.id.OrgID, Payload: payload},
+			func(peer *client) bool {
+				return peer.id.UserID != c.id.UserID && peer.dms[f.DMSpaceID]
+			})
+	}
 }
 
 func (h *Hub) handleReadMarker(ctx context.Context, c *client, f clientFrame) {

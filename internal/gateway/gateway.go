@@ -65,6 +65,8 @@ type Hub struct {
 
 	mu    sync.Mutex
 	conns map[int64]map[*client]struct{} // orgID → clients
+	// Live connection counts per user (presence is derived, per-process).
+	userConns map[int64]map[int64]int
 }
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
@@ -175,14 +177,23 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		h.conns[id.OrgID] = map[*client]struct{}{}
 	}
 	h.conns[id.OrgID][c] = struct{}{}
+	cameOnline := h.trackConnect(id.OrgID, id.UserID)
 	h.mu.Unlock()
+	if cameOnline {
+		h.broadcastPresence(ctx, id.OrgID, id.UserID, "online")
+	}
 	defer func() {
 		h.mu.Lock()
 		delete(h.conns[id.OrgID], c)
 		if len(h.conns[id.OrgID]) == 0 {
 			delete(h.conns, id.OrgID)
 		}
+		wentOffline := h.trackDisconnect(id.OrgID, id.UserID)
 		h.mu.Unlock()
+		if wentOffline {
+			// The request context is gone; presence still fans out.
+			h.broadcastPresence(context.Background(), id.OrgID, id.UserID, "offline")
+		}
 		ws.CloseNow()
 	}()
 
