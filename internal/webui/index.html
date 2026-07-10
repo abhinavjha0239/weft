@@ -56,7 +56,9 @@
   .sp .nm::before{content:"▦";font-size:11px;margin-right:6px;opacity:.6}
   .sp .key{font-size:10.5px;color:var(--dim);font-weight:700;letter-spacing:.5px}
   #dmlist{overflow-y:auto;flex:0 1 auto;padding:4px 8px}
-  .dmrow .nm::before{content:"@";opacity:.55;margin-right:5px}
+  .dmrow .nm{display:flex;align-items:center;gap:7px}
+  .pdot{width:8px;height:8px;border-radius:50%;background:var(--line);flex-shrink:0}
+  .pdot.on{background:var(--ok)}
   .picker{max-height:230px;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
   .picker label{display:flex;gap:9px;align-items:center;color:var(--text);font-size:13.5px;padding:6px 8px;border-radius:8px;cursor:pointer}
   .picker label:hover{background:var(--panel2)}
@@ -263,7 +265,7 @@ const S = {
   channels: [], unreads: {}, users: {},
   ch: null, thread: 0, isRoot: true,
   spaces: [], space: null, items: [], statuses: [],
-  dms: [], dm: null, dmUnreads: {},
+  dms: [], dm: null, dmUnreads: {}, online: new Set(),
   view: "chan", // "chan" (channel/thread chat) | "board" | "item" | "dm"
   lastSeq: -1, ws: null, wsTries: 0,
   typingUntil: 0, typers: new Map(),
@@ -319,10 +321,15 @@ $("#logout").onclick = signOut;
 async function enter(){
   $("#auth").style.display="none"; $("#app").classList.add("on");
   $("#orgName").textContent = S.org;
-  const [me] = await Promise.all([api("/me"), refreshChannels(), refreshSpaces(), refreshDMs()]);
+  // Identity and presence FIRST: the list renderers below read S.me (DM
+  // naming) and S.online (dots) — racing them caused a boot TypeError the
+  // moment a conversation existed.
+  const [me, pres] = await Promise.all([api("/me"), api("/presence")]);
   S.me = me;
+  S.online = new Set(pres.online||[]);
   S.users[me.user_id] = {id: me.user_id, full_name: me.full_name};
   $("#meName").textContent = me.full_name;
+  await Promise.all([refreshChannels(), refreshSpaces(), refreshDMs()]);
   const first = S.channels.find(c=>c.member);
   if (first) openChannel(first.id);
   connectWS();
@@ -393,7 +400,7 @@ function setView(v){
   $("#board").classList.toggle("on", v==="board");
   const chat = v!=="board";
   $("#msgs").style.display = chat ? "" : "none";
-  $("#typing").style.display = v==="chan" ? "" : "none";
+  $("#typing").style.display = (v==="chan" || v==="dm") ? "" : "none";
   document.querySelector(".composer").style.display = chat ? "" : "none";
   $("#thToggle").style.display = v==="chan" ? "" : "none";
   $("#newTh").style.display = v==="chan" ? "" : "none";
@@ -502,8 +509,12 @@ function renderDMs(){
     const row = document.createElement("div");
     row.className = "ch dmrow"+(S.dm && d.id===S.dm.id?" on":"");
     const n = S.dmUnreads[d.id]||0;
-    row.innerHTML = `<span class="nm"></span>`+(n?`<span class="badge">${n}</span>`:"");
-    row.querySelector(".nm").textContent = dmName(d);
+    row.innerHTML = `<span class="nm"><span class="pdot"></span><span class="dnm"></span></span>`+
+      (n?`<span class="badge">${n}</span>`:"");
+    const others = d.participant_ids.filter(id=>id!==S.me.user_id);
+    const on = others.length ? others.some(id=>S.online.has(id)) : true;
+    if (on) row.querySelector(".pdot").classList.add("on");
+    row.querySelector(".dnm").textContent = dmName(d);
     row.onclick = ()=>openDM(d);
     el.appendChild(row);
   }
@@ -531,8 +542,10 @@ $("#newDm").onclick = async ()=>{
       const lab = document.createElement("label");
       const cb = document.createElement("input");
       cb.type="checkbox"; cb.value=String(u.id);
+      const dot = document.createElement("span");
+      dot.className = "pdot"+(S.online.has(u.id)?" on":"");
       const nm = document.createElement("span"); nm.textContent = u.full_name;
-      lab.append(cb, nm);
+      lab.append(cb, dot, nm);
       el.appendChild(lab);
     }
     $("#dmDialog").showModal();
@@ -775,6 +788,10 @@ function connectWS(){
         refreshChannels(); break;
       case "space.created": refreshSpaces(); break;
       case "dm.opened": refreshDMs(); break;
+      case "presence.changed":
+        if (p.state==="online") S.online.add(p.user_id);
+        else S.online.delete(p.user_id);
+        renderDMs(); break;
       case "workitem.created": case "workitem.updated":
       case "workitem.status_changed": case "workitem.promoted_from_thread":
         if (S.view==="board" && S.space && p.space_id===S.space.id) loadItems();
@@ -825,12 +842,17 @@ function signalTyping(){
   const now = Date.now();
   if (now < S.typingUntil) return;
   S.typingUntil = now + 2500;
-  if (S.ws && S.ws.readyState===1 && S.view==="chan" && S.ch)
+  if (!S.ws || S.ws.readyState!==1) return;
+  if (S.view==="chan" && S.ch)
     S.ws.send(JSON.stringify({type:"typing", channel_id:S.ch.id, state:"start"}));
+  else if (S.view==="dm" && S.dm)
+    S.ws.send(JSON.stringify({type:"typing", dm_space_id:S.dm.id, state:"start"}));
 }
 
 function onTyping(p, on){
-  if (!S.ch || p.channel_id!==S.ch.id) return;
+  const inChannel = S.ch && p.channel_id && p.channel_id===S.ch.id;
+  const inDM = S.dm && p.dm_space_id && p.dm_space_id===S.dm.id;
+  if (!inChannel && !inDM) return;
   if (on){ S.typers.set(p.user_id, Date.now()); } else { S.typers.delete(p.user_id); }
   renderTyping();
   resolveUsers([p.user_id]).then(renderTyping);
