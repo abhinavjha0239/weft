@@ -20,6 +20,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/importer"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
@@ -116,15 +117,17 @@ func serve(ctx context.Context, cfg config.Config) error {
 
 	hub := gateway.NewHub(pool, log)
 	go hub.Run(ctx)
+	go notification.NewRunner(pool, hub, log).Run(ctx)
 
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
 	apiHandler := rest.Handler(ctx, rest.Deps{
 		Pool: pool, Hub: hub, Log: log,
-		Identity:  identity.New(pool, permsSvc),
-		Messaging: msgSvc,
-		Worktrack: worktrack.New(pool, permsSvc, msgSvc),
-		DM:        dm.New(pool),
+		Identity:      identity.New(pool, permsSvc),
+		Messaging:     msgSvc,
+		Worktrack:     worktrack.New(pool, permsSvc, msgSvc),
+		DM:            dm.New(pool),
+		Notifications: notification.New(pool),
 	})
 	ui, err := webui.Handler()
 	if err != nil {
