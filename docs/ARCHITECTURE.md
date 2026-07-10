@@ -112,6 +112,14 @@ Integration-first against real Postgres (`TEST_DATABASE_URL`, CI service,
 math). Every subsystem's "done" = its REALITY.md row cites a test. Perf: a
 load harness with a CI floor is an M1 exit criterion (blueprint §3.6).
 
+**Quality gates (CI):** gofmt, go vet, staticcheck, govulncheck (gates on
+vulnerabilities our code *calls*, not mere go.sum presence), the brand-token
+greps, and a cross-package statement-coverage floor (72% at introduction,
+measured with `-coverpkg=./internal/...` because domain modules are
+exercised through the rest-layer integration tests; the floor ratchets up,
+never down). CodeQL and Codecov are the go-public upgrades — both
+paid/limited for private repos; revisit at the licensing decision.
+
 ## 8. Known debt against this document
 
 ~~M0's `internal/server` mixed transport and domain~~ — resolved by the M1
