@@ -65,9 +65,9 @@ func TestWorkItemFusion(t *testing.T) {
 		Key string `json:"key"`
 	}
 	postJSON(t, ts.URL+"/api/v1/spaces", boot.Token,
-		map[string]any{"key": "weft", "name": "Weft Build"}, &space)
-	if space.Key != "WEFT" {
-		t.Fatalf("space key = %q, want normalized WEFT", space.Key)
+		map[string]any{"key": "fuse", "name": "Fusion Build"}, &space)
+	if space.Key != "FUSE" {
+		t.Fatalf("space key = %q, want normalized FUSE", space.Key)
 	}
 	var sts struct {
 		Statuses []worktrack.Status `json:"statuses"`
@@ -95,8 +95,8 @@ func TestWorkItemFusion(t *testing.T) {
 	postJSON(t, fmt.Sprintf("%s/api/v1/spaces/%d/items", ts.URL, space.ID), boot.Token,
 		map[string]any{"title": "Ship the fusion", "description": "the **why** lives here",
 			"type": "Bug"}, &task)
-	if task.Key != "WEFT-1" {
-		t.Fatalf("first item key = %q, want WEFT-1", task.Key)
+	if task.Key != "FUSE-1" {
+		t.Fatalf("first item key = %q, want FUSE-1", task.Key)
 	}
 	var desc struct {
 		Messages []struct {
@@ -127,7 +127,7 @@ func TestWorkItemFusion(t *testing.T) {
 	}
 	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/promote", ts.URL, th.ThreadID), boot.Token,
 		map[string]any{"space_id": space.ID, "type": "Bug"}, &promoted)
-	if promoted.Key != "WEFT-2" || promoted.ThreadID != th.ThreadID {
+	if promoted.Key != "FUSE-2" || promoted.ThreadID != th.ThreadID {
 		t.Fatalf("promotion wrong: %+v (thread must be THE SAME)", promoted)
 	}
 	// A chat reply in the channel thread is now also the item's discussion.
@@ -182,7 +182,7 @@ func TestWorkItemFusion(t *testing.T) {
 
 	// Duplicate space key → 409 (keys are never reused).
 	if code := postJSONStatus(t, ts.URL+"/api/v1/spaces", boot.Token,
-		map[string]any{"key": "WEFT", "name": "Again"}); code != http.StatusConflict {
+		map[string]any{"key": "FUSE", "name": "Again"}); code != http.StatusConflict {
 		t.Fatalf("duplicate key: %d, want 409", code)
 	}
 }
