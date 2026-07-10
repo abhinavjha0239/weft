@@ -31,7 +31,7 @@ type Report struct {
 
 	// Imported (lossless or transformed).
 	Users, Channels, Threads, Messages, Reactions, Subscriptions int            `json:"-"`
-	Groups, GroupMembers, GroupEdges                             int            `json:"-"`
+	Groups, GroupMembers, GroupEdges, Watermarks                 int            `json:"-"`
 	ImportedCounts                                               map[string]int `json:"imported"`
 
 	// Skipped-with-reason (documented losses of this importer version).
@@ -43,6 +43,10 @@ type Report struct {
 	// never elevates or demotes a live user. Counted when the source role
 	// was anything above plain member.
 	RoleGrantsSkipped int `json:"role_grants_skipped_existing_users"`
+	// The F-7 watermark marks everything up to the highest READ message as
+	// read; sparse unread gaps BELOW that point are coarsened away. Counted,
+	// never silent.
+	ReadCoarsened int `json:"unread_below_watermark_coarsened"`
 
 	// Idempotency: rows already present from a previous run.
 	AlreadyImported int `json:"already_imported"`
@@ -61,6 +65,7 @@ func (r *Report) finalize() {
 		"messages": r.Messages, "reactions": r.Reactions,
 		"subscriptions": r.Subscriptions, "groups": r.Groups,
 		"group_members": r.GroupMembers, "group_edges": r.GroupEdges,
+		"read_watermarks": r.Watermarks,
 	}
 }
 
@@ -187,6 +192,45 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 			selfEdge := superOK && subOK && superSys == subSys
 			if mapped && !selfEdge {
 				rep.GroupEdges++
+			}
+		}
+		// Read watermarks: source ids are imported in order, so
+		// max-by-source-id selects the same message the write pass lands on.
+		msgTkey := map[int64]string{}
+		for _, m := range ex.Messages {
+			if sid, ok := ex.StreamByRecipient[m.Recipient]; ok {
+				msgTkey[m.ID] = fmt.Sprintf("%d\x00%s", sid, m.Subject)
+			}
+		}
+		type drk struct {
+			user int64
+			tkey string
+		}
+		dmax := map[drk]int64{}
+		for _, um := range ex.UserMessages {
+			if um.FlagsMask&umReadFlag == 0 || bots[um.UserProfile] {
+				continue
+			}
+			tk, ok := msgTkey[um.Message]
+			if !ok {
+				continue
+			}
+			k := drk{um.UserProfile, tk}
+			if um.Message > dmax[k] {
+				dmax[k] = um.Message
+			}
+		}
+		rep.Watermarks = len(dmax)
+		for _, um := range ex.UserMessages {
+			if um.FlagsMask&umReadFlag != 0 || bots[um.UserProfile] {
+				continue
+			}
+			tk, ok := msgTkey[um.Message]
+			if !ok {
+				continue
+			}
+			if wm, ok := dmax[drk{um.UserProfile, tk}]; ok && um.Message < wm {
+				rep.ReadCoarsened++
 			}
 		}
 		rep.finalize()
@@ -532,6 +576,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	}
 	threadMap := map[string]int64{} // "streamID\x00subject" → thread id
 	messageMap := map[int64]int64{} // zulip message id → our id
+	msgThread := map[int64]int64{}  // zulip message id → our thread id
 	for _, m := range ex.Messages {
 		streamID, ok := ex.StreamByRecipient[m.Recipient]
 		if !ok {
@@ -606,12 +651,14 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 				return fmt.Errorf("resolve imported message: %w", err)
 			}
 			messageMap[m.ID] = msgID
+			msgThread[m.ID] = thID
 			continue
 		}
 		if err != nil {
 			return fmt.Errorf("message %d: %w", m.ID, err)
 		}
 		messageMap[m.ID] = msgID
+		msgThread[m.ID] = thID
 		if _, err := tx.Exec(ctx, `
 			UPDATE thread SET message_count = message_count + 1,
 			       last_activity_at = GREATEST(last_activity_at, $2),
@@ -649,6 +696,58 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}
 		if ct.RowsAffected() > 0 {
 			rep.Reactions++
+		}
+	}
+
+	// --- Read watermarks from usermessage read flags (F-7). Per (user,
+	// thread), the watermark lands on the highest READ message; sparse
+	// unread gaps below it are coarsened away and counted. Deliberately not
+	// event-logged — read state stays off the durable spine (scale
+	// contract), exactly like live mark-read.
+	type rk struct{ user, thread int64 }
+	maxRead := map[rk]int64{}
+	for _, um := range ex.UserMessages {
+		if um.FlagsMask&umReadFlag == 0 {
+			continue
+		}
+		uid, ok1 := userMap[um.UserProfile]
+		mid, ok2 := messageMap[um.Message]
+		if !ok1 || !ok2 {
+			continue // flags on unimported (DM) messages carry nothing
+		}
+		k := rk{uid, msgThread[um.Message]}
+		if mid > maxRead[k] {
+			maxRead[k] = mid
+		}
+	}
+	for _, um := range ex.UserMessages {
+		if um.FlagsMask&umReadFlag != 0 {
+			continue
+		}
+		uid, ok1 := userMap[um.UserProfile]
+		mid, ok2 := messageMap[um.Message]
+		if !ok1 || !ok2 {
+			continue
+		}
+		if wm, ok := maxRead[rk{uid, msgThread[um.Message]}]; ok && mid < wm {
+			rep.ReadCoarsened++
+		}
+	}
+	for k, mid := range maxRead {
+		// Monotone like MarkRead: the guard makes re-runs true no-ops, so
+		// idempotency is visible in the count too.
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO thread_read_watermark (user_id, thread_id, last_read_message_id, updated_at)
+			VALUES ($1, $2, $3, now())
+			ON CONFLICT (user_id, thread_id) DO UPDATE
+			SET last_read_message_id = EXCLUDED.last_read_message_id, updated_at = now()
+			WHERE thread_read_watermark.last_read_message_id < EXCLUDED.last_read_message_id`,
+			k.user, k.thread, mid)
+		if err != nil {
+			return fmt.Errorf("watermark: %w", err)
+		}
+		if ct.RowsAffected() > 0 {
+			rep.Watermarks++
 		}
 	}
 

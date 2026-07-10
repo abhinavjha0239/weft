@@ -77,6 +77,14 @@ const fixtureMessages = `{
   ],
   "zerver_reaction": [
     {"id": 201, "user_profile": 11, "message": 102, "emoji_name": "tada"}
+  ],
+  "zerver_usermessage": [
+    {"id": 301, "user_profile": 11, "flags_mask": 1, "message": 101},
+    {"id": 302, "user_profile": 11, "flags_mask": 1, "message": 102},
+    {"id": 303, "user_profile": 12, "flags_mask": 1, "message": 102},
+    {"id": 304, "user_profile": 12, "flags_mask": 0, "message": 101},
+    {"id": 305, "user_profile": 11, "flags_mask": 1, "message": 105},
+    {"id": 306, "user_profile": 12, "flags_mask": 3, "message": 103}
   ]
 }`
 
@@ -145,6 +153,12 @@ func TestZulipImportShowcase(t *testing.T) {
 	if dry.Groups != 1 || dry.SystemGroupsMapped != 3 ||
 		dry.GroupMembers != 2 || dry.GroupEdges != 1 {
 		t.Fatalf("dry-run group accounting off: %+v", dry)
+	}
+	// Watermarks: Iago read both launch-plan messages; Hamlet read the NEWER
+	// launch-plan message but not the older (coarsened) and read "random"
+	// with a starred bit that must be ignored; the DM read flag maps nowhere.
+	if dry.Watermarks != 3 || dry.ReadCoarsened != 1 {
+		t.Fatalf("dry-run watermark accounting off: %+v", dry)
 	}
 	var n int
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM message WHERE origin_system = 'zulip'`).Scan(&n)
@@ -281,6 +295,28 @@ func TestZulipImportShowcase(t *testing.T) {
 			iagoInClosure, hamletInClosure)
 	}
 
+	// Watermarks match the dry-run accounting, and Hamlet's launch-plan
+	// watermark sits on the NEWER read message (zulip 102) — the older
+	// unread message below it is the counted coarsening.
+	if rep.Watermarks != 3 || rep.ReadCoarsened != 1 {
+		t.Fatalf("watermark report off: %+v", rep)
+	}
+	var hamletWM, weft102 int64
+	_ = pool.QueryRow(ctx, `
+		SELECT id FROM message WHERE org_id = $1
+		 AND origin_system = 'zulip' AND origin_id = '102'`, orgID).Scan(&weft102)
+	if err := pool.QueryRow(ctx, `
+		SELECT w.last_read_message_id
+		FROM thread_read_watermark w
+		JOIN message m ON m.id = $2
+		WHERE w.user_id = $1 AND w.thread_id = m.thread_id`,
+		hamletID, weft102).Scan(&hamletWM); err != nil {
+		t.Fatalf("hamlet watermark: %v", err)
+	}
+	if hamletWM != weft102 {
+		t.Fatalf("hamlet watermark = %d, want %d (weft id of zulip 102)", hamletWM, weft102)
+	}
+
 	// Idempotency (D5): a re-run imports nothing new and duplicates nothing.
 	rep2, err := svc.Run(ctx, orgID, dir, false)
 	if err != nil {
@@ -288,7 +324,7 @@ func TestZulipImportShowcase(t *testing.T) {
 	}
 	if rep2.Messages != 0 || rep2.Users != 0 || rep2.Channels != 0 ||
 		rep2.Threads != 0 || rep2.Groups != 0 || rep2.GroupMembers != 0 ||
-		rep2.GroupEdges != 0 {
+		rep2.GroupEdges != 0 || rep2.Watermarks != 0 {
 		t.Fatalf("re-run imported new rows: %+v", rep2)
 	}
 	if rep2.AlreadyImported == 0 {

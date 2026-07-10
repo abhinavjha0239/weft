@@ -98,9 +98,20 @@ type zulipGroupEdge struct {
 	Subgroup   int64 `json:"subgroup"`
 }
 
+// zulipUserMessage carries per-user flags; bit 0 of flags_mask is "read"
+// (AbstractUserMessage.ALL_FLAGS order in zerver/models/messages.py).
+type zulipUserMessage struct {
+	UserProfile int64 `json:"user_profile"`
+	Message     int64 `json:"message"`
+	FlagsMask   int64 `json:"flags_mask"`
+}
+
+const umReadFlag = 1
+
 type zulipMessageFile struct {
-	Messages  []zulipMessage  `json:"zerver_message"`
-	Reactions []zulipReaction `json:"zerver_reaction"`
+	Messages     []zulipMessage     `json:"zerver_message"`
+	Reactions    []zulipReaction    `json:"zerver_reaction"`
+	UserMessages []zulipUserMessage `json:"zerver_usermessage"`
 }
 
 type zulipMessage struct {
@@ -130,6 +141,7 @@ type Export struct {
 	GroupEdges    []zulipGroupEdge
 	Messages      []zulipMessage
 	Reactions     []zulipReaction
+	UserMessages  []zulipUserMessage
 
 	// recipient id → stream id (type 2 only); non-stream recipients counted
 	// as skipped DMs.
@@ -177,6 +189,7 @@ func LoadZulipExport(dir string) (*Export, error) {
 		}
 		ex.Messages = append(ex.Messages, mf.Messages...)
 		ex.Reactions = append(ex.Reactions, mf.Reactions...)
+		ex.UserMessages = append(ex.UserMessages, mf.UserMessages...)
 	}
 	// Deterministic id order keeps event-log ordering ≈ original history.
 	sort.Slice(ex.Messages, func(i, j int) bool { return ex.Messages[i].ID < ex.Messages[j].ID })
