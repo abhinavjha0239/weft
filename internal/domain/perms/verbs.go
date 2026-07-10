@@ -9,6 +9,9 @@ const (
 	VerbEditThreadTitle   = "edit_thread_title" // thread-as-container: rename is an UPDATE, not a message move
 	VerbResolveThreads    = "resolve_threads"   // Zulip can_resolve_topics_group
 	VerbCreateChannel     = "create_channel"
+	VerbCreateSpace       = "create_space"
+	VerbCreateItems       = "create_items"
+	VerbEditItems         = "edit_items" // covers field edits + transitions in the v1 slice
 	VerbInviteMembers     = "invite_members"
 	VerbAdministerChannel = "administer_channel"
 	VerbManageOrg         = "manage_org"
@@ -34,6 +37,9 @@ var defaultAssignments = map[string]string{
 	VerbEditThreadTitle:   GroupMembers,
 	VerbResolveThreads:    GroupMembers,
 	VerbCreateChannel:     GroupMembers,
+	VerbCreateSpace:       GroupMembers,
+	VerbCreateItems:       GroupMembers,
+	VerbEditItems:         GroupMembers,
 	VerbInviteMembers:     GroupMembers,
 	VerbAdministerChannel: GroupAdmins,
 	VerbManageOrg:         GroupAdmins,

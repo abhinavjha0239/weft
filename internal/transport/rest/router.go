@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/search"
+	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 	"github.com/abhinavjha0239/weft/internal/platform/ratelimit"
@@ -27,6 +28,7 @@ type Deps struct {
 	Log       *slog.Logger
 	Identity  *identity.Service
 	Messaging *messaging.Service
+	Worktrack *worktrack.Service
 }
 
 type api struct {
@@ -78,6 +80,14 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/threads/{id}/read", a.withAuth(a.handleMarkRead))
 	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
 	mux.HandleFunc("GET /api/v1/search", a.withAuth(a.handleSearch))
+	mux.HandleFunc("POST /api/v1/spaces", a.withAuth(a.handleCreateSpace))
+	mux.HandleFunc("GET /api/v1/spaces", a.withAuth(a.handleListSpaces))
+	mux.HandleFunc("POST /api/v1/spaces/{id}/items", a.withAuth(a.handleCreateItem))
+	mux.HandleFunc("GET /api/v1/spaces/{id}/items", a.withAuth(a.handleListItems))
+	mux.HandleFunc("GET /api/v1/spaces/{id}/statuses", a.withAuth(a.handleSpaceStatuses))
+	mux.HandleFunc("PATCH /api/v1/items/{id}", a.withAuth(a.handleUpdateItem))
+	mux.HandleFunc("POST /api/v1/threads/{id}/promote", a.withAuth(a.handlePromoteThread))
+	mux.HandleFunc("POST /api/v1/threads/{id}/messages", a.withAuth(a.handleSendToThread))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
