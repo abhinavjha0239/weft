@@ -15,6 +15,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/search"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 	"github.com/abhinavjha0239/weft/internal/platform/ratelimit"
@@ -30,6 +31,7 @@ type Deps struct {
 
 type api struct {
 	Deps
+	search *search.Service
 	// authLimit: pre-auth endpoints, per IP (brute-force protection).
 	// apiLimit: authenticated endpoints, per user.
 	authLimit *ratelimit.Limiter
@@ -52,6 +54,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	}
 	a := &api{
 		Deps:      d,
+		search:    search.New(d.Pool),
 		authLimit: ratelimit.New(0.5, 10), // ~30/min burst 10 per IP
 		apiLimit:  ratelimit.New(50, 100), // 50 rps burst 100 per user
 	}
@@ -74,6 +77,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/threads/{id}/messages", a.withAuth(a.handleListThreadMessages))
 	mux.HandleFunc("POST /api/v1/threads/{id}/read", a.withAuth(a.handleMarkRead))
 	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
+	mux.HandleFunc("GET /api/v1/search", a.withAuth(a.handleSearch))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
