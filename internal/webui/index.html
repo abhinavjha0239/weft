@@ -38,6 +38,7 @@
   aside{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
   .org{padding:16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
   .org b{font-size:15px}
+  .org .me{color:var(--dim);font-size:11.5px;margin-top:1px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:150px}
   .org button{background:none;color:var(--dim);font-size:12px}
   .org button:hover{color:var(--danger)}
   .chhead{display:flex;justify-content:space-between;align-items:center;padding:14px 16px 6px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px}
@@ -157,7 +158,7 @@
 
 <div id="app">
   <aside>
-    <div class="org"><b id="orgName"></b><button id="logout">sign out</button></div>
+    <div class="org"><div><b id="orgName"></b><div class="me" id="meName"></div></div><button id="logout">sign out</button></div>
     <div class="chhead"><span>Channels</span><button id="newCh" title="New channel">+</button></div>
     <div id="chlist"></div>
     <div class="chhead"><span>Spaces</span><button id="newSp" title="New space">+</button></div>
@@ -301,10 +302,35 @@ $("#logout").onclick = signOut;
 async function enter(){
   $("#auth").style.display="none"; $("#app").classList.add("on");
   $("#orgName").textContent = S.org;
-  await Promise.all([refreshChannels(), refreshSpaces()]);
+  const [me] = await Promise.all([api("/me"), refreshChannels(), refreshSpaces()]);
+  S.me = me;
+  S.users[me.user_id] = {id: me.user_id, full_name: me.full_name};
+  $("#meName").textContent = me.full_name;
   const first = S.channels.find(c=>c.member);
   if (first) openChannel(first.id);
   connectWS();
+}
+
+/* ---------- profiles ---------- */
+// Batch-resolve unknown user ids into S.users; renderers read from the
+// cache synchronously afterwards. Unknown ids stay "user N" — never block.
+async function resolveUsers(ids){
+  const missing = [...new Set(ids)].filter(id=>id && !S.users[id]);
+  if (!missing.length) return;
+  try {
+    const r = await api("/users?ids="+missing.join(","));
+    for (const u of r.users||[]) S.users[u.id] = u;
+  } catch {}
+}
+function userName(id){
+  const u = S.users[id];
+  return u ? u.full_name + (u.deactivated ? " (deactivated)" : "") : "user "+id;
+}
+function initials(id){
+  const u = S.users[id];
+  if (!u) return String(id).slice(-2);
+  const parts = u.full_name.trim().split(/\s+/);
+  return (parts[0][0] + (parts[1] ? parts[1][0] : "")).toUpperCase();
 }
 
 async function refreshChannels(){
@@ -392,6 +418,7 @@ $("#crumb").onclick = ()=>{
 async function loadMessages(){
   const r = await api(`/threads/${S.thread}/messages?limit=100`);
   const msgs = (r.messages||[]).slice().reverse();
+  await resolveUsers(msgs.map(m=>m.author_id));
   const el = $("#msgs"); el.innerHTML="";
   if (!msgs.length) el.innerHTML = `<div class="sys">No messages yet — say hello 👋</div>`;
   msgs.forEach(m=>el.appendChild(renderMsg(m)));
@@ -400,10 +427,11 @@ async function loadMessages(){
 
 function renderMsg(m){
   const d = document.createElement("div"); d.className="msg"; d.dataset.id=m.id;
-  const initial = String(m.author_id);
-  d.innerHTML = `<div class="av">${initial.slice(-2)}</div>
-    <div><span class="who">user ${m.author_id}</span><span class="when"></span>
+  d.innerHTML = `<div class="av"></div>
+    <div><span class="who"></span><span class="when"></span>
     <div class="body">${m.rendered}</div></div>`;
+  d.querySelector(".av").textContent = initials(m.author_id);
+  d.querySelector(".who").textContent = userName(m.author_id);
   return d;
 }
 
@@ -595,14 +623,15 @@ $("#search").addEventListener("input", e=>{
 async function runSearch(q){
   try {
     const r = await api("/search?q="+encodeURIComponent(q)+"&limit=40");
-    const el = $("#results"); el.innerHTML=""; el.classList.add("on");
     const rs = r.results||[];
+    await resolveUsers(rs.map(m=>m.author_id));
+    const el = $("#results"); el.innerHTML=""; el.classList.add("on");
     if (!rs.length){ el.innerHTML=`<div class="sys">No matches</div>`; return; }
     for (const m of rs){
       const ch = S.channels.find(c=>c.id===m.channel_id);
       const d = document.createElement("div"); d.className="res";
       const meta = document.createElement("div"); meta.className="rmeta";
-      meta.textContent = `#${ch?ch.name:m.channel_id} · user ${m.author_id} · ${m.created_at.slice(0,10)}`;
+      meta.textContent = `#${ch?ch.name:m.channel_id} · ${userName(m.author_id)} · ${m.created_at.slice(0,10)}`;
       const snip = document.createElement("div"); snip.className="rsnip";
       // Snippet is PLAIN TEXT with » « highlight markers — safe to set as text,
       // then upgrade the markers to styled spans.
@@ -660,6 +689,7 @@ async function onMessage(p){
   if (S.view!=="board" && p.thread_id===S.thread){
     try {
       const m = await api(`/messages/${p.message_id}`);
+      await resolveUsers([m.author_id]);
       const el = $("#msgs");
       if (!el.querySelector(`[data-id="${m.id}"]`)){
         el.querySelector(".sys")?.remove();
@@ -696,13 +726,18 @@ function onTyping(p, on){
   if (!S.ch || p.channel_id!==S.ch.id) return;
   if (on){ S.typers.set(p.user_id, Date.now()); } else { S.typers.delete(p.user_id); }
   renderTyping();
+  resolveUsers([p.user_id]).then(renderTyping);
 }
 setInterval(()=>{ const cut=Date.now()-4000; let ch=false;
   for (const [k,v] of S.typers) if (v<cut){ S.typers.delete(k); ch=true; }
   if (ch) renderTyping(); }, 1500);
 function renderTyping(){
-  $("#typing").textContent = S.typers.size
-    ? (S.typers.size===1 ? "someone is typing…" : S.typers.size+" people are typing…") : "";
+  const who = [...S.typers.keys()];
+  $("#typing").textContent =
+    who.length===0 ? "" :
+    who.length===1 ? userName(who[0])+" is typing…" :
+    who.length===2 ? userName(who[0])+" and "+userName(who[1])+" are typing…" :
+    who.length+" people are typing…";
 }
 
 /* ---------- boot ---------- */
