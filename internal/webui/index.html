@@ -95,6 +95,12 @@
   .msg .who{font-weight:700;font-size:13.5px;margin-right:8px}
   .msg .when{color:var(--dim);font-size:11.5px}
   .msg .body{margin-top:1px;word-wrap:break-word}
+  .msg .reacts{display:flex;gap:4px;flex-wrap:wrap;margin-top:3px}
+  .msg .chip{border:1px solid var(--line);background:transparent;color:var(--fg);
+    border-radius:10px;padding:1px 7px;font-size:12px;cursor:pointer;line-height:18px}
+  .msg .chip.mine{border-color:var(--acc);background:color-mix(in srgb, var(--acc) 12%, transparent)}
+  .msg .chip.add{opacity:0;color:var(--dim)}
+  .msg:hover .chip.add{opacity:1}
   .body p{margin:2px 0}
   .body code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px}
   .body pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto;margin:6px 0}
@@ -518,10 +524,38 @@ function renderMsg(m){
   const d = document.createElement("div"); d.className="msg"; d.dataset.id=m.id;
   d.innerHTML = `<div class="av"></div>
     <div><span class="who"></span><span class="when"></span>
-    <div class="body">${m.rendered}</div></div>`;
+    <div class="body">${m.rendered}</div>
+    <div class="reacts"></div></div>`;
   d.querySelector(".av").textContent = initials(m.author_id);
   d.querySelector(".who").textContent = userName(m.author_id);
+  renderReacts(d.querySelector(".reacts"), m);
   return d;
+}
+
+function renderReacts(row, m){
+  row.innerHTML = "";
+  for (const r of (m.reactions||[])) {
+    const b = document.createElement("button");
+    b.className = "chip" + (r.me ? " mine" : "");
+    b.textContent = `${r.emoji} ${r.count}`;
+    b.title = r.me ? "remove your reaction" : "react";
+    b.onclick = () => toggleReaction(m.id, r.emoji, r.me);
+    row.appendChild(b);
+  }
+  const add = document.createElement("button");
+  add.className = "chip add";
+  add.textContent = "+👍";
+  add.title = "react 👍";
+  const mine = (m.reactions||[]).some(r => r.emoji === "👍" && r.me);
+  add.onclick = () => toggleReaction(m.id, "👍", mine);
+  row.appendChild(add);
+}
+
+async function toggleReaction(msgID, emoji, mine){
+  try {
+    await api(`/messages/${msgID}/reactions/${encodeURIComponent(emoji)}`,
+      {method: mine ? "DELETE" : "PUT"});
+  } catch(err){ toast(err.message); }
 }
 
 async function loadThreads(){
@@ -930,6 +964,7 @@ function connectWS(){
     switch(e.type){
       case "message.created": onMessage(p); break;
       case "message.edited": case "message.deleted":
+      case "reaction.added": case "reaction.removed":
         if (S.view!=="board" && p.thread_id===S.thread) loadMessages(); break;
       case "thread.created": case "thread.titled":
       case "thread.resolved": case "thread.reopened":
