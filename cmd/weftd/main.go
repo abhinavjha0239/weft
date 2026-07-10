@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"encoding/json"
+	"flag"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -15,6 +17,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/config"
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
+	"github.com/abhinavjha0239/weft/internal/domain/importer"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
@@ -43,9 +46,11 @@ func main() {
 		})
 	case "serve":
 		run(serve)
+	case "import-zulip":
+		run(importZulip)
 	default:
 		fmt.Printf("%s v%s — %s\n", brand.Name, version, brand.Tagline)
-		fmt.Println("usage: serve | migrate | version")
+		fmt.Println("usage: serve | migrate | import-zulip | version")
 	}
 }
 
@@ -60,6 +65,38 @@ func run(fn func(context.Context, config.Config) error) {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
+}
+
+// importZulip: weftd import-zulip -org <slug> -dir <unpacked-export> [-dry-run]
+func importZulip(ctx context.Context, cfg config.Config) error {
+	fs := flag.NewFlagSet("import-zulip", flag.ExitOnError)
+	orgSlug := fs.String("org", "", "target org slug (must exist)")
+	dir := fs.String("dir", "", "unpacked Zulip export directory")
+	dryRun := fs.Bool("dry-run", false, "report fidelity without writing")
+	_ = fs.Parse(os.Args[2:])
+	if *orgSlug == "" || *dir == "" {
+		return fmt.Errorf("import-zulip: -org and -dir are required")
+	}
+	pool, err := db.Connect(ctx, cfg.DatabaseURL)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := db.Migrate(ctx, pool, "migrations"); err != nil {
+		return err
+	}
+	var orgID int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM org WHERE slug = $1`, *orgSlug).Scan(&orgID); err != nil {
+		return fmt.Errorf("org %q not found: %w", *orgSlug, err)
+	}
+	rep, err := importer.New(pool).Run(ctx, orgID, *dir, *dryRun)
+	if err != nil {
+		return err
+	}
+	out, _ := json.MarshalIndent(rep, "", "  ")
+	fmt.Println(string(out))
+	return nil
 }
 
 func serve(ctx context.Context, cfg config.Config) error {
