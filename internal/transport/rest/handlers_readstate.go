@@ -38,5 +38,13 @@ func (a *api) handleUnreads(w http.ResponseWriter, r *http.Request, id auth.Iden
 	if unreads == nil {
 		unreads = []messaging.ChannelUnread{}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"channels": unreads})
+	dmUnreads, err := a.Messaging.DMUnreads(r.Context(), id)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	if dmUnreads == nil {
+		dmUnreads = []messaging.DMUnread{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"channels": unreads, "dms": dmUnreads})
 }

@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/search"
@@ -29,6 +30,7 @@ type Deps struct {
 	Identity  *identity.Service
 	Messaging *messaging.Service
 	Worktrack *worktrack.Service
+	DM        *dm.Service
 }
 
 type api struct {
@@ -79,6 +81,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/threads/{id}/messages", a.withAuth(a.handleListThreadMessages))
 	mux.HandleFunc("POST /api/v1/threads/{id}/read", a.withAuth(a.handleMarkRead))
 	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
+	mux.HandleFunc("POST /api/v1/dms", a.withAuth(a.handleOpenDM))
+	mux.HandleFunc("GET /api/v1/dms", a.withAuth(a.handleListDMs))
 	mux.HandleFunc("GET /api/v1/search", a.withAuth(a.handleSearch))
 	mux.HandleFunc("GET /api/v1/me", a.withAuth(a.handleMe))
 	mux.HandleFunc("GET /api/v1/users", a.withAuth(a.handleListUsers))

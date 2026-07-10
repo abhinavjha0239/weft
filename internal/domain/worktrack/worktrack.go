@@ -253,7 +253,7 @@ func (s *Service) CreateItem(ctx context.Context, actor auth.Identity, p CreateI
 		}
 		if strings.TrimSpace(p.Description) != "" {
 			if _, err := s.messaging.InsertThreadMessage(ctx, tx, actor,
-				threadID, nil, p.Description); err != nil {
+				threadID, nil, nil, p.Description); err != nil {
 				return err
 			}
 		}

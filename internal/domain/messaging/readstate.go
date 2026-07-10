@@ -30,17 +30,23 @@ import (
 func (s *Service) MarkRead(ctx context.Context, actor auth.Identity, threadID, upTo int64) (int64, error) {
 	var applied int64
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		var channelID *int64
+		var channelID, dmSpaceID *int64
 		if err := tx.QueryRow(ctx,
-			`SELECT channel_id FROM thread WHERE id = $1 AND org_id = $2`,
-			threadID, actor.OrgID).Scan(&channelID); err != nil {
+			`SELECT channel_id, dm_space_id FROM thread WHERE id = $1 AND org_id = $2`,
+			threadID, actor.OrgID).Scan(&channelID, &dmSpaceID); err != nil {
 			return apperr.NotFound("thread not found")
 		}
-		if channelID == nil {
-			return apperr.Invalid("only channel threads are supported here")
-		}
-		if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
-			return err
+		switch {
+		case channelID != nil:
+			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+				return err
+			}
+		case dmSpaceID != nil:
+			if err := s.requireParticipant(ctx, tx, *dmSpaceID, actor.UserID); err != nil {
+				return err
+			}
+		default:
+			return apperr.Invalid("space threads have no read watermark yet")
 		}
 		var newest int64
 		if err := tx.QueryRow(ctx,
@@ -75,6 +81,42 @@ type ChannelUnread struct {
 	ChannelID   int64 `json:"channel_id"`
 	UnreadCount int   `json:"unread_count"`
 	Mentioned   bool  `json:"mentioned"`
+}
+
+type DMUnread struct {
+	DMSpaceID   int64 `json:"dm_space_id"`
+	UnreadCount int   `json:"unread_count"`
+}
+
+// DMUnreads mirrors Unreads over the DM plane: per-conversation counts of
+// messages after the watermark, authored by someone else.
+func (s *Service) DMUnreads(ctx context.Context, actor auth.Identity) ([]DMUnread, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT m.dm_space_id, count(*) AS unread
+		FROM dm_participant dp
+		JOIN message m
+		  ON m.dm_space_id = dp.dm_space_id
+		 AND m.author_id <> dp.user_id
+		 AND m.deleted_at IS NULL
+		LEFT JOIN thread_read_watermark w
+		  ON w.user_id = dp.user_id AND w.thread_id = m.thread_id
+		WHERE dp.user_id = $1
+		  AND m.id > COALESCE(w.last_read_message_id, 0)
+		GROUP BY m.dm_space_id`,
+		actor.UserID)
+	if err != nil {
+		return nil, apperr.Internal("dm unreads", err)
+	}
+	defer rows.Close()
+	var out []DMUnread
+	for rows.Next() {
+		var u DMUnread
+		if err := rows.Scan(&u.DMSpaceID, &u.UnreadCount); err != nil {
+			return nil, apperr.Internal("scan dm unread", err)
+		}
+		out = append(out, u)
+	}
+	return out, rows.Err()
 }
 
 // Unreads returns per-channel unread counts for the actor across their

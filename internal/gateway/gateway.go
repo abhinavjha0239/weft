@@ -44,9 +44,11 @@ type client struct {
 	id     auth.Identity
 	lastID int64
 	wake   chan struct{}
-	// Channel-membership view for ACL filtering; refreshed when a membership
-	// event for this user arrives (F-2 replay rule, M0 slice).
+	// Membership views for ACL filtering (channels + DM participation);
+	// refreshed when a membership event for this user arrives (F-2 replay
+	// rule, M0 slice).
 	channels map[int64]bool
+	dms      map[int64]bool
 	// Inbound signal-frame budget (typing storms, abuse).
 	frameLimit *rate.Limiter
 	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
@@ -289,19 +291,35 @@ func (h *Hub) pump(ctx context.Context, c *client) error {
 	}
 }
 
-// filter applies the M0 ACL slice: channel-scoped events require membership;
-// events about this user's own membership trigger a view refresh.
+// filter applies the read ACL: channel-scoped events require membership,
+// DM-scoped events require participation, container-less events (spaces)
+// deliver org-wide. Events about this user's own membership trigger a view
+// refresh; dm.opened decides from its participant list because the invited
+// side's view predates the new conversation.
 func (c *client) filter(verb string, payload json.RawMessage) (deliver, refresh bool) {
 	var p struct {
-		ChannelID int64 `json:"channel_id"`
-		UserID    int64 `json:"user_id"`
+		ChannelID int64   `json:"channel_id"`
+		DMSpaceID int64   `json:"dm_space_id"`
+		UserID    int64   `json:"user_id"`
+		UserIDs   []int64 `json:"user_ids"`
 	}
 	_ = json.Unmarshal(payload, &p)
 	if (verb == "member.joined" || verb == "member.left") && p.UserID == c.id.UserID {
 		refresh = true
 	}
+	if verb == "dm.opened" {
+		for _, uid := range p.UserIDs {
+			if uid == c.id.UserID {
+				return true, true
+			}
+		}
+		return false, refresh
+	}
 	if p.ChannelID != 0 {
 		return c.channels[p.ChannelID], refresh
+	}
+	if p.DMSpaceID != 0 {
+		return c.dms[p.DMSpaceID], refresh
 	}
 	return true, refresh
 }
@@ -323,7 +341,25 @@ func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
 		set[id] = true
 	}
 	c.channels = set
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	drows, err := pool.Query(ctx,
+		`SELECT dm_space_id FROM dm_participant WHERE user_id = $1`, c.id.UserID)
+	if err != nil {
+		return err
+	}
+	defer drows.Close()
+	dset := map[int64]bool{}
+	for drows.Next() {
+		var id int64
+		if err := drows.Scan(&id); err != nil {
+			return err
+		}
+		dset[id] = true
+	}
+	c.dms = dset
+	return drows.Err()
 }
 
 // send serializes writes per connection: coder/websocket forbids concurrent

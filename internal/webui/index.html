@@ -55,6 +55,12 @@
   #splist{overflow-y:auto;flex:0 1 auto;padding:4px 8px}
   .sp .nm::before{content:"▦";font-size:11px;margin-right:6px;opacity:.6}
   .sp .key{font-size:10.5px;color:var(--dim);font-weight:700;letter-spacing:.5px}
+  #dmlist{overflow-y:auto;flex:0 1 auto;padding:4px 8px}
+  .dmrow .nm::before{content:"@";opacity:.55;margin-right:5px}
+  .picker{max-height:230px;overflow-y:auto;display:flex;flex-direction:column;gap:4px}
+  .picker label{display:flex;gap:9px;align-items:center;color:var(--text);font-size:13.5px;padding:6px 8px;border-radius:8px;cursor:pointer}
+  .picker label:hover{background:var(--panel2)}
+  .picker input[type=checkbox]{width:auto}
 
   main{display:flex;flex-direction:column;min-width:0}
   header{padding:13px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
@@ -161,6 +167,8 @@
     <div class="org"><div><b id="orgName"></b><div class="me" id="meName"></div></div><button id="logout">sign out</button></div>
     <div class="chhead"><span>Channels</span><button id="newCh" title="New channel">+</button></div>
     <div id="chlist"></div>
+    <div class="chhead"><span>Direct messages</span><button id="newDm" title="New conversation">+</button></div>
+    <div id="dmlist"></div>
     <div class="chhead"><span>Spaces</span><button id="newSp" title="New space">+</button></div>
     <div id="splist"></div>
   </aside>
@@ -236,6 +244,14 @@
   </form>
 </dialog>
 
+<dialog id="dmDialog">
+  <h3>New conversation</h3>
+  <form method="dialog" id="dmForm">
+    <div class="picker" id="dmPicker"></div>
+    <button class="primary">Start conversation</button>
+  </form>
+</dialog>
+
 <div id="toast"></div>
 
 <script>
@@ -247,7 +263,8 @@ const S = {
   channels: [], unreads: {}, users: {},
   ch: null, thread: 0, isRoot: true,
   spaces: [], space: null, items: [], statuses: [],
-  view: "chan", // "chan" (channel/thread chat) | "board" | "item"
+  dms: [], dm: null, dmUnreads: {},
+  view: "chan", // "chan" (channel/thread chat) | "board" | "item" | "dm"
   lastSeq: -1, ws: null, wsTries: 0,
   typingUntil: 0, typers: new Map(),
 };
@@ -302,7 +319,7 @@ $("#logout").onclick = signOut;
 async function enter(){
   $("#auth").style.display="none"; $("#app").classList.add("on");
   $("#orgName").textContent = S.org;
-  const [me] = await Promise.all([api("/me"), refreshChannels(), refreshSpaces()]);
+  const [me] = await Promise.all([api("/me"), refreshChannels(), refreshSpaces(), refreshDMs()]);
   S.me = me;
   S.users[me.user_id] = {id: me.user_id, full_name: me.full_name};
   $("#meName").textContent = me.full_name;
@@ -337,7 +354,8 @@ async function refreshChannels(){
   const [cl, un] = await Promise.all([api("/channels"), api("/unreads")]);
   S.channels = cl.channels;
   S.unreads = {}; (un.channels||[]).forEach(u=>S.unreads[u.channel_id]=u.unread_count);
-  renderChannels();
+  S.dmUnreads = {}; (un.dms||[]).forEach(u=>S.dmUnreads[u.dm_space_id]=u.unread_count);
+  renderChannels(); renderDMs();
 }
 
 function renderChannels(){
@@ -384,6 +402,7 @@ function setView(v){
   $("#input").placeholder = v==="item"
     ? "Comment…  (**bold**, `code`, @**Full Name**, :rocket:)"
     : "Message…  (**bold**, `code`, @**Full Name**, :rocket:)";
+  if (v!=="dm") S.dm = null;
   $("#threads").classList.remove("on");
   $("#results").classList.remove("on");
 }
@@ -396,7 +415,7 @@ async function openChannel(id){
   $("#viewTitle").textContent = "#"+S.ch.name;
   $("#viewDesc").textContent = S.ch.description||"";
   $("#crumb").style.display="none";
-  renderChannels(); renderSpaces();
+  renderChannels(); renderSpaces(); renderDMs();
   await Promise.all([loadMessages(), loadThreads()]);
   markRead();
 }
@@ -460,6 +479,76 @@ $("#thForm").onsubmit = async ()=>{
   } catch(err){ toast(err.message); }
 };
 
+/* ---------- direct messages ---------- */
+// A conversation's display name = the OTHER participants' names ("You" for
+// the self conversation).
+function dmName(d){
+  const others = d.participant_ids.filter(id=>id!==S.me.user_id);
+  if (!others.length) return "You";
+  return others.map(userName).join(", ");
+}
+
+async function refreshDMs(){
+  const r = await api("/dms");
+  S.dms = r.dms||[];
+  await resolveUsers(S.dms.flatMap(d=>d.participant_ids));
+  renderDMs();
+}
+
+function renderDMs(){
+  const el = $("#dmlist"); if (!el) return;
+  el.innerHTML="";
+  for (const d of S.dms){
+    const row = document.createElement("div");
+    row.className = "ch dmrow"+(S.dm && d.id===S.dm.id?" on":"");
+    const n = S.dmUnreads[d.id]||0;
+    row.innerHTML = `<span class="nm"></span>`+(n?`<span class="badge">${n}</span>`:"");
+    row.querySelector(".nm").textContent = dmName(d);
+    row.onclick = ()=>openDM(d);
+    el.appendChild(row);
+  }
+}
+
+async function openDM(d){
+  S.dm = d; S.ch = null; S.space = null;
+  S.thread = d.root_thread_id; S.isRoot = true;
+  setView("dm");
+  $("#viewTitle").textContent = dmName(d);
+  $("#viewDesc").textContent = d.kind===2 ? "group conversation" : "direct message";
+  $("#crumb").style.display="none";
+  renderChannels(); renderSpaces(); renderDMs();
+  await loadMessages();
+  markRead();
+}
+
+$("#newDm").onclick = async ()=>{
+  try {
+    const r = await api("/users");
+    const el = $("#dmPicker"); el.innerHTML="";
+    const others = (r.users||[]).filter(u=>u.id!==S.me.user_id);
+    if (!others.length){ toast("Nobody else is here yet"); return; }
+    for (const u of others){
+      const lab = document.createElement("label");
+      const cb = document.createElement("input");
+      cb.type="checkbox"; cb.value=String(u.id);
+      const nm = document.createElement("span"); nm.textContent = u.full_name;
+      lab.append(cb, nm);
+      el.appendChild(lab);
+    }
+    $("#dmDialog").showModal();
+  } catch(err){ toast(err.message); }
+};
+$("#dmForm").onsubmit = async ()=>{
+  const ids = [...document.querySelectorAll("#dmPicker input:checked")]
+    .map(cb=>Number(cb.value));
+  if (!ids.length) return;
+  try {
+    const d = await post("/dms", {user_ids: ids});
+    await refreshDMs();
+    openDM(S.dms.find(x=>x.id===d.id) || d);
+  } catch(err){ toast(err.message); }
+};
+
 /* ---------- spaces & board ---------- */
 async function refreshSpaces(){
   const r = await api("/spaces");
@@ -496,7 +585,7 @@ async function openBoard(spaceID){
   $("#viewTitle").textContent = sp.name;
   $("#viewDesc").textContent = sp.key;
   $("#crumb").style.display="none";
-  renderChannels(); renderSpaces();
+  renderChannels(); renderSpaces(); renderDMs();
   const [sts, its] = await Promise.all([
     api(`/spaces/${sp.id}/statuses`), api(`/spaces/${sp.id}/items`)]);
   S.statuses = sts.statuses||[]; S.items = its.items||[];
@@ -685,6 +774,7 @@ function connectWS(){
       case "channel.created": case "member.joined": case "member.left":
         refreshChannels(); break;
       case "space.created": refreshSpaces(); break;
+      case "dm.opened": refreshDMs(); break;
       case "workitem.created": case "workitem.updated":
       case "workitem.status_changed": case "workitem.promoted_from_thread":
         if (S.view==="board" && S.space && p.space_id===S.space.id) loadItems();
@@ -713,18 +803,22 @@ async function onMessage(p){
   } else if (p.channel_id){
     S.unreads[p.channel_id] = (S.unreads[p.channel_id]||0)+1;
     renderChannels();
+  } else if (p.dm_space_id){
+    S.dmUnreads[p.dm_space_id] = (S.dmUnreads[p.dm_space_id]||0)+1;
+    renderDMs();
   }
   if (S.ch && p.channel_id===S.ch.id && S.isRoot) loadThreads();
 }
 
 function markRead(){
-  // Read watermarks are channel-thread only for now (space read state is a
-  // later slice) — item views skip this.
-  if (!S.thread || !S.ch) return;
+  // Watermarks cover channel and DM threads (space read state is a later
+  // slice) — item views skip this.
+  if (!S.thread || (!S.ch && !S.dm)) return;
   if (S.ws && S.ws.readyState===1)
     S.ws.send(JSON.stringify({type:"read_marker", thread_id:S.thread, up_to:0}));
   else post(`/threads/${S.thread}/read`,{up_to:0}).catch(()=>{});
-  S.unreads[S.ch.id]=0; renderChannels();
+  if (S.ch){ S.unreads[S.ch.id]=0; renderChannels(); }
+  if (S.dm){ S.dmUnreads[S.dm.id]=0; renderDMs(); }
 }
 
 function signalTyping(){

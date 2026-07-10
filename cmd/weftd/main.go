@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/brand"
 	"github.com/abhinavjha0239/weft/internal/config"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/importer"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
@@ -123,6 +124,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Identity:  identity.New(pool, permsSvc),
 		Messaging: msgSvc,
 		Worktrack: worktrack.New(pool, permsSvc, msgSvc),
+		DM:        dm.New(pool),
 	})
 	ui, err := webui.Handler()
 	if err != nil {

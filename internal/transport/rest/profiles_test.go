@@ -129,10 +129,19 @@ func TestUserProfiles(t *testing.T) {
 		t.Fatalf("deactivated profile wrong: %+v", got.Users)
 	}
 
-	// Guards: missing ids, malformed id, over-cap list.
+	// Directory form (no ids): live members ordered by name; the
+	// deactivated user is absent.
+	if code := getJSON(t, ts.URL+"/api/v1/users", boot.Token, &got); code != http.StatusOK {
+		t.Fatalf("directory: %d, want 200", code)
+	}
+	if len(got.Users) != 1 || got.Users[0].FullName != "Alice Chen" {
+		t.Fatalf("directory = %+v, want just Alice (Bob deactivated)", got.Users)
+	}
+
+	// Guards: malformed id, over-cap list.
 	for name, q := range map[string]string{
-		"missing": "", "malformed": "?ids=1,zap",
-		"overcap": "?ids=" + strings.TrimSuffix(strings.Repeat("1,", 101), ","),
+		"malformed": "?ids=1,zap",
+		"overcap":   "?ids=" + strings.TrimSuffix(strings.Repeat("1,", 101), ","),
 	} {
 		u := ts.URL + "/api/v1/users" + q
 		req, _ := http.NewRequestWithContext(ctx, "GET", u, nil)
