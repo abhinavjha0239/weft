@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/brand"
 	"github.com/abhinavjha0239/weft/internal/config"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/compliance"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/files"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
@@ -141,6 +142,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		DM:            dm.New(pool),
 		Notifications: notification.New(pool),
 		Files:         filesSvc,
+		Compliance:    compliance.New(pool, permsSvc),
 	})
 	ui, err := webui.Handler()
 	if err != nil {

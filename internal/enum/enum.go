@@ -30,6 +30,7 @@ const (
 	EntityWorkspace EntityType = 9
 	EntityGroup     EntityType = 10
 	EntityDM        EntityType = 11
+	EntityLegalHold EntityType = 12
 )
 
 // UserKind is user_account.kind (CC-5: agent covers all non-human principals).
