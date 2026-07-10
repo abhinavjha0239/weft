@@ -21,7 +21,11 @@ import (
 // two humans + one bot; #general (collides with the bootstrap channel) and a
 // private #core-team (deactivated=false, invite_only); two topics; a DM that
 // must be skipped-with-count; a message with edit_history; an @**mention**;
-// a reaction; everything dated 2019 to prove backdating.
+// a reaction; everything dated 2019 to prove backdating. Groups: four system
+// role groups (administrators/members map, fullmembers coarsens to members,
+// nobody is unmappable) + custom "engineering" with a bot member (skipped)
+// and a members⊇engineering nesting edge; the members⊇fullmembers edge must
+// collapse to a dropped self-edge.
 const fixtureRealm = `{
   "zerver_userprofile": [
     {"id": 11, "delivery_email": "iago@zulip.test", "full_name": "Iago", "is_active": true, "is_bot": false, "role": 200, "date_joined": 1546300800},
@@ -42,6 +46,24 @@ const fixtureRealm = `{
     {"id": 42, "user_profile": 12, "recipient": 31, "active": true},
     {"id": 43, "user_profile": 11, "recipient": 32, "active": true},
     {"id": 44, "user_profile": 12, "recipient": 32, "active": false}
+  ],
+  "zerver_namedusergroup": [
+    {"id": 51, "name": "role:administrators", "description": "", "is_system_group": true, "deactivated": false, "date_created": null},
+    {"id": 52, "name": "role:members", "description": "", "is_system_group": true, "deactivated": false, "date_created": null},
+    {"id": 53, "name": "role:fullmembers", "description": "", "is_system_group": true, "deactivated": false, "date_created": null},
+    {"id": 54, "name": "role:nobody", "description": "", "is_system_group": true, "deactivated": false, "date_created": null},
+    {"id": 55, "name": "engineering", "description": "Eng team", "is_system_group": false, "deactivated": false, "date_created": 1546310000}
+  ],
+  "zerver_usergroupmembership": [
+    {"id": 61, "user_profile": 11, "user_group": 51},
+    {"id": 62, "user_profile": 12, "user_group": 52},
+    {"id": 63, "user_profile": 11, "user_group": 55},
+    {"id": 64, "user_profile": 12, "user_group": 55},
+    {"id": 65, "user_profile": 13, "user_group": 55}
+  ],
+  "zerver_groupgroupmembership": [
+    {"id": 71, "supergroup": 52, "subgroup": 55},
+    {"id": 72, "supergroup": 52, "subgroup": 53}
   ]
 }`
 
@@ -117,6 +139,13 @@ func TestZulipImportShowcase(t *testing.T) {
 		dry.EditHistoryDropped != 1 || dry.Reactions != 1 {
 		t.Fatalf("dry-run report off: %+v", dry)
 	}
+	// Groups: 1 custom; 3 mappable system groups (nobody has no counterpart);
+	// 2 custom memberships (the bot's is skipped); 1 edge (members⊇fullmembers
+	// collapses to a self-edge and is dropped).
+	if dry.Groups != 1 || dry.SystemGroupsMapped != 3 ||
+		dry.GroupMembers != 2 || dry.GroupEdges != 1 {
+		t.Fatalf("dry-run group accounting off: %+v", dry)
+	}
 	var n int
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM message WHERE origin_system = 'zulip'`).Scan(&n)
 	if n != 0 {
@@ -186,15 +215,70 @@ func TestZulipImportShowcase(t *testing.T) {
 		t.Fatalf("E3 violated: occurred=%v recorded=%v", occurred, recorded)
 	}
 
-	// Placeholders are claimable deactivated accounts of the placeholder kind.
-	var kind int16
+	// Placeholders are claimable deactivated accounts of the placeholder
+	// kind, with the SOURCE role (Zulip 200 = realm admin → Weft 20).
+	var kind, role int16
 	var deact *time.Time
 	_ = pool.QueryRow(ctx, `
-		SELECT kind, deactivated_at FROM user_account
+		SELECT kind, role, deactivated_at FROM user_account
 		WHERE org_id = $1 AND origin_system = 'zulip' AND origin_id = '11'`,
-		orgID).Scan(&kind, &deact)
-	if kind != 3 {
-		t.Fatalf("imported user kind = %d, want 3 (imported_placeholder)", kind)
+		orgID).Scan(&kind, &role, &deact)
+	if kind != 3 || role != 20 {
+		t.Fatalf("imported Iago kind=%d role=%d, want kind 3, role 20 (admin)", kind, role)
+	}
+
+	// Groups: same accounting as the dry run, plus real rows.
+	if rep.Groups != 1 || rep.SystemGroupsMapped != 3 ||
+		rep.GroupMembers != 2 || rep.GroupEdges != 1 || len(rep.RenamedGroups) != 0 {
+		t.Fatalf("group import report off: %+v", rep)
+	}
+	var engID int64
+	var engSystem bool
+	if err := pool.QueryRow(ctx, `
+		SELECT id, is_system FROM user_group
+		WHERE org_id = $1 AND origin_system = 'zulip' AND origin_id = '55'`,
+		orgID).Scan(&engID, &engSystem); err != nil {
+		t.Fatalf("engineering group not imported: %v", err)
+	}
+	if engSystem {
+		t.Fatal("imported custom group wrongly marked system")
+	}
+	var engMembers int
+	_ = pool.QueryRow(ctx,
+		`SELECT count(*) FROM user_group_member WHERE group_id = $1`, engID).Scan(&engMembers)
+	if engMembers != 2 {
+		t.Fatalf("engineering members = %d, want 2 (bot skipped)", engMembers)
+	}
+	// Nesting: seeded role:members now CONTAINS engineering, and the closure
+	// resolves imported users through BOTH lanes — Hamlet via his member
+	// role, Iago via role-chain nesting AND via engineering.
+	var nested bool
+	_ = pool.QueryRow(ctx, `
+		SELECT EXISTS (
+		  SELECT 1 FROM user_group_subgroup s
+		  JOIN user_group g ON g.id = s.group_id
+		  WHERE g.org_id = $1 AND g.name = 'role:members' AND s.subgroup_id = $2)`,
+		orgID, engID).Scan(&nested)
+	if !nested {
+		t.Fatal("members ⊇ engineering edge not imported")
+	}
+	var iagoInClosure, hamletInClosure bool
+	var hamletID int64
+	_ = pool.QueryRow(ctx, `
+		SELECT id FROM user_account WHERE org_id = $1
+		 AND origin_system = 'zulip' AND origin_id = '12'`, orgID).Scan(&hamletID)
+	_ = pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_group_closure gc
+		  JOIN user_group g ON g.id = gc.group_id
+		  WHERE g.org_id = $1 AND g.name = 'role:admins' AND gc.user_id = $2)`,
+		orgID, iagoID).Scan(&iagoInClosure)
+	_ = pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_group_closure gc
+		  WHERE gc.group_id = $1 AND gc.user_id = $2)`,
+		engID, hamletID).Scan(&hamletInClosure)
+	if !iagoInClosure || !hamletInClosure {
+		t.Fatalf("closure not rebuilt: iago-admin=%v hamlet-engineering=%v",
+			iagoInClosure, hamletInClosure)
 	}
 
 	// Idempotency (D5): a re-run imports nothing new and duplicates nothing.
@@ -202,7 +286,9 @@ func TestZulipImportShowcase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-run: %v", err)
 	}
-	if rep2.Messages != 0 || rep2.Users != 0 || rep2.Channels != 0 || rep2.Threads != 0 {
+	if rep2.Messages != 0 || rep2.Users != 0 || rep2.Channels != 0 ||
+		rep2.Threads != 0 || rep2.Groups != 0 || rep2.GroupMembers != 0 ||
+		rep2.GroupEdges != 0 {
 		t.Fatalf("re-run imported new rows: %+v", rep2)
 	}
 	if rep2.AlreadyImported == 0 {

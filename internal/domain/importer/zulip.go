@@ -27,6 +27,9 @@ type zulipRealmFile struct {
 	Streams       []zulipStream       `json:"zerver_stream"`
 	Recipients    []zulipRecipient    `json:"zerver_recipient"`
 	Subscriptions []zulipSubscription `json:"zerver_subscription"`
+	NamedGroups   []zulipNamedGroup   `json:"zerver_namedusergroup"`
+	GroupMembers  []zulipGroupMember  `json:"zerver_usergroupmembership"`
+	GroupEdges    []zulipGroupEdge    `json:"zerver_groupgroupmembership"`
 }
 
 type zulipUser struct {
@@ -71,6 +74,30 @@ type zulipSubscription struct {
 	Active      bool  `json:"active"`
 }
 
+// zulipNamedGroup is a zerver_namedusergroup row. Zulip keeps group names on
+// NamedUserGroup (an MTI child of UserGroup); the exported "id" duplicates
+// the usergroup pointer, i.e. it IS the group id memberships reference.
+// Anonymous UserGroup rows (setting values) are deliberately not modeled.
+type zulipNamedGroup struct {
+	ID          int64    `json:"id"`
+	Name        string   `json:"name"`
+	Description string   `json:"description"`
+	IsSystem    bool     `json:"is_system_group"`
+	Deactivated bool     `json:"deactivated"`
+	DateCreated *float64 `json:"date_created"`
+}
+
+type zulipGroupMember struct {
+	UserProfile int64 `json:"user_profile"`
+	UserGroup   int64 `json:"user_group"`
+}
+
+// zulipGroupEdge: supergroup CONTAINS subgroup (zerver_groupgroupmembership).
+type zulipGroupEdge struct {
+	Supergroup int64 `json:"supergroup"`
+	Subgroup   int64 `json:"subgroup"`
+}
+
 type zulipMessageFile struct {
 	Messages  []zulipMessage  `json:"zerver_message"`
 	Reactions []zulipReaction `json:"zerver_reaction"`
@@ -98,6 +125,9 @@ type Export struct {
 	Users         []zulipUser
 	Streams       []zulipStream
 	Subscriptions []zulipSubscription
+	NamedGroups   []zulipNamedGroup
+	GroupMembers  []zulipGroupMember
+	GroupEdges    []zulipGroupEdge
 	Messages      []zulipMessage
 	Reactions     []zulipReaction
 
@@ -118,6 +148,9 @@ func LoadZulipExport(dir string) (*Export, error) {
 		Users:             realm.Users,
 		Streams:           realm.Streams,
 		Subscriptions:     realm.Subscriptions,
+		NamedGroups:       realm.NamedGroups,
+		GroupMembers:      realm.GroupMembers,
+		GroupEdges:        realm.GroupEdges,
 		StreamByRecipient: map[int64]int64{},
 		DMRecipients:      map[int64]bool{},
 	}
