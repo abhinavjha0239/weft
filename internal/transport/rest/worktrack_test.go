@@ -109,9 +109,27 @@ func TestWorkItemFusion(t *testing.T) {
 		t.Fatalf("description-as-root-message wrong: %+v", desc.Messages)
 	}
 	// Commenting on the item = posting to its (space-governed) thread.
-	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, task.ThreadID),
-		boot.Token, map[string]any{"content": "triage note"}); code != http.StatusCreated {
-		t.Fatalf("item comment: %d, want 201", code)
+	var comment struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, task.ThreadID),
+		boot.Token, map[string]any{"content": "triage note"}, &comment)
+	// Space-thread messages are org-visible: a user with NO channel in common
+	// with the message can still fetch it by id (the membership-join Get
+	// used to 404 exactly this).
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@f.test", "Bob Ray", "bobfusetok")
+	var fetched struct {
+		ChannelID int64  `json:"channel_id"`
+		ThreadID  int64  `json:"thread_id"`
+		Source    string `json:"source"`
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, comment.MessageID),
+		bobTok, &fetched); code != http.StatusOK {
+		t.Fatalf("space-thread message fetch by org member: %d, want 200", code)
+	}
+	if fetched.ChannelID != 0 || fetched.ThreadID != task.ThreadID || fetched.Source != "triage note" {
+		t.Fatalf("space-thread message fetch wrong: %+v", fetched)
 	}
 
 	// THE FUSION: a chat thread in #general → promote → WEFT-2, same thread.
