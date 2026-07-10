@@ -20,6 +20,28 @@ const (
 	VerbComplianceOfficer = "compliance_officer" // F-9: NOT in any preset
 )
 
+// knownVerbs gates admin reassignment: only verbs the code actually checks
+// may be assigned, so a typo can't mint a dead grant.
+var knownVerbs = map[string]bool{
+	VerbSendMessage:       true,
+	VerbCreateThread:      true,
+	VerbEditThreadTitle:   true,
+	VerbResolveThreads:    true,
+	VerbCreateChannel:     true,
+	VerbCreateSpace:       true,
+	VerbCreateItems:       true,
+	VerbEditItems:         true,
+	VerbInviteMembers:     true,
+	VerbAdministerChannel: true,
+	VerbModerateMessages:  true,
+	VerbManageOrg:         true,
+	VerbManageBilling:     true,
+	VerbComplianceOfficer: true,
+}
+
+// KnownVerb reports whether verb is in the registry.
+func KnownVerb(verb string) bool { return knownVerbs[verb] }
+
 // System role groups (ADR-006 P-2: roles are presets over groups), nested
 // owners ⊂ admins ⊂ moderators ⊂ members ⊂ everyone.
 const (

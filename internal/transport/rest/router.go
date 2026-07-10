@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/domain/compliance"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/files"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
@@ -36,6 +37,8 @@ type Deps struct {
 	// Notifications is optional in tests that never hit the endpoints.
 	Notifications *notification.Service
 	Files         *files.Service
+	// Compliance is optional in tests that never hit the admin endpoints.
+	Compliance *compliance.Service
 }
 
 type api struct {
@@ -109,6 +112,12 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/items/{id}", a.withAuth(a.handleUpdateItem))
 	mux.HandleFunc("POST /api/v1/threads/{id}/promote", a.withAuth(a.handlePromoteThread))
 	mux.HandleFunc("POST /api/v1/threads/{id}/messages", a.withAuth(a.handleSendToThread))
+	mux.HandleFunc("PUT /api/v1/admin/verbs", a.withAuth(a.handleAssignVerb))
+	mux.HandleFunc("PUT /api/v1/admin/retention-policies", a.withAuth(a.handleSetRetentionPolicy))
+	mux.HandleFunc("GET /api/v1/admin/retention-policies", a.withAuth(a.handleListRetentionPolicies))
+	mux.HandleFunc("POST /api/v1/admin/legal-holds", a.withAuth(a.handleCreateLegalHold))
+	mux.HandleFunc("GET /api/v1/admin/legal-holds", a.withAuth(a.handleListLegalHolds))
+	mux.HandleFunc("POST /api/v1/admin/legal-holds/{id}/release", a.withAuth(a.handleReleaseLegalHold))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
