@@ -213,3 +213,31 @@ func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64
 	}
 	return out, rows.Err()
 }
+
+// Directory lists the org's live members (humans and agents) for pickers,
+// ordered by name. Capped at 200 — paging arrives when an org that size
+// consumes it (the batch ids= form stays the bulk-resolution path).
+func (s *Service) Directory(ctx context.Context, actor auth.Identity, limit int) ([]Profile, error) {
+	if limit <= 0 || limit > 200 {
+		limit = 200
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, full_name, kind, false
+		FROM user_account
+		WHERE org_id = $1 AND deactivated_at IS NULL AND kind IN (1, 2)
+		ORDER BY lower(full_name), id
+		LIMIT $2`, actor.OrgID, limit)
+	if err != nil {
+		return nil, apperr.Internal("directory", err)
+	}
+	defer rows.Close()
+	var out []Profile
+	for rows.Next() {
+		var p Profile
+		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated); err != nil {
+			return nil, apperr.Internal("scan directory", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}

@@ -18,12 +18,21 @@ func (a *api) handleMe(w http.ResponseWriter, r *http.Request, id auth.Identity)
 	writeJSON(w, http.StatusOK, me)
 }
 
-// handleListUsers is the batch profile lookup: GET /users?ids=1,2,3.
-// The unfiltered directory form arrives with its consumer (mention picker).
+// handleListUsers serves both profile forms: GET /users?ids=1,2,3 is the
+// batch lookup; without ids it is the active-member directory (pickers).
 func (a *api) handleListUsers(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	raw := r.URL.Query().Get("ids")
 	if raw == "" {
-		writeError(w, http.StatusBadRequest, "ids required (comma-separated user ids)")
+		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+		users, err := a.Identity.Directory(r.Context(), id, limit)
+		if err != nil {
+			writeDomainError(w, a.Log, r, err)
+			return
+		}
+		if users == nil {
+			users = []identity.Profile{}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"users": users})
 		return
 	}
 	var ids []int64
