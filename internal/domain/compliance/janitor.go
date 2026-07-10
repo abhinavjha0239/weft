@@ -134,6 +134,9 @@ func (j *Janitor) SweepOnce(ctx context.Context, now time.Time) (Report, error) 
 		"dead_references", &rep.DeadRefPurged, &rep.BlobsDeleted); err != nil {
 		return rep, err
 	}
+	if err := j.scrubRevisions(ctx, &rep.RevisionsScrubbed); err != nil {
+		return rep, err
+	}
 	return rep, nil
 }
 
@@ -247,4 +250,91 @@ func (j *Janitor) purgeFile(ctx context.Context, fileID int64, predicate string,
 		*blobs++
 	}
 	return nil
+}
+
+// scrubRevisions purges prior message versions wherever the EFFECTIVE
+// retention policy says keep_edits=false — the AD-3 "delete edits" toggle.
+// The scope ladder is nearest-wins: channel override, then the org default;
+// messages outside any channel (DMs, space threads) resolve to the org
+// default until their own rungs land. Only content-bearing edit revisions
+// (kind 1 content, 2 title) are scrubbed, and only their prev_source/
+// prev_ast: the structural record (who edited, when) survives, matching
+// AD-5 — purged versions are absent from exports by design. Kind 4 rows
+// (deletion capture) are evidence for the message-retention lane, never
+// touched here. Holds freeze matching content: a custodian's or held
+// channel's revisions keep their originals (AD-4). New edits in a
+// keep_edits=false scope are scrubbed on the next sweep, so prior versions
+// linger at most one janitor interval.
+func (j *Janitor) scrubRevisions(ctx context.Context, scrubbed *int) error {
+	for {
+		var batch int
+		err := db.WithTx(ctx, j.pool, func(tx pgx.Tx) error {
+			rows, err := tx.Query(ctx, `
+				SELECT mr.id, m.org_id
+				FROM message_revision mr
+				JOIN message m ON m.id = mr.message_id
+				WHERE mr.kind IN (1, 2)
+				  AND (mr.prev_source IS NOT NULL OR mr.prev_ast IS NOT NULL)
+				  AND COALESCE(
+				      (SELECT rp.keep_edits FROM retention_policy rp
+				       WHERE rp.org_id = m.org_id AND rp.scope_type = 3
+				         AND rp.scope_id = m.channel_id),
+				      (SELECT rp.keep_edits FROM retention_policy rp
+				       WHERE rp.org_id = m.org_id AND rp.scope_type = 1
+				         AND rp.scope_id = m.org_id),
+				      true) = false
+				  AND NOT EXISTS (
+				      SELECT 1 FROM legal_hold h
+				      WHERE h.org_id = m.org_id AND h.released_at IS NULL
+				        AND (h.custodian_user_id = m.author_id
+				          OR h.channel_id = m.channel_id))
+				ORDER BY mr.id LIMIT `+fmt.Sprint(sweepBatch))
+			if err != nil {
+				return fmt.Errorf("janitor: scrub scan: %w", err)
+			}
+			var ids []int64
+			perOrg := map[int64]int{}
+			for rows.Next() {
+				var id, orgID int64
+				if err := rows.Scan(&id, &orgID); err != nil {
+					rows.Close()
+					return fmt.Errorf("janitor: scrub scan: %w", err)
+				}
+				ids = append(ids, id)
+				perOrg[orgID]++
+			}
+			rows.Close()
+			if err := rows.Err(); err != nil {
+				return fmt.Errorf("janitor: scrub scan: %w", err)
+			}
+			if len(ids) == 0 {
+				return nil
+			}
+			if _, err := tx.Exec(ctx, `
+				UPDATE message_revision
+				SET prev_source = NULL, prev_ast = NULL
+				WHERE id = ANY($1)`, ids); err != nil {
+				return fmt.Errorf("janitor: scrub: %w", err)
+			}
+			for orgID, n := range perOrg {
+				if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+					OrgID: orgID, ActorKind: enum.ActorSystem,
+					EntityType: enum.EntityOrg, EntityID: orgID,
+					Verb:    "retention.revisions_scrubbed",
+					Payload: eventlog.MustPayload(map[string]any{"count": n}),
+				}); err != nil {
+					return fmt.Errorf("janitor: scrub event: %w", err)
+				}
+			}
+			batch = len(ids)
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		*scrubbed += batch
+		if batch < sweepBatch {
+			return nil
+		}
+	}
 }
