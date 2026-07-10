@@ -61,7 +61,17 @@ type Identity struct {
 	UserID int64
 	OrgID  int64
 	Kind   int16
+	// Role is the preset pointer (10 owner … 50 guest). Synthetic
+	// identities (runners) leave it 0 — never a guest.
+	Role int16
 }
+
+// GuestRole is the P-5 visibility boundary: at or above it, read surfaces
+// shrink to the user's own channels.
+const GuestRole int16 = 50
+
+// IsGuest reports whether the identity is visibility-restricted (P-5).
+func (id Identity) IsGuest() bool { return id.Role >= GuestRole }
 
 // Login verifies email+password and mints a session.
 func Login(ctx context.Context, pool *pgxpool.Pool, orgSlug, email, password string) (string, error) {
@@ -85,12 +95,12 @@ func Login(ctx context.Context, pool *pgxpool.Pool, orgSlug, email, password str
 func FromToken(ctx context.Context, pool *pgxpool.Pool, token string) (Identity, error) {
 	var id Identity
 	err := pool.QueryRow(ctx, `
-		SELECT u.id, u.org_id, u.kind
+		SELECT u.id, u.org_id, u.kind, u.role
 		FROM auth_session s
 		JOIN user_account u ON u.id = s.user_id
 		WHERE s.token_hash = $1 AND s.revoked_at IS NULL
 		  AND s.expires_at > now() AND u.deactivated_at IS NULL`,
-		hashToken(token)).Scan(&id.UserID, &id.OrgID, &id.Kind)
+		hashToken(token)).Scan(&id.UserID, &id.OrgID, &id.Kind, &id.Role)
 	if err != nil {
 		return Identity{}, ErrUnauthorized
 	}

@@ -159,6 +159,7 @@ type ChannelSummary struct {
 // ListChannels: the ADR-008 C-2 read-model slice — public channels are
 // discoverable org-wide; private channels appear only to members.
 func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]ChannelSummary, error) {
+	// Guests (P-5) see ONLY their channels; members also see public ones.
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id, c.name, c.description, c.visibility = 2,
 		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0)
@@ -166,9 +167,9 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 		LEFT JOIN channel_member cm
 		  ON cm.channel_id = c.id AND cm.user_id = $2 AND cm.unsubscribed_at IS NULL
 		WHERE c.org_id = $1 AND c.archived_at IS NULL
-		  AND (c.visibility = 1 OR cm.user_id IS NOT NULL)
+		  AND ((NOT $3 AND c.visibility = 1) OR cm.user_id IS NOT NULL)
 		ORDER BY c.name`,
-		actor.OrgID, actor.UserID)
+		actor.OrgID, actor.UserID, actor.IsGuest())
 	if err != nil {
 		return nil, apperr.Internal("list channels", err)
 	}
