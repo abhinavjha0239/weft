@@ -112,6 +112,20 @@ func TestAutomationCRUD(t *testing.T) {
 		t.Fatalf("scope escape = %d, want 400", code)
 	}
 
+	// The trigger catalog spans subsystems (AU-1): a reaction trigger is
+	// accepted like any other log verb (created and removed here so the
+	// list assertions below stay exact).
+	var onReact automation.Automation
+	postJSON(t, ts.URL+"/api/v1/automations", boot.Token, map[string]any{
+		"scope_type": 3, "scope_id": boot.ChannelID, "name": "on-react",
+		"definition": def("reaction.added", 0, "noted")}, &onReact)
+	if onReact.ID == 0 {
+		t.Fatal("reaction trigger must be accepted")
+	}
+	if code := deleteReq(t, fmt.Sprintf("%s/api/v1/automations/%d", ts.URL, onReact.ID), boot.Token); code != http.StatusOK {
+		t.Fatalf("delete on-react = %d", code)
+	}
+
 	// Create (disabled by default) → enable → list shows it.
 	var rule automation.Automation
 	postJSON(t, ts.URL+"/api/v1/automations", boot.Token, map[string]any{
