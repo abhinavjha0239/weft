@@ -13,6 +13,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
@@ -21,6 +22,9 @@ import (
 // files import, and nil-safe for tests that never attach).
 type FileAttacher interface {
 	AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor auth.Identity, messageID int64, fileIDs []int64) (int, error)
+	// Scheduled sends pin their attachments until delivery or cancellation.
+	AttachEntityReferences(ctx context.Context, tx pgx.Tx, actor auth.Identity, entity enum.EntityType, entityID int64, fileIDs []int64) (int, error)
+	ReleaseEntityReferences(ctx context.Context, tx pgx.Tx, entity enum.EntityType, entityID int64) error
 }
 
 type Service struct {

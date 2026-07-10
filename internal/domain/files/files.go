@@ -231,11 +231,19 @@ func (s *Service) OpenDownload(ctx context.Context, actor auth.Identity, fileID 
 }
 
 // AttachMessageReferences records file_reference rows for the given file
-// ids on a message — called in the message-write transaction. Only files
-// from the SAME ORG attach, and only ones the author may read (their own
-// uploads or files already visible to them); anything else is silently
-// skipped, never an error (a bad link must not block a send).
+// ids on a message — called in the message-write transaction.
 func (s *Service) AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor auth.Identity, messageID int64, fileIDs []int64) (int, error) {
+	return s.AttachEntityReferences(ctx, tx, actor, enum.EntityMessage, messageID, fileIDs)
+}
+
+// AttachEntityReferences records file_reference rows for any entity (live
+// messages, scheduled messages awaiting delivery). Only files from the
+// SAME ORG attach, and only ones the AUTHOR may read — their own uploads
+// or files already visible via a live MESSAGE reference (the inner check
+// stays entity_type=1: message references define visibility; other kinds
+// only pin). Anything else is silently skipped, never an error (a bad
+// link must not block a send).
+func (s *Service) AttachEntityReferences(ctx context.Context, tx pgx.Tx, actor auth.Identity, entity enum.EntityType, entityID int64, fileIDs []int64) (int, error) {
 	attached := 0
 	for _, fid := range fileIDs {
 		ct, err := tx.Exec(ctx, `
@@ -245,7 +253,7 @@ func (s *Service) AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor 
 			WHERE f.id = $1 AND f.org_id = $5 AND f.deleted_at IS NULL
 			  AND (f.uploader_id = $4 OR EXISTS (
 			      SELECT 1 FROM file_reference fr2
-			      JOIN message m2 ON fr2.entity_type = $2 AND m2.id = fr2.entity_id
+			      JOIN message m2 ON fr2.entity_type = 1 AND m2.id = fr2.entity_id
 			      WHERE fr2.file_id = f.id AND m2.deleted_at IS NULL
 			        AND ((m2.channel_id IS NOT NULL AND EXISTS (
 			               SELECT 1 FROM channel_member cm
@@ -256,7 +264,7 @@ func (s *Service) AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor 
 			               WHERE dp.dm_space_id = m2.dm_space_id AND dp.user_id = $4))
 			          OR (m2.channel_id IS NULL AND m2.dm_space_id IS NULL))))
 			ON CONFLICT DO NOTHING`,
-			fid, int16(enum.EntityMessage), messageID, actor.UserID, actor.OrgID)
+			fid, int16(entity), entityID, actor.UserID, actor.OrgID)
 		if err != nil {
 			return attached, apperr.Internal("attach reference", err)
 		}
@@ -265,6 +273,18 @@ func (s *Service) AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor 
 		}
 	}
 	return attached, nil
+}
+
+// ReleaseEntityReferences drops one entity's file references — a scheduled
+// message delivered or cancelled releases its pins (the LIVE message
+// re-claims its files itself).
+func (s *Service) ReleaseEntityReferences(ctx context.Context, tx pgx.Tx, entity enum.EntityType, entityID int64) error {
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM file_reference WHERE entity_type = $1 AND entity_id = $2`,
+		int16(entity), entityID); err != nil {
+		return apperr.Internal("release references", err)
+	}
+	return nil
 }
 
 // StorageKey is THE content-addressed blob key derivation: org-scoped with
