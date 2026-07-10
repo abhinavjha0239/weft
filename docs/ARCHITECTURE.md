@@ -44,6 +44,13 @@ internal/
 - A module = `service.go` (exported API, takes ctx + domain types),
   `store.go` (all SQL — pgx directly, no ORM), `types.go`, `*_test.go`
   (integration, real PG — the established pattern).
+- **Infra seams (standing directive): every infrastructure choice hides
+  behind a platform interface chosen by config, so operators swap backends
+  without touching core code.** First instance: `platform/blob.Store`
+  (`WEFT_BLOB_DRIVER`) — `fs` for bare metal/any mounted volume ships
+  first; S3/GCS/Azure are one file implementing the interface plus a
+  factory case. The same pattern applies to any future cache, queue, or
+  media dependency (the LiveKit seam is the founding example).
 
 ## 2. The write path (the one pattern everything follows)
 

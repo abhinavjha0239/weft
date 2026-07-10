@@ -16,10 +16,22 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
+// FileAttacher records attachment references at message-write time; the
+// files service implements it (an interface keeps messaging free of the
+// files import, and nil-safe for tests that never attach).
+type FileAttacher interface {
+	AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor auth.Identity, messageID int64, fileIDs []int64) (int, error)
+}
+
 type Service struct {
 	pool  *pgxpool.Pool
 	perms *perms.Service
+	files FileAttacher
 }
+
+// SetFiles wires the attachment hook (same pattern as the gateway's
+// MarkReader — set at composition time).
+func (s *Service) SetFiles(f FileAttacher) { s.files = f }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
 	return &Service{pool: pool, perms: p}

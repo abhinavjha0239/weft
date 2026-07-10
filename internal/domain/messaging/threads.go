@@ -387,6 +387,23 @@ func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth
 		doc.HasLink()).Scan(&msgID); err != nil {
 		return 0, apperr.Internal("insert message", err)
 	}
+	// Attachment references: any /api/v1/files/{id} link in the content
+	// becomes a file_reference (union-of-referencing-ACLs, ADR-012) —
+	// unattachable ids are skipped by the files service, never an error.
+	if s.files != nil {
+		if ids := fileIDsFromLinks(doc.Links()); len(ids) > 0 {
+			attached, err := s.files.AttachMessageReferences(ctx, tx, actor, msgID, ids)
+			if err != nil {
+				return 0, err
+			}
+			if attached > 0 {
+				if _, err := tx.Exec(ctx,
+					`UPDATE message SET has_attachment = true WHERE id = $1`, msgID); err != nil {
+					return 0, apperr.Internal("flag attachment", err)
+				}
+			}
+		}
+	}
 	payload := map[string]any{
 		"message_id": msgID, "thread_id": threadID, "mentions": doc.Mentions()}
 	if channelID != nil {
@@ -490,4 +507,28 @@ func decodeCursor(c string) (time.Time, int64, error) {
 		return time.Time{}, 0, apperr.Invalid("bad cursor")
 	}
 	return time.Unix(0, ns), id, nil
+}
+
+// fileIDsFromLinks extracts managed-file ids from link destinations —
+// relative or absolute forms of /api/v1/files/{id}.
+func fileIDsFromLinks(links []string) []int64 {
+	var out []int64
+	for _, l := range links {
+		idx := strings.Index(l, "/api/v1/files/")
+		if idx < 0 {
+			continue
+		}
+		rest := l[idx+len("/api/v1/files/"):]
+		end := 0
+		for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+			end++
+		}
+		if end == 0 {
+			continue
+		}
+		if id, err := strconv.ParseInt(rest[:end], 10, 64); err == nil {
+			out = append(out, id)
+		}
+	}
+	return out
 }
