@@ -469,56 +469,75 @@ func (s *Service) SendToThread(ctx context.Context, actor auth.Identity, threadI
 	}
 	var msgID int64
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		var channelID, dmSpaceID, spaceID *int64
-		var kind int16
-		err := tx.QueryRow(ctx, `
-			SELECT channel_id, dm_space_id, space_id, kind FROM thread
-			WHERE id = $1 AND org_id = $2`, threadID, actor.OrgID).
-			Scan(&channelID, &dmSpaceID, &spaceID, &kind)
-		if err != nil {
-			return apperr.NotFound("thread not found")
-		}
-		switch {
-		case channelID != nil:
-			chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, *channelID)
-			if err != nil {
-				return err
-			}
-			if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
-				return err
-			}
-			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
-				return err
-			}
-			if err := s.requireLiveChannel(ctx, tx, actor.OrgID, *channelID); err != nil {
-				return err
-			}
-		case dmSpaceID != nil:
-			if err := s.requireParticipant(ctx, tx, *dmSpaceID, actor.UserID); err != nil {
-				return err
-			}
-		default:
-			if err := s.perms.Require(ctx, tx, actor, perms.VerbEditItems,
-				perms.OrgScope(actor.OrgID)); err != nil {
-				return err
-			}
-		}
-		msgID, err = s.InsertThreadMessage(ctx, tx, actor, threadID, channelID, dmSpaceID, contentSrc)
-		if err != nil {
-			return err
-		}
-		if kind == 1 {
-			if _, err := tx.Exec(ctx, `
-				UPDATE thread SET last_activity_at = now(),
-				       message_count = message_count + 1 WHERE id = $1`,
-				threadID); err != nil {
-				return apperr.Internal("bump thread", err)
-			}
-		}
-		return nil
+		var err error
+		msgID, err = s.deliverToThread(ctx, tx, actor, threadID, contentSrc)
+		return err
 	})
 	if err != nil {
 		return 0, err
+	}
+	return msgID, nil
+}
+
+// requireThreadSend runs the full container gate for posting into a thread
+// and returns its containers — shared by the live send path and the
+// scheduled-delivery runner (which re-checks at fire time: access revoked
+// between scheduling and sending must fail the send).
+func (s *Service) requireThreadSend(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64) (channelID, dmSpaceID *int64, kind int16, err error) {
+	var spaceID *int64
+	err = tx.QueryRow(ctx, `
+		SELECT channel_id, dm_space_id, space_id, kind FROM thread
+		WHERE id = $1 AND org_id = $2`, threadID, actor.OrgID).
+		Scan(&channelID, &dmSpaceID, &spaceID, &kind)
+	if err != nil {
+		return nil, nil, 0, apperr.NotFound("thread not found")
+	}
+	switch {
+	case channelID != nil:
+		chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, *channelID)
+		if err != nil {
+			return nil, nil, 0, err
+		}
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
+			return nil, nil, 0, err
+		}
+		if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+			return nil, nil, 0, err
+		}
+		if err := s.requireLiveChannel(ctx, tx, actor.OrgID, *channelID); err != nil {
+			return nil, nil, 0, err
+		}
+	case dmSpaceID != nil:
+		if err := s.requireParticipant(ctx, tx, *dmSpaceID, actor.UserID); err != nil {
+			return nil, nil, 0, err
+		}
+	default:
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbEditItems,
+			perms.OrgScope(actor.OrgID)); err != nil {
+			return nil, nil, 0, err
+		}
+	}
+	return channelID, dmSpaceID, kind, nil
+}
+
+// deliverToThread is the gated in-transaction delivery: container gate,
+// insert, activity bump (never on channel roots, F-15).
+func (s *Service) deliverToThread(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, contentSrc string) (int64, error) {
+	channelID, dmSpaceID, kind, err := s.requireThreadSend(ctx, tx, actor, threadID)
+	if err != nil {
+		return 0, err
+	}
+	msgID, err := s.InsertThreadMessage(ctx, tx, actor, threadID, channelID, dmSpaceID, contentSrc)
+	if err != nil {
+		return 0, err
+	}
+	if kind == 1 {
+		if _, err := tx.Exec(ctx, `
+			UPDATE thread SET last_activity_at = now(),
+			       message_count = message_count + 1 WHERE id = $1`,
+			threadID); err != nil {
+			return 0, apperr.Internal("bump thread", err)
+		}
 	}
 	return msgID, nil
 }
