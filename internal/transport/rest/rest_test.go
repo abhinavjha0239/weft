@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +16,12 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/migrations"
 )
 
 // End-to-end M0 test: bootstrap → login-token → WebSocket → REST send →
@@ -158,19 +158,10 @@ func resetAndMigrate(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	files, _ := filepath.Glob("../../../migrations/0*.sql")
-	if len(files) == 0 {
-		t.Fatal("no migrations found")
-	}
-	sort.Strings(files)
-	for _, f := range files {
-		sql, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("apply %s: %v", f, err)
-		}
+	// The production runner against the embedded schema: tests exercise the
+	// same migration path operators run.
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 }
 

@@ -4,14 +4,14 @@ import (
 	"context"
 	"encoding/json"
 	"os"
-	"path/filepath"
-	"sort"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/enum"
+	"github.com/abhinavjha0239/weft/migrations"
 )
 
 // Integration tests: need a real Postgres. Set TEST_DATABASE_URL, e.g.
@@ -41,19 +41,8 @@ func applyMigrations(t *testing.T, pool *pgxpool.Pool) {
 		`DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset schema: %v", err)
 	}
-	files, err := filepath.Glob("../../migrations/0*.sql")
-	if err != nil || len(files) == 0 {
-		t.Fatalf("no migrations found: %v", err)
-	}
-	sort.Strings(files)
-	for _, f := range files {
-		sql, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("apply %s: %v", f, err)
-		}
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 }
 
