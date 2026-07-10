@@ -5,8 +5,10 @@ package identity
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
@@ -64,7 +66,13 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 		if err := tx.QueryRow(ctx,
 			`INSERT INTO org (name, slug) VALUES ($1, $2) RETURNING id`,
 			p.OrgName, p.OrgSlug).Scan(&out.OrgID); err != nil {
-			return apperr.Conflict("org slug unavailable")
+			// Only an actual duplicate slug is the client's problem;
+			// anything else (e.g. an unmigrated database) is ours.
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && pgErr.Code == "23505" { // unique_violation
+				return apperr.Conflict("org slug unavailable")
+			}
+			return apperr.Internal("create org", err)
 		}
 		if err := tx.QueryRow(ctx,
 			`INSERT INTO workspace (org_id, name, slug) VALUES ($1, 'General', 'general') RETURNING id`,
