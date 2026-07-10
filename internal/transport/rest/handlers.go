@@ -109,3 +109,36 @@ func (a *api) handleGateway(w http.ResponseWriter, r *http.Request) {
 	}
 	a.Hub.Serve(w, r, id)
 }
+
+func (a *api) handleEditMessage(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	msgID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad message id")
+		return
+	}
+	type req struct {
+		Content string `json:"content"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Messaging.EditMessage(r.Context(), id, msgID, in.Content); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *api) handleDeleteMessage(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	msgID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad message id")
+		return
+	}
+	if err := a.Messaging.DeleteMessage(r.Context(), id, msgID); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

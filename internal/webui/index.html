@@ -929,6 +929,8 @@ function connectWS(){
     const p = e.payload||{};
     switch(e.type){
       case "message.created": onMessage(p); break;
+      case "message.edited": case "message.deleted":
+        if (S.view!=="board" && p.thread_id===S.thread) loadMessages(); break;
       case "thread.created": case "thread.titled":
       case "thread.resolved": case "thread.reopened":
         if (S.ch && p.channel_id===S.ch.id) loadThreads(); break;
