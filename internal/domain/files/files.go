@@ -6,6 +6,7 @@
 package files
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -113,6 +114,66 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	out.Name, out.Mime, out.Size, out.SHA = name, mime, size, shaHex
 	out.URL = fmt.Sprintf("/api/v1/files/%d", out.ID)
 	return out, nil
+}
+
+// StoreDocument records a system-produced artifact (compliance exports)
+// as a first-class file: content-addressed like any upload, uploader = the
+// requesting officer, but WITHOUT the HTTP upload cap — export size is
+// bounded by the export lane, not the request path.
+func (s *Service) StoreDocument(ctx context.Context, actor auth.Identity, name, mime string, data []byte) (File, error) {
+	name = sanitizeName(name)
+	if name == "" || len(data) == 0 {
+		return File{}, apperr.Invalid("document name and content required")
+	}
+	sum := sha256.Sum256(data)
+	shaHex := hex.EncodeToString(sum[:])
+	key := StorageKey(actor.OrgID, shaHex)
+	if err := s.store.Put(ctx, key, bytes.NewReader(data)); err != nil {
+		return File{}, apperr.Internal("store blob", err)
+	}
+	var out File
+	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO file (org_id, kind, name, mime, size_bytes, sha256,
+				storage_key, uploader_id)
+			VALUES ($1, 1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+			actor.OrgID, name, mime, len(data), sum[:], key, actor.UserID).Scan(&out.ID); err != nil {
+			return apperr.Internal("record file", err)
+		}
+		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
+			EntityType: enum.EntityFile, EntityID: out.ID, Verb: "file.uploaded",
+			Payload: eventlog.MustPayload(map[string]any{
+				"file_id": out.ID, "name": name, "size_bytes": len(data)}),
+		}); err != nil {
+			return apperr.Internal("append event", err)
+		}
+		return nil
+	})
+	if err != nil {
+		return File{}, err
+	}
+	out.Name, out.Mime, out.Size, out.SHA = name, mime, int64(len(data)), shaHex
+	out.URL = fmt.Sprintf("/api/v1/files/%d", out.ID)
+	return out, nil
+}
+
+// PinForExport records export-job references on files, freezing their
+// bytes against GC (the janitor treats non-message references as live):
+// an export's evidence outlives the retention of what it captured. Only
+// same-org files pin; unknown ids are skipped.
+func (s *Service) PinForExport(ctx context.Context, tx pgx.Tx, orgID, exportJobID int64, fileIDs []int64) error {
+	for _, fid := range fileIDs {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO file_reference (file_id, entity_type, entity_id)
+			SELECT f.id, $2, $3 FROM file f
+			WHERE f.id = $1 AND f.org_id = $4 AND f.deleted_at IS NULL
+			ON CONFLICT DO NOTHING`,
+			fid, int16(enum.EntityExportJob), exportJobID, orgID); err != nil {
+			return apperr.Internal("pin export reference", err)
+		}
+	}
+	return nil
 }
 
 type Meta struct {
