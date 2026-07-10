@@ -140,6 +140,16 @@ func (h *Hub) wakeOrgLocked(orgID int64) {
 // Serve upgrades the request and streams events. ?last_id=N resumes.
 func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	lastID, _ := strconv.ParseInt(r.URL.Query().Get("last_id"), 10, 64)
+	// last_id=-1: tail mode — start from the org's current head instead of
+	// replaying history (fresh clients render state from REST, then follow).
+	if lastID < 0 {
+		if err := h.pool.QueryRow(r.Context(),
+			`SELECT COALESCE(MAX(id), 0) FROM event_log WHERE org_id = $1`,
+			id.OrgID).Scan(&lastID); err != nil {
+			http.Error(w, "head lookup failed", http.StatusInternalServerError)
+			return
+		}
+	}
 	ws, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return

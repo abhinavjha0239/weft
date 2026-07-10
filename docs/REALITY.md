@@ -29,7 +29,7 @@ subsystem's reality. Ratings:*
 | Load generator | **PROVEN** | `cmd/loadgen` + `internal/loadtest`: many-tenant HTTP+WS load, id-correlated delivery latency, histogram percentiles. Unit-tested (`histogram_test.go`); used for the numbers below |
 | Scale — code path | **MEASURED** | uncontended full send = ~3.8 ms (auth+perms+AST+insert+event+notify+commit). Stable under 150 tenants / 450 concurrent WS with **zero errors**. See docs/PERF.md |
 | Scale — per-node capacity | **NOT YET MEASURED (rig-bound)** | laptop rig conflates loadgen+server+Docker-VM Postgres on 8 cores (VM at 228% CPU was the ceiling, not weftd at 63%). A true per-cell number needs dedicated hosts (PERF.md has the procedure). No CI perf floor yet — would be environment-bound on the shared runner |
-| Clients | ABSENT | curl + tests are the only consumers; every UI claim is future |
+| Web client (dogfood) | **WORKS-THIN** | zero-build embedded client (`internal/webui`, one HTML file, brand injected from token): auth, channel list/create/join, threads (create/open/back), rich message send with live WS render (bold/code/mention/emoji verified in a real browser via Playwright), typing + unread badges + mark-read. Handler unit-tested; the flows were browser-verified, not automated in CI. Gaps: no message pagination/scrollback UI, author names show as `user N` (no profile fetch yet), no presence, no reconnect UX polish — this is the dogfood UI, not the real client app |
 
 ## Standing rules
 1. A subsystem may not be marked done anywhere (README, PRs, timeline) at a
