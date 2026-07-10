@@ -65,3 +65,10 @@ func (h *Hub) OnlineUsers(orgID int64) []int64 {
 	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
 	return ids
 }
+
+// NotifyUser fans an ephemeral notification ping to one user's connections
+// (the notification materializer's live path; the row is the durable truth).
+func (h *Hub) NotifyUser(ctx context.Context, orgID, userID int64, payload json.RawMessage) {
+	h.fanEphemeral(ctx, orgID, Envelope{Type: "notification.created", OrgID: orgID, Payload: payload},
+		func(peer *client) bool { return peer.id.UserID == userID })
+}
