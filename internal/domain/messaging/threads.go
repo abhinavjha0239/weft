@@ -70,7 +70,7 @@ func (s *Service) CreateThread(ctx context.Context, actor auth.Identity, p Creat
 			return apperr.Internal("create thread", err)
 		}
 
-		msgID, err := s.insertMessage(ctx, tx, actor, p.ChannelID, out.ThreadID, p.Content)
+		msgID, err := s.InsertThreadMessage(ctx, tx, actor, out.ThreadID, &p.ChannelID, p.Content)
 		if err != nil {
 			return err
 		}
@@ -287,14 +287,14 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 		if err != nil {
 			return apperr.Internal("load thread", err)
 		}
-		if channelID == nil {
-			return apperr.Invalid("only channel threads are supported here")
+		if channelID != nil {
+			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+				return err
+			}
 		}
-		if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
-			return err
-		}
+		// Space-governed threads (work items) are org-visible in the v1 slice.
 		rows, err := tx.Query(ctx, `
-			SELECT id, channel_id, thread_id, author_id, source, rendered
+			SELECT id, COALESCE(channel_id, 0), thread_id, author_id, source, rendered
 			FROM message
 			WHERE thread_id = $1 AND id < $2 AND deleted_at IS NULL
 			ORDER BY id DESC
@@ -337,9 +337,12 @@ func (s *Service) requireMember(ctx context.Context, tx pgx.Tx, channelID, userI
 	return nil
 }
 
-// insertMessage is the shared message write (used by Send and CreateThread):
+// InsertThreadMessage is the shared in-transaction message write (Send,
+// CreateThread, and the worktrack module's item descriptions/comments):
 // AST parse with in-tx mention resolution, insert, message.created event.
-func (s *Service) insertMessage(ctx context.Context, tx pgx.Tx, actor auth.Identity, channelID, threadID int64, source string) (int64, error) {
+// channelID is nil for space-governed threads; the event payload then omits
+// a channel and the gateway delivers org-wide (the v1 space-visibility slice).
+func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, channelID *int64, source string) (int64, error) {
 	doc := content.Parse(source, func(label string) (int64, bool) {
 		var uid int64
 		err := tx.QueryRow(ctx, `
@@ -358,14 +361,73 @@ func (s *Service) insertMessage(ctx context.Context, tx pgx.Tx, actor auth.Ident
 		doc.HasLink()).Scan(&msgID); err != nil {
 		return 0, apperr.Internal("insert message", err)
 	}
+	payload := map[string]any{
+		"message_id": msgID, "thread_id": threadID, "mentions": doc.Mentions()}
+	if channelID != nil {
+		payload["channel_id"] = *channelID
+	}
 	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 		OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 		EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
-		Payload: eventlog.MustPayload(map[string]any{
-			"message_id": msgID, "channel_id": channelID,
-			"thread_id": threadID, "mentions": doc.Mentions()}),
+		Payload: eventlog.MustPayload(payload),
 	}); err != nil {
 		return 0, apperr.Internal("append event", err)
+	}
+	return msgID, nil
+}
+
+// SendToThread posts into any thread by its governing container (F-5): channel
+// threads require send_message + membership; space threads (work items)
+// require edit_items (v1 slice — VisibilityScope refines later). Bumps the
+// thread's activity counters (never on channel roots, F-15).
+func (s *Service) SendToThread(ctx context.Context, actor auth.Identity, threadID int64, contentSrc string) (int64, error) {
+	if contentSrc == "" {
+		return 0, apperr.Invalid("content required")
+	}
+	var msgID int64
+	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		var channelID, spaceID *int64
+		var kind int16
+		err := tx.QueryRow(ctx, `
+			SELECT channel_id, space_id, kind FROM thread
+			WHERE id = $1 AND org_id = $2`, threadID, actor.OrgID).
+			Scan(&channelID, &spaceID, &kind)
+		if err != nil {
+			return apperr.NotFound("thread not found")
+		}
+		if channelID != nil {
+			chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, *channelID)
+			if err != nil {
+				return err
+			}
+			if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
+				return err
+			}
+			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+				return err
+			}
+		} else {
+			if err := s.perms.Require(ctx, tx, actor, perms.VerbEditItems,
+				perms.OrgScope(actor.OrgID)); err != nil {
+				return err
+			}
+		}
+		msgID, err = s.InsertThreadMessage(ctx, tx, actor, threadID, channelID, contentSrc)
+		if err != nil {
+			return err
+		}
+		if kind == 1 {
+			if _, err := tx.Exec(ctx, `
+				UPDATE thread SET last_activity_at = now(),
+				       message_count = message_count + 1 WHERE id = $1`,
+				threadID); err != nil {
+				return apperr.Internal("bump thread", err)
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		return 0, err
 	}
 	return msgID, nil
 }

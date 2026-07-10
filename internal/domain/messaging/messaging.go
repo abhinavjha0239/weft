@@ -83,7 +83,7 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 
 		// Shared write path: AST parse (in-tx mention resolution), insert,
 		// message.created event with mention ids (F-4: ids, never content).
-		msgID, err = s.insertMessage(ctx, tx, actor, p.ChannelID, threadID, p.Content)
+		msgID, err = s.InsertThreadMessage(ctx, tx, actor, threadID, &p.ChannelID, p.Content)
 		if err != nil {
 			return err
 		}
