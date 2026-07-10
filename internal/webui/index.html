@@ -63,6 +63,13 @@
 
   #threads{display:none;border-bottom:1px solid var(--line);max-height:220px;overflow-y:auto;background:var(--panel)}
   #threads.on{display:block}
+  #results{display:none;border-bottom:1px solid var(--line);max-height:300px;overflow-y:auto;background:var(--panel)}
+  #results.on{display:block}
+  .res{padding:9px 20px;border-bottom:1px solid var(--line);cursor:pointer}
+  .res:hover{background:var(--panel2)}
+  .res .rmeta{color:var(--dim);font-size:11.5px;margin-bottom:2px}
+  .res .rsnip{font-size:13px}
+  .res mark,.res .hl{background:rgba(124,108,255,.28);color:var(--text);border-radius:3px;padding:0 2px}
   .th{display:flex;gap:10px;align-items:center;padding:9px 20px;border-bottom:1px solid var(--line);cursor:pointer}
   .th:hover{background:var(--panel2)}
   .th .t{font-weight:600}
@@ -135,9 +142,11 @@
       <span class="title" id="viewTitle"></span>
       <span class="desc" id="viewDesc"></span>
       <span class="spacer"></span>
+      <input id="search" placeholder="Search… (from: in: has:link)" style="max-width:260px">
       <button id="thToggle">Threads</button>
       <button id="newTh">+ Thread</button>
     </header>
+    <div id="results"></div>
     <div id="threads"></div>
     <div id="msgs"></div>
     <div id="typing"></div>
@@ -354,6 +363,46 @@ $("#input").addEventListener("keydown", e=>{
   if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }
   else signalTyping();
 });
+
+/* ---------- search ---------- */
+let searchTimer = 0;
+$("#search").addEventListener("input", e=>{
+  clearTimeout(searchTimer);
+  const q = e.target.value.trim();
+  if (!q){ $("#results").classList.remove("on"); return; }
+  searchTimer = setTimeout(()=>runSearch(q), 250);
+});
+async function runSearch(q){
+  try {
+    const r = await api("/search?q="+encodeURIComponent(q)+"&limit=40");
+    const el = $("#results"); el.innerHTML=""; el.classList.add("on");
+    const rs = r.results||[];
+    if (!rs.length){ el.innerHTML=`<div class="sys">No matches</div>`; return; }
+    for (const m of rs){
+      const ch = S.channels.find(c=>c.id===m.channel_id);
+      const d = document.createElement("div"); d.className="res";
+      const meta = document.createElement("div"); meta.className="rmeta";
+      meta.textContent = `#${ch?ch.name:m.channel_id} · user ${m.author_id} · ${m.created_at.slice(0,10)}`;
+      const snip = document.createElement("div"); snip.className="rsnip";
+      // Snippet is PLAIN TEXT with » « highlight markers — safe to set as text,
+      // then upgrade the markers to styled spans.
+      snip.textContent = m.snippet;
+      snip.innerHTML = snip.innerHTML.replace(/»/g,'<span class="hl">').replace(/«/g,'</span>');
+      d.append(meta, snip);
+      d.onclick = ()=>{ $("#search").value=""; el.classList.remove("on");
+        if (ch && ch.member){ openChannel(m.channel_id).then(()=>{
+          if (m.thread_id !== ch.root_thread_id) openThreadById(m.thread_id); }); } };
+      el.appendChild(d);
+    }
+  } catch(err){ toast(err.message); }
+}
+async function openThreadById(id){
+  try {
+    const r = await api(`/channels/${S.ch.id}/threads?limit=100`);
+    const t = (r.threads||[]).find(x=>x.id===id);
+    if (t) openThread(t);
+  } catch {}
+}
 
 /* ---------- realtime ---------- */
 function connectWS(){
