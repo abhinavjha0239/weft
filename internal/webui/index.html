@@ -932,7 +932,9 @@ function connectWS(){
       case "thread.created": case "thread.titled":
       case "thread.resolved": case "thread.reopened":
         if (S.ch && p.channel_id===S.ch.id) loadThreads(); break;
-      case "channel.created": case "member.joined": case "member.left":
+      case "channel.created": case "channel.renamed": case "channel.updated":
+      case "channel.archived": case "channel.unarchived":
+      case "member.joined": case "member.left":
         refreshChannels(); break;
       case "space.created": refreshSpaces(); break;
       case "dm.opened": refreshDMs(); break;

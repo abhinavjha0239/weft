@@ -74,6 +74,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.Handle("POST /api/v1/auth/login", preAuth(http.HandlerFunc(a.handleLogin)))
 	mux.HandleFunc("POST /api/v1/channels", a.withAuth(a.handleCreateChannel))
 	mux.HandleFunc("GET /api/v1/channels", a.withAuth(a.handleListChannels))
+	mux.HandleFunc("PATCH /api/v1/channels/{id}", a.withAuth(a.handleUpdateChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/join", a.withAuth(a.handleJoinChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/leave", a.withAuth(a.handleLeaveChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/messages", a.withAuth(a.handleSendMessage))

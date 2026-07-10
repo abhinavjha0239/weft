@@ -91,6 +91,17 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 		if taken {
 			return apperr.Conflict("channel name already in use")
 		}
+		// F-22: renamed-away names stay reserved for their channel.
+		var reserved bool
+		if err := tx.QueryRow(ctx, `
+			SELECT EXISTS (SELECT 1 FROM channel_name_alias
+			 WHERE org_id = $1 AND name = lower($2))`,
+			actor.OrgID, name).Scan(&reserved); err != nil {
+			return apperr.Internal("alias check", err)
+		}
+		if reserved {
+			return apperr.Conflict("channel name is reserved by a renamed channel")
+		}
 
 		visibility := visibilityPublic
 		if p.Private {

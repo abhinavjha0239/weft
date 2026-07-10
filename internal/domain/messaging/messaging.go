@@ -64,6 +64,9 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 		if !member {
 			return apperr.Forbidden("not a channel member")
 		}
+		if err := s.requireLiveChannel(ctx, tx, actor.OrgID, p.ChannelID); err != nil {
+			return err
+		}
 
 		threadID := p.ThreadID
 		var threadKind int16
