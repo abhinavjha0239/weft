@@ -137,11 +137,12 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 }
 
 type ChannelSummary struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	Description string `json:"description"`
-	Private     bool   `json:"private"`
-	Member      bool   `json:"member"`
+	ID           int64  `json:"id"`
+	Name         string `json:"name"`
+	Description  string `json:"description"`
+	Private      bool   `json:"private"`
+	Member       bool   `json:"member"`
+	RootThreadID int64  `json:"root_thread_id"`
 }
 
 // ListChannels: the ADR-008 C-2 read-model slice — public channels are
@@ -149,7 +150,7 @@ type ChannelSummary struct {
 func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]ChannelSummary, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id, c.name, c.description, c.visibility = 2,
-		       cm.user_id IS NOT NULL
+		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0)
 		FROM channel c
 		LEFT JOIN channel_member cm
 		  ON cm.channel_id = c.id AND cm.user_id = $2 AND cm.unsubscribed_at IS NULL
@@ -164,7 +165,7 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 	var out []ChannelSummary
 	for rows.Next() {
 		var c ChannelSummary
-		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member, &c.RootThreadID); err != nil {
 			return nil, apperr.Internal("scan channel", err)
 		}
 		out = append(out, c)

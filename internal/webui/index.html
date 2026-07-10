@@ -1,0 +1,434 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{.Brand}}</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%237c6cff'/%3E%3Cg stroke='white' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M8 9v14M16 9v14M24 9v14'/%3E%3Cpath d='M6 13h20M6 19h20' stroke-opacity='.85'/%3E%3C/g%3E%3C/svg%3E">
+<link rel="apple-touch-icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%237c6cff'/%3E%3Cg stroke='white' stroke-width='2.4' stroke-linecap='round'%3E%3Cpath d='M8 9v14M16 9v14M24 9v14'/%3E%3Cpath d='M6 13h20M6 19h20' stroke-opacity='.85'/%3E%3C/g%3E%3C/svg%3E">
+<style>
+  :root{
+    --bg:#0e1016; --panel:#151823; --panel2:#1b1f2e; --line:#262b3d;
+    --text:#e7eaf3; --dim:#8b91a7; --accent:#7c6cff; --accent2:#4f8cff;
+    --ok:#3ecf8e; --danger:#ff6b6b; --radius:10px;
+  }
+  *{box-sizing:border-box;margin:0;padding:0}
+  body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;height:100vh;overflow:hidden}
+  button{font:inherit;border:0;cursor:pointer;border-radius:8px}
+  input,textarea{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 12px;outline:none;width:100%}
+  input:focus,textarea:focus{border-color:var(--accent)}
+  ::placeholder{color:var(--dim)}
+
+  /* auth */
+  #auth{display:flex;align-items:center;justify-content:center;height:100vh}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:16px;padding:32px;width:360px}
+  .card h1{font-size:22px;letter-spacing:.3px;margin-bottom:2px}
+  .card .tag{color:var(--dim);font-size:12.5px;margin-bottom:22px}
+  .tabs{display:flex;gap:6px;margin-bottom:16px}
+  .tabs button{flex:1;padding:8px;background:var(--panel2);color:var(--dim)}
+  .tabs button.on{background:var(--accent);color:#fff}
+  .card form{display:flex;flex-direction:column;gap:10px}
+  .primary{background:var(--accent);color:#fff;padding:10px;font-weight:600}
+  .primary:hover{filter:brightness(1.1)}
+  .err{color:var(--danger);font-size:12.5px;min-height:16px}
+
+  /* app shell */
+  #app{display:none;height:100vh;grid-template-columns:250px 1fr;grid-template-rows:100vh}
+  #app.on{display:grid}
+  aside{background:var(--panel);border-right:1px solid var(--line);display:flex;flex-direction:column}
+  .org{padding:16px;border-bottom:1px solid var(--line);display:flex;justify-content:space-between;align-items:center}
+  .org b{font-size:15px}
+  .org button{background:none;color:var(--dim);font-size:12px}
+  .org button:hover{color:var(--danger)}
+  .chhead{display:flex;justify-content:space-between;align-items:center;padding:14px 16px 6px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px}
+  .chhead button{background:var(--panel2);color:var(--accent);width:22px;height:22px;font-size:15px;line-height:1}
+  #chlist{overflow-y:auto;flex:1;padding:4px 8px}
+  .ch{display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:8px;color:var(--dim);cursor:pointer;gap:8px}
+  .ch:hover{background:var(--panel2)}
+  .ch.on{background:var(--panel2);color:var(--text)}
+  .ch .nm{white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  .ch .nm::before{content:"#";opacity:.55;margin-right:5px}
+  .ch.priv .nm::before{content:"🔒";font-size:11px}
+  .badge{background:var(--accent);color:#fff;border-radius:10px;font-size:11px;padding:1px 7px;font-weight:700}
+  .join{font-size:11px;color:var(--accent2);background:none}
+
+  main{display:flex;flex-direction:column;min-width:0}
+  header{padding:13px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
+  header .title{font-weight:700;font-size:15px}
+  header .desc{color:var(--dim);font-size:12.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+  header .spacer{flex:1}
+  header button{background:var(--panel2);color:var(--text);padding:7px 12px;font-size:12.5px}
+  header button:hover{background:var(--line)}
+  #crumb{color:var(--accent2);background:none;padding-left:0}
+
+  #threads{display:none;border-bottom:1px solid var(--line);max-height:220px;overflow-y:auto;background:var(--panel)}
+  #threads.on{display:block}
+  .th{display:flex;gap:10px;align-items:center;padding:9px 20px;border-bottom:1px solid var(--line);cursor:pointer}
+  .th:hover{background:var(--panel2)}
+  .th .t{font-weight:600}
+  .th .meta{color:var(--dim);font-size:12px}
+  .th .res{color:var(--ok);font-size:12px}
+
+  #msgs{flex:1;overflow-y:auto;padding:18px 20px;display:flex;flex-direction:column;gap:2px}
+  .msg{display:flex;gap:12px;padding:6px 8px;border-radius:8px}
+  .msg:hover{background:var(--panel)}
+  .av{width:34px;height:34px;border-radius:9px;background:linear-gradient(135deg,var(--accent),var(--accent2));display:flex;align-items:center;justify-content:center;font-weight:700;font-size:13px;flex-shrink:0}
+  .msg .who{font-weight:700;font-size:13.5px;margin-right:8px}
+  .msg .when{color:var(--dim);font-size:11.5px}
+  .msg .body{margin-top:1px;word-wrap:break-word}
+  .body p{margin:2px 0}
+  .body code{background:var(--panel2);border:1px solid var(--line);border-radius:5px;padding:1px 5px;font-size:12.5px}
+  .body pre{background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:10px;overflow-x:auto;margin:6px 0}
+  .body pre code{border:0;background:none;padding:0}
+  .body blockquote{border-left:3px solid var(--accent);padding-left:10px;color:var(--dim);margin:4px 0}
+  .body a{color:var(--accent2)}
+  .body .mention{background:rgba(124,108,255,.18);color:var(--accent);border-radius:5px;padding:0 4px;font-weight:600}
+  .body table{border-collapse:collapse;margin:6px 0}
+  .body td,.body th{border:1px solid var(--line);padding:4px 9px}
+  .sys{color:var(--dim);font-size:12.5px;text-align:center;padding:6px}
+
+  #typing{min-height:20px;color:var(--dim);font-size:12px;padding:0 22px}
+  .composer{padding:0 20px 18px}
+  .composer .box{display:flex;gap:10px;background:var(--panel2);border:1px solid var(--line);border-radius:12px;padding:6px 6px 6px 14px}
+  .composer textarea{background:none;border:0;resize:none;height:42px;padding:9px 0}
+  .composer button{background:var(--accent);color:#fff;padding:0 18px;font-weight:700;border-radius:9px}
+
+  dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:22px;width:340px}
+  dialog::backdrop{background:rgba(0,0,0,.55)}
+  dialog h3{margin-bottom:14px}
+  dialog form{display:flex;flex-direction:column;gap:10px}
+  dialog label{display:flex;gap:8px;align-items:center;color:var(--dim);font-size:13px}
+  dialog label input[type=checkbox]{width:auto}
+  #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--danger);color:#fff;padding:9px 16px;border-radius:9px;font-size:13px;display:none}
+</style>
+</head>
+<body>
+
+<div id="auth">
+  <div class="card">
+    <h1>{{.Brand}}</h1>
+    <div class="tag">{{.Tagline}}</div>
+    <div class="tabs">
+      <button id="tabIn" class="on">Sign in</button>
+      <button id="tabUp">Create org</button>
+    </div>
+    <form id="authForm">
+      <input id="fOrg" placeholder="org slug" autocomplete="username" required>
+      <input id="fEmail" placeholder="email" type="email" required>
+      <input id="fPass" placeholder="password" type="password" required>
+      <input id="fName" placeholder="your full name" style="display:none">
+      <button class="primary" id="authBtn">Sign in</button>
+      <div class="err" id="authErr"></div>
+    </form>
+  </div>
+</div>
+
+<div id="app">
+  <aside>
+    <div class="org"><b id="orgName"></b><button id="logout">sign out</button></div>
+    <div class="chhead"><span>Channels</span><button id="newCh" title="New channel">+</button></div>
+    <div id="chlist"></div>
+  </aside>
+  <main>
+    <header>
+      <button id="crumb" style="display:none">← back</button>
+      <span class="title" id="viewTitle"></span>
+      <span class="desc" id="viewDesc"></span>
+      <span class="spacer"></span>
+      <button id="thToggle">Threads</button>
+      <button id="newTh">+ Thread</button>
+    </header>
+    <div id="threads"></div>
+    <div id="msgs"></div>
+    <div id="typing"></div>
+    <div class="composer">
+      <div class="box">
+        <textarea id="input" placeholder="Message…  (**bold**, `code`, @**Full Name**, :rocket:)"></textarea>
+        <button id="send">Send</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<dialog id="chDialog">
+  <h3>New channel</h3>
+  <form method="dialog" id="chForm">
+    <input id="chName" placeholder="name" required>
+    <input id="chDesc" placeholder="description (optional)">
+    <label><input type="checkbox" id="chPriv"> Private</label>
+    <button class="primary">Create</button>
+  </form>
+</dialog>
+
+<dialog id="thDialog">
+  <h3>New thread</h3>
+  <form method="dialog" id="thForm">
+    <input id="thTitle" placeholder="title (optional)">
+    <textarea id="thContent" placeholder="first message" required rows="3"></textarea>
+    <button class="primary">Start thread</button>
+  </form>
+</dialog>
+
+<div id="toast"></div>
+
+<script>
+"use strict";
+const $ = s => document.querySelector(s);
+const S = {
+  token: localStorage.getItem("token") || "",
+  org: localStorage.getItem("org") || "",
+  channels: [], unreads: {}, users: {},
+  ch: null, thread: 0, isRoot: true,
+  lastSeq: -1, ws: null, wsTries: 0,
+  typingUntil: 0, typers: new Map(),
+};
+
+function toast(msg){ const t=$("#toast"); t.textContent=msg; t.style.display="block";
+  clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none", 2600); }
+
+async function api(path, opts={}) {
+  opts.headers = Object.assign({"Content-Type":"application/json"},
+    S.token ? {"Authorization":"Bearer "+S.token} : {}, opts.headers||{});
+  const r = await fetch("/api/v1"+path, opts);
+  if (!r.ok) {
+    let m = "request failed ("+r.status+")";
+    try { m = (await r.json()).error || m; } catch {}
+    if (r.status === 401 && S.token) { signOut(); }
+    throw new Error(m);
+  }
+  return r.json();
+}
+const post = (p,b) => api(p,{method:"POST",body:JSON.stringify(b||{})});
+
+/* ---------- auth ---------- */
+let signup = false;
+function setMode(up){ signup = up;
+  $("#tabIn").classList.toggle("on",!up); $("#tabUp").classList.toggle("on",up);
+  $("#fName").style.display = up ? "" : "none";
+  $("#authBtn").textContent = up ? "Create org" : "Sign in"; }
+$("#tabIn").onclick = e=>{e.preventDefault(); setMode(false)};
+$("#tabUp").onclick = e=>{e.preventDefault(); setMode(true)};
+$("#authForm").onsubmit = async e => {
+  e.preventDefault(); $("#authErr").textContent="";
+  const org=$("#fOrg").value.trim(), email=$("#fEmail").value.trim(), pass=$("#fPass").value;
+  try {
+    let token;
+    if (signup) {
+      const r = await post("/orgs/bootstrap",
+        {org_slug:org, email, password:pass, full_name:$("#fName").value.trim()});
+      token = r.token;
+    } else {
+      token = (await post("/auth/login",{org_slug:org,email,password:pass})).token;
+    }
+    S.token = token; S.org = org;
+    localStorage.setItem("token",token); localStorage.setItem("org",org);
+    enter();
+  } catch(err){ $("#authErr").textContent = err.message; }
+};
+function signOut(){ localStorage.clear(); location.reload(); }
+$("#logout").onclick = signOut;
+
+/* ---------- shell ---------- */
+async function enter(){
+  $("#auth").style.display="none"; $("#app").classList.add("on");
+  $("#orgName").textContent = S.org;
+  await refreshChannels();
+  const first = S.channels.find(c=>c.member);
+  if (first) openChannel(first.id);
+  connectWS();
+}
+
+async function refreshChannels(){
+  const [cl, un] = await Promise.all([api("/channels"), api("/unreads")]);
+  S.channels = cl.channels;
+  S.unreads = {}; (un.channels||[]).forEach(u=>S.unreads[u.channel_id]=u.unread_count);
+  renderChannels();
+}
+
+function renderChannels(){
+  const el = $("#chlist"); el.innerHTML="";
+  for (const c of S.channels){
+    const d = document.createElement("div");
+    d.className = "ch"+(c.private?" priv":"")+(S.ch && c.id===S.ch.id?" on":"");
+    const n = S.unreads[c.id]||0;
+    d.innerHTML = `<span class="nm"></span>` +
+      (c.member ? (n?`<span class="badge">${n}</span>`:"") : `<button class="join">join</button>`);
+    d.querySelector(".nm").textContent = c.name;
+    if (c.member) d.onclick = ()=>openChannel(c.id);
+    else d.querySelector(".join").onclick = async e=>{ e.stopPropagation();
+      try { await post(`/channels/${c.id}/join`); await refreshChannels(); openChannel(c.id); }
+      catch(err){ toast(err.message); } };
+    el.appendChild(d);
+  }
+}
+
+$("#newCh").onclick = ()=>$("#chDialog").showModal();
+$("#chForm").onsubmit = async ()=>{
+  try {
+    const r = await post("/channels",{name:$("#chName").value,
+      description:$("#chDesc").value, private:$("#chPriv").checked});
+    $("#chName").value=$("#chDesc").value=""; $("#chPriv").checked=false;
+    await refreshChannels(); openChannel(r.channel_id);
+  } catch(err){ toast(err.message); }
+};
+
+/* ---------- channel / thread views ---------- */
+async function openChannel(id){
+  S.ch = S.channels.find(c=>c.id===id); if (!S.ch) return;
+  S.thread = S.ch.root_thread_id; S.isRoot = true;
+  $("#viewTitle").textContent = "#"+S.ch.name;
+  $("#viewDesc").textContent = S.ch.description||"";
+  $("#crumb").style.display="none";
+  $("#threads").classList.remove("on");
+  renderChannels();
+  await Promise.all([loadMessages(), loadThreads()]);
+  markRead();
+}
+
+async function openThread(t){
+  S.thread = t.id; S.isRoot = false;
+  $("#viewTitle").textContent = t.title || "(untitled thread)";
+  $("#viewDesc").textContent = "in #"+S.ch.name;
+  $("#crumb").style.display="";
+  $("#threads").classList.remove("on");
+  await loadMessages();
+  markRead();
+}
+$("#crumb").onclick = ()=>openChannel(S.ch.id);
+
+async function loadMessages(){
+  const r = await api(`/threads/${S.thread}/messages?limit=100`);
+  const msgs = (r.messages||[]).slice().reverse();
+  const el = $("#msgs"); el.innerHTML="";
+  if (!msgs.length) el.innerHTML = `<div class="sys">No messages yet — say hello 👋</div>`;
+  msgs.forEach(m=>el.appendChild(renderMsg(m)));
+  el.scrollTop = el.scrollHeight;
+}
+
+function renderMsg(m){
+  const d = document.createElement("div"); d.className="msg"; d.dataset.id=m.id;
+  const initial = String(m.author_id);
+  d.innerHTML = `<div class="av">${initial.slice(-2)}</div>
+    <div><span class="who">user ${m.author_id}</span><span class="when"></span>
+    <div class="body">${m.rendered}</div></div>`;
+  return d;
+}
+
+async function loadThreads(){
+  const r = await api(`/channels/${S.ch.id}/threads?limit=50`);
+  const el = $("#threads"); el.innerHTML="";
+  const ths = r.threads||[];
+  if (!ths.length) el.innerHTML=`<div class="sys">No threads yet</div>`;
+  for (const t of ths){
+    const d=document.createElement("div"); d.className="th";
+    d.innerHTML = `<span class="t"></span><span class="meta">${t.message_count} msgs</span>`+
+      (t.resolved?`<span class="res">✓ resolved</span>`:"");
+    d.querySelector(".t").textContent = t.title || "(untitled)";
+    d.onclick = ()=>openThread(t);
+    el.appendChild(d);
+  }
+}
+$("#thToggle").onclick = ()=>$("#threads").classList.toggle("on");
+$("#newTh").onclick = ()=>$("#thDialog").showModal();
+$("#thForm").onsubmit = async ()=>{
+  try {
+    await post(`/channels/${S.ch.id}/threads`,
+      {title:$("#thTitle").value, content:$("#thContent").value});
+    $("#thTitle").value=$("#thContent").value="";
+    await loadThreads(); $("#threads").classList.add("on");
+  } catch(err){ toast(err.message); }
+};
+
+/* ---------- composing ---------- */
+async function send(){
+  const text = $("#input").value.trim(); if (!text) return;
+  $("#input").value="";
+  try {
+    const body = {content:text};
+    if (!S.isRoot) body.thread_id = S.thread;
+    await post(`/channels/${S.ch.id}/messages`, body);
+  } catch(err){ toast(err.message); $("#input").value=text; }
+}
+$("#send").onclick = send;
+$("#input").addEventListener("keydown", e=>{
+  if (e.key==="Enter" && !e.shiftKey){ e.preventDefault(); send(); }
+  else signalTyping();
+});
+
+/* ---------- realtime ---------- */
+function connectWS(){
+  const proto = location.protocol==="https:" ? "wss" : "ws";
+  const ws = new WebSocket(`${proto}://${location.host}/api/v1/gateway?token=${S.token}&last_id=${S.lastSeq}`);
+  S.ws = ws;
+  ws.onopen = ()=>{ S.wsTries=0; };
+  ws.onclose = ()=>{ setTimeout(connectWS, Math.min(8000, 500*Math.pow(2,S.wsTries++))); };
+  ws.onmessage = ev => {
+    let e; try { e = JSON.parse(ev.data); } catch { return; }
+    if (e.seq) S.lastSeq = e.seq;
+    const p = e.payload||{};
+    switch(e.type){
+      case "message.created": onMessage(p); break;
+      case "thread.created": case "thread.titled":
+      case "thread.resolved": case "thread.reopened":
+        if (S.ch && p.channel_id===S.ch.id) loadThreads(); break;
+      case "channel.created": case "member.joined": case "member.left":
+        refreshChannels(); break;
+      case "typing.started": onTyping(p, true); break;
+      case "typing.stopped": onTyping(p, false); break;
+      case "readstate.synced": refreshChannels(); break;
+    }
+  };
+}
+
+async function onMessage(p){
+  if (S.ch && p.thread_id===S.thread){
+    try {
+      const m = await api(`/messages/${p.message_id}`);
+      const el = $("#msgs");
+      if (!el.querySelector(`[data-id="${m.id}"]`)){
+        el.querySelector(".sys")?.remove();
+        el.appendChild(renderMsg(m)); el.scrollTop = el.scrollHeight;
+      }
+      markRead();
+    } catch {}
+  } else {
+    S.unreads[p.channel_id] = (S.unreads[p.channel_id]||0)+1;
+    renderChannels();
+  }
+  if (S.ch && p.channel_id===S.ch.id && !S.isRoot===false) loadThreads();
+}
+
+function markRead(){
+  if (!S.thread) return;
+  if (S.ws && S.ws.readyState===1)
+    S.ws.send(JSON.stringify({type:"read_marker", thread_id:S.thread, up_to:0}));
+  else post(`/threads/${S.thread}/read`,{up_to:0}).catch(()=>{});
+  S.unreads[S.ch.id]=0; renderChannels();
+}
+
+function signalTyping(){
+  const now = Date.now();
+  if (now < S.typingUntil) return;
+  S.typingUntil = now + 2500;
+  if (S.ws && S.ws.readyState===1 && S.ch)
+    S.ws.send(JSON.stringify({type:"typing", channel_id:S.ch.id, state:"start"}));
+}
+
+function onTyping(p, on){
+  if (!S.ch || p.channel_id!==S.ch.id) return;
+  if (on){ S.typers.set(p.user_id, Date.now()); } else { S.typers.delete(p.user_id); }
+  renderTyping();
+}
+setInterval(()=>{ const cut=Date.now()-4000; let ch=false;
+  for (const [k,v] of S.typers) if (v<cut){ S.typers.delete(k); ch=true; }
+  if (ch) renderTyping(); }, 1500);
+function renderTyping(){
+  $("#typing").textContent = S.typers.size
+    ? (S.typers.size===1 ? "someone is typing…" : S.typers.size+" people are typing…") : "";
+}
+
+/* ---------- boot ---------- */
+if (S.token) enter().catch(()=>signOut());
+</script>
+</body>
+</html>

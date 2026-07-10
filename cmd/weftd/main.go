@@ -22,6 +22,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
+	"github.com/abhinavjha0239/weft/internal/webui"
 )
 
 // version is stamped by the build (-ldflags "-X main.version=...").
@@ -113,13 +114,22 @@ func serve(ctx context.Context, cfg config.Config) error {
 	hub := gateway.NewHub(pool, log)
 	go hub.Run(ctx)
 
+	apiHandler := rest.Handler(ctx, rest.Deps{
+		Pool: pool, Hub: hub, Log: log,
+		Identity:  identity.New(pool, perms.New(pool)),
+		Messaging: messaging.New(pool, perms.New(pool)),
+	})
+	ui, err := webui.Handler()
+	if err != nil {
+		return err
+	}
+	root := http.NewServeMux()
+	root.Handle("/api/", apiHandler)
+	root.Handle("/", ui)
+
 	srv := &http.Server{
-		Addr: cfg.ListenAddr,
-		Handler: rest.Handler(ctx, rest.Deps{
-			Pool: pool, Hub: hub, Log: log,
-			Identity:  identity.New(pool, perms.New(pool)),
-			Messaging: messaging.New(pool, perms.New(pool)),
-		}),
+		Addr:              cfg.ListenAddr,
+		Handler:           root,
 		ReadHeaderTimeout: 10 * time.Second,
 	}
 	go func() {
