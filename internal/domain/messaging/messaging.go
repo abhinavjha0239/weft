@@ -113,16 +113,19 @@ type Message struct {
 	Rendered  string `json:"rendered"`
 }
 
-// Get fetches one message the actor may read (M0 ACL slice: membership of
-// the governing channel).
+// Get fetches one message the actor may read — the same visibility rule as
+// ListMessages: channel messages require membership of the governing channel;
+// space-thread messages (no channel) are org-visible in the v1 slice.
 func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Message, error) {
 	var m Message
 	err := s.pool.QueryRow(ctx, `
-		SELECT m.id, m.channel_id, m.thread_id, m.author_id, m.source, m.rendered
+		SELECT m.id, COALESCE(m.channel_id, 0), m.thread_id, m.author_id, m.source, m.rendered
 		FROM message m
-		JOIN channel_member cm ON cm.channel_id = m.channel_id
-		 AND cm.user_id = $2 AND cm.unsubscribed_at IS NULL
-		WHERE m.id = $1 AND m.org_id = $3 AND m.deleted_at IS NULL`,
+		WHERE m.id = $1 AND m.org_id = $3 AND m.deleted_at IS NULL
+		  AND (m.channel_id IS NULL OR EXISTS (
+		      SELECT 1 FROM channel_member cm
+		      WHERE cm.channel_id = m.channel_id AND cm.user_id = $2
+		        AND cm.unsubscribed_at IS NULL))`,
 		msgID, actor.UserID, actor.OrgID).Scan(&m.ID, &m.ChannelID, &m.ThreadID,
 		&m.AuthorID, &m.Source, &m.Rendered)
 	if errors.Is(err, pgx.ErrNoRows) {

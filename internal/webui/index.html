@@ -15,8 +15,8 @@
   *{box-sizing:border-box;margin:0;padding:0}
   body{background:var(--bg);color:var(--text);font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Inter,Roboto,sans-serif;height:100vh;overflow:hidden}
   button{font:inherit;border:0;cursor:pointer;border-radius:8px}
-  input,textarea{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 12px;outline:none;width:100%}
-  input:focus,textarea:focus{border-color:var(--accent)}
+  input,textarea,select{font:inherit;color:var(--text);background:var(--panel2);border:1px solid var(--line);border-radius:8px;padding:9px 12px;outline:none;width:100%}
+  input:focus,textarea:focus,select:focus{border-color:var(--accent)}
   ::placeholder{color:var(--dim)}
 
   /* auth */
@@ -42,7 +42,7 @@
   .org button:hover{color:var(--danger)}
   .chhead{display:flex;justify-content:space-between;align-items:center;padding:14px 16px 6px;color:var(--dim);font-size:11px;text-transform:uppercase;letter-spacing:1px}
   .chhead button{background:var(--panel2);color:var(--accent);width:22px;height:22px;font-size:15px;line-height:1}
-  #chlist{overflow-y:auto;flex:1;padding:4px 8px}
+  #chlist{overflow-y:auto;flex:0 1 auto;min-height:38px;padding:4px 8px}
   .ch{display:flex;justify-content:space-between;align-items:center;padding:7px 10px;border-radius:8px;color:var(--dim);cursor:pointer;gap:8px}
   .ch:hover{background:var(--panel2)}
   .ch.on{background:var(--panel2);color:var(--text)}
@@ -51,6 +51,9 @@
   .ch.priv .nm::before{content:"🔒";font-size:11px}
   .badge{background:var(--accent);color:#fff;border-radius:10px;font-size:11px;padding:1px 7px;font-weight:700}
   .join{font-size:11px;color:var(--accent2);background:none}
+  #splist{overflow-y:auto;flex:0 1 auto;padding:4px 8px}
+  .sp .nm::before{content:"▦";font-size:11px;margin-right:6px;opacity:.6}
+  .sp .key{font-size:10.5px;color:var(--dim);font-weight:700;letter-spacing:.5px}
 
   main{display:flex;flex-direction:column;min-width:0}
   header{padding:13px 20px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:12px}
@@ -100,6 +103,27 @@
   .composer textarea{background:none;border:0;resize:none;height:42px;padding:9px 0}
   .composer button{background:var(--accent);color:#fff;padding:0 18px;font-weight:700;border-radius:9px}
 
+  /* board */
+  #board{display:none;flex:1;overflow-x:auto;padding:16px 20px;gap:14px;align-items:flex-start}
+  #board.on{display:flex}
+  .col{background:var(--panel);border:1px solid var(--line);border-radius:12px;width:280px;min-width:240px;flex-shrink:0;display:flex;flex-direction:column;max-height:100%}
+  .col.over{border-color:var(--accent)}
+  .colhead{padding:11px 14px 8px;font-size:11px;letter-spacing:1px;text-transform:uppercase;color:var(--dim);display:flex;align-items:center;gap:7px}
+  .colhead .dot{width:8px;height:8px;border-radius:50%;background:var(--dim)}
+  .col[data-cat="2"] .dot{background:var(--accent2)}
+  .col[data-cat="3"] .dot{background:var(--ok)}
+  .colhead .cnt{margin-left:auto;font-weight:700}
+  .cards{padding:2px 10px 10px;overflow-y:auto;display:flex;flex-direction:column;gap:8px;flex:1;min-height:44px}
+  .itemcard{background:var(--panel2);border:1px solid var(--line);border-radius:10px;padding:9px 12px;cursor:grab}
+  .itemcard:hover{border-color:var(--accent)}
+  .itemcard.drag{opacity:.4}
+  .itemcard .ikey{font-size:11px;color:var(--dim);font-weight:700;letter-spacing:.5px;display:flex;align-items:center;gap:6px}
+  .itemcard .ikey .done{color:var(--ok);margin-left:auto}
+  .itemcard .ititle{font-size:13px;margin-top:3px;word-wrap:break-word}
+  .itype{font-size:10px;padding:0 6px;border-radius:6px;background:rgba(79,140,255,.15);color:var(--accent2)}
+  .itype.bug{background:rgba(255,107,107,.15);color:var(--danger)}
+  .itype.epic{background:rgba(124,108,255,.18);color:var(--accent)}
+
   dialog{background:var(--panel);color:var(--text);border:1px solid var(--line);border-radius:14px;padding:22px;width:340px}
   dialog::backdrop{background:rgba(0,0,0,.55)}
   dialog h3{margin-bottom:14px}
@@ -107,6 +131,7 @@
   dialog label{display:flex;gap:8px;align-items:center;color:var(--dim);font-size:13px}
   dialog label input[type=checkbox]{width:auto}
   #toast{position:fixed;bottom:18px;left:50%;transform:translateX(-50%);background:var(--danger);color:#fff;padding:9px 16px;border-radius:9px;font-size:13px;display:none}
+  #toast.ok{background:var(--ok);color:#06281a}
 </style>
 </head>
 <body>
@@ -135,6 +160,8 @@
     <div class="org"><b id="orgName"></b><button id="logout">sign out</button></div>
     <div class="chhead"><span>Channels</span><button id="newCh" title="New channel">+</button></div>
     <div id="chlist"></div>
+    <div class="chhead"><span>Spaces</span><button id="newSp" title="New space">+</button></div>
+    <div id="splist"></div>
   </aside>
   <main>
     <header>
@@ -145,9 +172,12 @@
       <input id="search" placeholder="Search… (from: in: has:link)" style="max-width:260px">
       <button id="thToggle">Threads</button>
       <button id="newTh">+ Thread</button>
+      <button id="promote" style="display:none">→ Item</button>
+      <button id="newIt" style="display:none">+ Item</button>
     </header>
     <div id="results"></div>
     <div id="threads"></div>
+    <div id="board"></div>
     <div id="msgs"></div>
     <div id="typing"></div>
     <div class="composer">
@@ -178,6 +208,33 @@
   </form>
 </dialog>
 
+<dialog id="spDialog">
+  <h3>New space</h3>
+  <form method="dialog" id="spForm">
+    <input id="spKey" placeholder="key (e.g. OPS)" maxlength="10" required>
+    <input id="spName" placeholder="name" required>
+    <button class="primary">Create space</button>
+  </form>
+</dialog>
+
+<dialog id="itDialog">
+  <h3>New item</h3>
+  <form method="dialog" id="itForm">
+    <input id="itTitle" placeholder="title" required>
+    <textarea id="itDesc" placeholder="description — becomes the first message of the item's discussion" rows="3"></textarea>
+    <select id="itType"><option>Task</option><option>Bug</option><option>Epic</option></select>
+    <button class="primary">Create item</button>
+  </form>
+</dialog>
+
+<dialog id="prDialog">
+  <h3>Promote thread to item</h3>
+  <form method="dialog" id="prForm">
+    <select id="prSpace"></select>
+    <button class="primary">Promote</button>
+  </form>
+</dialog>
+
 <div id="toast"></div>
 
 <script>
@@ -188,11 +245,14 @@ const S = {
   org: localStorage.getItem("org") || "",
   channels: [], unreads: {}, users: {},
   ch: null, thread: 0, isRoot: true,
+  spaces: [], space: null, items: [], statuses: [],
+  view: "chan", // "chan" (channel/thread chat) | "board" | "item"
   lastSeq: -1, ws: null, wsTries: 0,
   typingUntil: 0, typers: new Map(),
 };
 
-function toast(msg){ const t=$("#toast"); t.textContent=msg; t.style.display="block";
+function toast(msg, ok){ const t=$("#toast"); t.textContent=msg; t.style.display="block";
+  t.classList.toggle("ok", !!ok);
   clearTimeout(t._h); t._h=setTimeout(()=>t.style.display="none", 2600); }
 
 async function api(path, opts={}) {
@@ -241,7 +301,7 @@ $("#logout").onclick = signOut;
 async function enter(){
   $("#auth").style.display="none"; $("#app").classList.add("on");
   $("#orgName").textContent = S.org;
-  await refreshChannels();
+  await Promise.all([refreshChannels(), refreshSpaces()]);
   const first = S.channels.find(c=>c.member);
   if (first) openChannel(first.id);
   connectWS();
@@ -281,29 +341,53 @@ $("#chForm").onsubmit = async ()=>{
   } catch(err){ toast(err.message); }
 };
 
+/* ---------- view switching ---------- */
+// One place decides what the main pane shows: chat surfaces (messages,
+// composer) or the board, plus which header actions apply.
+function setView(v){
+  S.view = v;
+  $("#board").classList.toggle("on", v==="board");
+  const chat = v!=="board";
+  $("#msgs").style.display = chat ? "" : "none";
+  $("#typing").style.display = v==="chan" ? "" : "none";
+  document.querySelector(".composer").style.display = chat ? "" : "none";
+  $("#thToggle").style.display = v==="chan" ? "" : "none";
+  $("#newTh").style.display = v==="chan" ? "" : "none";
+  $("#promote").style.display = (v==="chan" && !S.isRoot) ? "" : "none";
+  $("#newIt").style.display = v==="board" ? "" : "none";
+  $("#input").placeholder = v==="item"
+    ? "Comment…  (**bold**, `code`, @**Full Name**, :rocket:)"
+    : "Message…  (**bold**, `code`, @**Full Name**, :rocket:)";
+  $("#threads").classList.remove("on");
+  $("#results").classList.remove("on");
+}
+
 /* ---------- channel / thread views ---------- */
 async function openChannel(id){
   S.ch = S.channels.find(c=>c.id===id); if (!S.ch) return;
-  S.thread = S.ch.root_thread_id; S.isRoot = true;
+  S.thread = S.ch.root_thread_id; S.isRoot = true; S.space = null;
+  setView("chan");
   $("#viewTitle").textContent = "#"+S.ch.name;
   $("#viewDesc").textContent = S.ch.description||"";
   $("#crumb").style.display="none";
-  $("#threads").classList.remove("on");
-  renderChannels();
+  renderChannels(); renderSpaces();
   await Promise.all([loadMessages(), loadThreads()]);
   markRead();
 }
 
 async function openThread(t){
   S.thread = t.id; S.isRoot = false;
+  setView("chan");
   $("#viewTitle").textContent = t.title || "(untitled thread)";
   $("#viewDesc").textContent = "in #"+S.ch.name;
   $("#crumb").style.display="";
-  $("#threads").classList.remove("on");
   await loadMessages();
   markRead();
 }
-$("#crumb").onclick = ()=>openChannel(S.ch.id);
+$("#crumb").onclick = ()=>{
+  if (S.view==="item" && S.space) openBoard(S.space.id);
+  else if (S.ch) openChannel(S.ch.id);
+};
 
 async function loadMessages(){
   const r = await api(`/threads/${S.thread}/messages?limit=100`);
@@ -348,14 +432,150 @@ $("#thForm").onsubmit = async ()=>{
   } catch(err){ toast(err.message); }
 };
 
+/* ---------- spaces & board ---------- */
+async function refreshSpaces(){
+  const r = await api("/spaces");
+  S.spaces = r.spaces||[];
+  renderSpaces();
+}
+
+function renderSpaces(){
+  const el = $("#splist"); el.innerHTML="";
+  for (const sp of S.spaces){
+    const d = document.createElement("div");
+    d.className = "ch sp"+(S.space && sp.id===S.space.id?" on":"");
+    d.innerHTML = `<span class="nm"></span><span class="key"></span>`;
+    d.querySelector(".nm").textContent = sp.name;
+    d.querySelector(".key").textContent = sp.key;
+    d.onclick = ()=>openBoard(sp.id);
+    el.appendChild(d);
+  }
+}
+
+$("#newSp").onclick = ()=>$("#spDialog").showModal();
+$("#spForm").onsubmit = async ()=>{
+  try {
+    const r = await post("/spaces",{key:$("#spKey").value, name:$("#spName").value});
+    $("#spKey").value=$("#spName").value="";
+    await refreshSpaces(); openBoard(r.id);
+  } catch(err){ toast(err.message); }
+};
+
+async function openBoard(spaceID){
+  const sp = S.spaces.find(s=>s.id===spaceID); if (!sp) return;
+  S.space = sp; S.ch = null; S.thread = 0; S.isRoot = true;
+  setView("board");
+  $("#viewTitle").textContent = sp.name;
+  $("#viewDesc").textContent = sp.key;
+  $("#crumb").style.display="none";
+  renderChannels(); renderSpaces();
+  const [sts, its] = await Promise.all([
+    api(`/spaces/${sp.id}/statuses`), api(`/spaces/${sp.id}/items`)]);
+  S.statuses = sts.statuses||[]; S.items = its.items||[];
+  renderBoard();
+}
+
+async function loadItems(){
+  if (!S.space) return;
+  const r = await api(`/spaces/${S.space.id}/items`);
+  S.items = r.items||[];
+  renderBoard();
+}
+
+function renderBoard(){
+  const el = $("#board"); el.innerHTML="";
+  for (const st of S.statuses){
+    const col = document.createElement("div");
+    col.className = "col"; col.dataset.cat = st.category;
+    col.innerHTML = `<div class="colhead"><span class="dot"></span><span class="cn"></span><span class="cnt"></span></div><div class="cards"></div>`;
+    col.querySelector(".cn").textContent = st.name;
+    const cards = col.querySelector(".cards");
+    const mine = S.items.filter(it=>it.status_id===st.id);
+    col.querySelector(".cnt").textContent = mine.length;
+    for (const it of mine) cards.appendChild(renderCard(it));
+    col.ondragover = e=>{ e.preventDefault(); col.classList.add("over"); };
+    col.ondragleave = ()=>col.classList.remove("over");
+    col.ondrop = async e=>{
+      e.preventDefault(); col.classList.remove("over");
+      const id = Number(e.dataTransfer.getData("text/plain")); if (!id) return;
+      try {
+        await api(`/items/${id}`,{method:"PATCH",body:JSON.stringify({status_id:st.id})});
+        await loadItems();
+      } catch(err){ toast(err.message); }
+    };
+    el.appendChild(col);
+  }
+}
+
+function renderCard(it){
+  const d = document.createElement("div");
+  d.className = "itemcard"; d.draggable = true;
+  d.innerHTML = `<div class="ikey"><span class="k"></span><span class="itype"></span></div><div class="ititle"></div>`;
+  d.querySelector(".k").textContent = it.key;
+  const ty = d.querySelector(".itype");
+  ty.textContent = it.type;
+  if (it.type==="Bug") ty.classList.add("bug");
+  if (it.type==="Epic") ty.classList.add("epic");
+  if (it.resolved){
+    const ok = document.createElement("span");
+    ok.className="done"; ok.textContent="✓";
+    d.querySelector(".ikey").appendChild(ok);
+  }
+  d.querySelector(".ititle").textContent = it.title;
+  d.ondragstart = e=>{ e.dataTransfer.setData("text/plain", String(it.id)); d.classList.add("drag"); };
+  d.ondragend = ()=>d.classList.remove("drag");
+  d.onclick = ()=>openItem(it);
+  return d;
+}
+
+$("#newIt").onclick = ()=>$("#itDialog").showModal();
+$("#itForm").onsubmit = async ()=>{
+  try {
+    await post(`/spaces/${S.space.id}/items`, {title:$("#itTitle").value,
+      description:$("#itDesc").value, type:$("#itType").value});
+    $("#itTitle").value=$("#itDesc").value="";
+    await loadItems();
+  } catch(err){ toast(err.message); }
+};
+
+// The item view IS a chat view: the item's discussion is a real thread whose
+// root message is the description (the D2 fusion, visible).
+async function openItem(it){
+  S.thread = it.thread_id; S.isRoot = false;
+  setView("item");
+  $("#viewTitle").textContent = `${it.key} · ${it.title}`;
+  $("#viewDesc").textContent = `${it.status}${it.resolved?" · resolved":""} — in ${S.space.name}`;
+  $("#crumb").style.display="";
+  await loadMessages();
+}
+
+$("#promote").onclick = ()=>{
+  if (!S.spaces.length){ toast("Create a space first"); return; }
+  const sel = $("#prSpace"); sel.innerHTML="";
+  for (const sp of S.spaces){
+    const o = document.createElement("option");
+    o.value = sp.id; o.textContent = `${sp.key} — ${sp.name}`;
+    sel.appendChild(o);
+  }
+  $("#prDialog").showModal();
+};
+$("#prForm").onsubmit = async ()=>{
+  try {
+    const r = await post(`/threads/${S.thread}/promote`,
+      {space_id:Number($("#prSpace").value)});
+    toast(`Promoted to ${r.key}`, true);
+    $("#viewDesc").textContent = `${r.key} · in #${S.ch.name}`;
+  } catch(err){ toast(err.message); }
+};
+
 /* ---------- composing ---------- */
 async function send(){
   const text = $("#input").value.trim(); if (!text) return;
   $("#input").value="";
   try {
-    const body = {content:text};
-    if (!S.isRoot) body.thread_id = S.thread;
-    await post(`/channels/${S.ch.id}/messages`, body);
+    // One endpoint for every thread — the server routes permissions by the
+    // thread's governing container (channel or space).
+    await post(`/threads/${S.thread}/messages`, {content:text});
   } catch(err){ toast(err.message); $("#input").value=text; }
 }
 $("#send").onclick = send;
@@ -422,6 +642,11 @@ function connectWS(){
         if (S.ch && p.channel_id===S.ch.id) loadThreads(); break;
       case "channel.created": case "member.joined": case "member.left":
         refreshChannels(); break;
+      case "space.created": refreshSpaces(); break;
+      case "workitem.created": case "workitem.updated":
+      case "workitem.status_changed": case "workitem.promoted_from_thread":
+        if (S.view==="board" && S.space && p.space_id===S.space.id) loadItems();
+        break;
       case "typing.started": onTyping(p, true); break;
       case "typing.stopped": onTyping(p, false); break;
       case "readstate.synced": refreshChannels(); break;
@@ -430,7 +655,9 @@ function connectWS(){
 }
 
 async function onMessage(p){
-  if (S.ch && p.thread_id===S.thread){
+  // Space-thread messages carry no channel_id — they only matter here when
+  // the item's thread is open.
+  if (S.view!=="board" && p.thread_id===S.thread){
     try {
       const m = await api(`/messages/${p.message_id}`);
       const el = $("#msgs");
@@ -440,15 +667,17 @@ async function onMessage(p){
       }
       markRead();
     } catch {}
-  } else {
+  } else if (p.channel_id){
     S.unreads[p.channel_id] = (S.unreads[p.channel_id]||0)+1;
     renderChannels();
   }
-  if (S.ch && p.channel_id===S.ch.id && !S.isRoot===false) loadThreads();
+  if (S.ch && p.channel_id===S.ch.id && S.isRoot) loadThreads();
 }
 
 function markRead(){
-  if (!S.thread) return;
+  // Read watermarks are channel-thread only for now (space read state is a
+  // later slice) — item views skip this.
+  if (!S.thread || !S.ch) return;
   if (S.ws && S.ws.readyState===1)
     S.ws.send(JSON.stringify({type:"read_marker", thread_id:S.thread, up_to:0}));
   else post(`/threads/${S.thread}/read`,{up_to:0}).catch(()=>{});
@@ -459,7 +688,7 @@ function signalTyping(){
   const now = Date.now();
   if (now < S.typingUntil) return;
   S.typingUntil = now + 2500;
-  if (S.ws && S.ws.readyState===1 && S.ch)
+  if (S.ws && S.ws.readyState===1 && S.view==="chan" && S.ch)
     S.ws.send(JSON.stringify({type:"typing", channel_id:S.ch.id, state:"start"}));
 }
 
