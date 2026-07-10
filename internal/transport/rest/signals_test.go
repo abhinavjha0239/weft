@@ -14,6 +14,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
@@ -194,4 +195,139 @@ func TestEphemeralSignals(t *testing.T) {
 	alice1.waitFor(t, "error")
 	alice1.send(t, ctx, map[string]any{"type": "typing", "channel_id": boot.ChannelID, "state": "stop"})
 	bob.waitFor(t, "typing.stopped")
+}
+
+// waitForPresence drains until a presence.changed for userID/state arrives.
+func (c *wsClient) waitForPresence(t *testing.T, userID int64, state string) {
+	t.Helper()
+	deadline := time.After(8 * time.Second)
+	for {
+		select {
+		case e, ok := <-c.events:
+			if !ok {
+				t.Fatalf("connection closed waiting for presence %s of %d", state, userID)
+			}
+			if e.Type != "presence.changed" {
+				continue
+			}
+			var p struct {
+				UserID int64  `json:"user_id"`
+				State  string `json:"state"`
+			}
+			_ = json.Unmarshal(e.Payload, &p)
+			if p.UserID == userID && p.State == state {
+				return
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for presence %s of %d", state, userID)
+		}
+	}
+}
+
+// TestDMTypingAndPresence: the ephemeral plane v2 — DM-scoped typing with
+// the sender spoof gate, and connection-derived presence with multi-device
+// first/last semantics.
+func TestDMTypingAndPresence(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+		DM:        dm.New(pool),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		UserID    int64  `json:"user_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "eph", "email": "a@e.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@e.test", "Bob Ray", "bobephtok")
+	charlieTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"charlie@e.test", "Charlie Kim", "charlieephtok")
+	var bobID, charlieID int64
+	_ = pool.QueryRow(ctx, `SELECT id FROM user_account WHERE org_id=$1 AND email='bob@e.test'`,
+		boot.OrgID).Scan(&bobID)
+	_ = pool.QueryRow(ctx, `SELECT id FROM user_account WHERE org_id=$1 AND email='charlie@e.test'`,
+		boot.OrgID).Scan(&charlieID)
+
+	var opened dm.Summary
+	postJSON(t, ts.URL+"/api/v1/dms", boot.Token,
+		map[string]any{"user_ids": []int64{bobID}}, &opened)
+
+	// Presence: alice online first; bob's FIRST connection broadcasts online,
+	// a second device does not, and only the LAST disconnect goes offline.
+	alice := dialClient(t, ctx, ts.URL, boot.Token)
+	alice.waitFor(t, "ready")
+	bob1 := dialClient(t, ctx, ts.URL, bobTok)
+	bob1.waitFor(t, "ready")
+	alice.waitForPresence(t, bobID, "online")
+	bob2 := dialClient(t, ctx, ts.URL, bobTok)
+	bob2.waitFor(t, "ready")
+	alice.expectSilence(t, "presence.changed", 700*time.Millisecond)
+
+	// Snapshot has both while connected.
+	var pres struct {
+		Online []int64 `json:"online"`
+	}
+	getJSON(t, ts.URL+"/api/v1/presence", boot.Token, &pres)
+	onSet := map[int64]bool{}
+	for _, id := range pres.Online {
+		onSet[id] = true
+	}
+	if !onSet[boot.UserID] || !onSet[bobID] {
+		t.Fatalf("presence snapshot = %v, want alice+bob", pres.Online)
+	}
+
+	// DM typing: alice → bob (scoped payload); charlie hears nothing, and a
+	// non-participant's frame is dropped at the sender gate.
+	charlie := dialClient(t, ctx, ts.URL, charlieTok)
+	charlie.waitFor(t, "ready")
+	// Drain charlie's own online broadcast from alice's queue so the
+	// multi-device silence assertions below are payload-clean.
+	alice.waitForPresence(t, charlieID, "online")
+	alice.send(t, ctx, map[string]any{"type": "typing", "dm_space_id": opened.ID, "state": "start"})
+	ev := bob2.waitFor(t, "typing.started")
+	var tp struct {
+		DMSpaceID int64 `json:"dm_space_id"`
+		UserID    int64 `json:"user_id"`
+	}
+	_ = json.Unmarshal(ev.Payload, &tp)
+	if tp.DMSpaceID != opened.ID || tp.UserID != boot.UserID {
+		t.Fatalf("dm typing payload wrong: %+v", tp)
+	}
+	// The legit signal reached BOTH of bob's devices — drain bob1's copy so
+	// the spoof assertion below starts from a clean queue.
+	bob1.waitFor(t, "typing.started")
+	charlie.expectSilence(t, "typing.started", 700*time.Millisecond)
+	charlie.send(t, ctx, map[string]any{"type": "typing", "dm_space_id": opened.ID, "state": "start"})
+	bob1.expectSilence(t, "typing.started", 700*time.Millisecond)
+
+	// Multi-device offline: closing one bob connection is silent; closing
+	// the last broadcasts offline.
+	_ = bob1.conn.CloseNow()
+	alice.expectSilence(t, "presence.changed", 700*time.Millisecond)
+	_ = bob2.conn.CloseNow()
+	alice.waitForPresence(t, bobID, "offline")
 }
