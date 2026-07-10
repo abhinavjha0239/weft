@@ -140,6 +140,10 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go automation.NewRunner(pool, msgSvc, log).Run(ctx)
 	filesSvc := files.New(pool, store)
 	msgSvc.SetFiles(filesSvc)
+	complianceSvc := compliance.New(pool, permsSvc)
+	complianceSvc.SetLogger(log)
+	complianceSvc.SetFiles(filesSvc)
+	go complianceSvc.RunExportLoop(ctx)
 	apiHandler := rest.Handler(ctx, rest.Deps{
 		Pool: pool, Hub: hub, Log: log,
 		Identity:      identity.New(pool, permsSvc),
@@ -148,7 +152,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		DM:            dm.New(pool),
 		Notifications: notification.New(pool),
 		Files:         filesSvc,
-		Compliance:    compliance.New(pool, permsSvc),
+		Compliance:    complianceSvc,
 		Automations:   automation.New(pool, permsSvc),
 	})
 	ui, err := webui.Handler()

@@ -70,6 +70,30 @@ func (a *api) handleListLegalHolds(w http.ResponseWriter, r *http.Request, id au
 	writeJSON(w, http.StatusOK, map[string]any{"holds": out})
 }
 
+// handleRequestExport: POST /api/v1/admin/exports (AD-5; the result file
+// downloads through the normal files endpoint).
+func (a *api) handleRequestExport(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	in, ok := decode[compliance.ExportScope](w, r)
+	if !ok {
+		return
+	}
+	job, err := a.Compliance.RequestExport(r.Context(), id, in)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, job)
+}
+
+func (a *api) handleListExports(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	out, err := a.Compliance.ListExports(r.Context(), id)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"exports": out})
+}
+
 func (a *api) handleReleaseLegalHold(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	holdID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
