@@ -631,7 +631,12 @@ async function runSearch(q){
       const ch = S.channels.find(c=>c.id===m.channel_id);
       const d = document.createElement("div"); d.className="res";
       const meta = document.createElement("div"); meta.className="rmeta";
-      meta.textContent = `#${ch?ch.name:m.channel_id} · ${userName(m.author_id)} · ${m.created_at.slice(0,10)}`;
+      // Item hits carry a key; promoted channel threads show both scopes.
+      const parts = [];
+      if (m.channel_id) parts.push("#"+(ch?ch.name:m.channel_id));
+      if (m.item_key) parts.push(m.item_key);
+      parts.push(userName(m.author_id), m.created_at.slice(0,10));
+      meta.textContent = parts.join(" · ");
       const snip = document.createElement("div"); snip.className="rsnip";
       // Snippet is PLAIN TEXT with » « highlight markers — safe to set as text,
       // then upgrade the markers to styled spans.
@@ -639,7 +644,8 @@ async function runSearch(q){
       snip.innerHTML = snip.innerHTML.replace(/»/g,'<span class="hl">').replace(/«/g,'</span>');
       d.append(meta, snip);
       d.onclick = ()=>{ $("#search").value=""; el.classList.remove("on");
-        if (ch && ch.member){ openChannel(m.channel_id).then(()=>{
+        if (!m.channel_id && m.space_id){ openItemByThread(m.space_id, m.thread_id); }
+        else if (ch && ch.member){ openChannel(m.channel_id).then(()=>{
           if (m.thread_id !== ch.root_thread_id) openThreadById(m.thread_id); }); } };
       el.appendChild(d);
     }
@@ -650,6 +656,13 @@ async function openThreadById(id){
     const r = await api(`/channels/${S.ch.id}/threads?limit=100`);
     const t = (r.threads||[]).find(x=>x.id===id);
     if (t) openThread(t);
+  } catch {}
+}
+async function openItemByThread(spaceID, threadID){
+  try {
+    await openBoard(spaceID);
+    const it = S.items.find(i=>i.thread_id===threadID);
+    if (it) openItem(it);
   } catch {}
 }
 

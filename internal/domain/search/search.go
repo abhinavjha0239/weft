@@ -18,18 +18,24 @@ type Service struct {
 func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
 
 type Result struct {
-	MessageID int64  `json:"message_id"`
-	ChannelID int64  `json:"channel_id"`
-	ThreadID  int64  `json:"thread_id"`
-	AuthorID  int64  `json:"author_id"`
+	MessageID int64 `json:"message_id"`
+	ChannelID int64 `json:"channel_id"`
+	ThreadID  int64 `json:"thread_id"`
+	AuthorID  int64 `json:"author_id"`
+	// ItemKey/SpaceID are set when the message's thread is a work item's
+	// discussion (space-governed, or a promoted channel thread).
+	ItemKey   string `json:"item_key,omitempty"`
+	SpaceID   int64  `json:"space_id,omitempty"`
 	Snippet   string `json:"snippet"`
 	CreatedAt string `json:"created_at"`
 }
 
-// Search runs a parsed query, ACL-scoped to the channels the actor is a member
-// of (S-2, v1 slice — the same read-model gate as message fetch). Free text
-// uses Postgres FTS with ts_rank ordering + a guillemet-highlighted snippet;
-// operator-only queries order by recency.
+// Search runs a parsed query under the read-model ACL — the same rule as
+// message fetch: channel messages require membership of the governing
+// channel; space-thread messages (item descriptions and comments) are
+// org-visible in the v1 slice. Free text uses Postgres FTS with ts_rank
+// ordering + a guillemet-highlighted snippet; operator-only queries order
+// by recency.
 func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, limit int) ([]Result, error) {
 	if limit <= 0 || limit > 100 {
 		limit = 30
@@ -49,7 +55,10 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	hasText := q.Text != ""
 
 	var sb strings.Builder
-	sb.WriteString("SELECT m.id, m.channel_id, m.thread_id, m.author_id, ")
+	sb.WriteString("SELECT m.id, COALESCE(m.channel_id, 0), m.thread_id, m.author_id, ")
+	// Item enrichment: work_item.thread_id is UNIQUE, so this is a per-row
+	// index lookup that also tags promoted channel threads with their key.
+	sb.WriteString("COALESCE(sp.key || '-' || w.key_no, ''), COALESCE(w.space_id, 0), ")
 	if hasText {
 		// Empty StartSel/StopSel via guillemets keeps the snippet PLAIN TEXT
 		// (no HTML injected into a field the client shows).
@@ -60,8 +69,8 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	}
 	sb.WriteString("to_char(m.created_at, 'YYYY-MM-DD\"T\"HH24:MI:SSZ') AS created_at ")
 	sb.WriteString("FROM message m ")
-	sb.WriteString("JOIN channel_member cm ON cm.channel_id = m.channel_id AND cm.user_id = " +
-		actorP + " AND cm.unsubscribed_at IS NULL ")
+	sb.WriteString("LEFT JOIN work_item w ON w.thread_id = m.thread_id ")
+	sb.WriteString("LEFT JOIN space sp ON sp.id = w.space_id ")
 	if q.Resolved != nil {
 		sb.WriteString("JOIN thread t ON t.id = m.thread_id ")
 	}
@@ -69,6 +78,11 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 		sb.WriteString(", websearch_to_tsquery('english', " + add(q.Text) + ") qq ")
 	}
 	sb.WriteString("WHERE m.org_id = " + orgP + " AND m.deleted_at IS NULL ")
+	// Read ACL (matches messaging.Get/ListMessages): membership for channel
+	// messages; channel-less space-thread messages are org-visible.
+	sb.WriteString("AND (m.channel_id IS NULL OR EXISTS (" +
+		"SELECT 1 FROM channel_member cm WHERE cm.channel_id = m.channel_id " +
+		"AND cm.user_id = " + actorP + " AND cm.unsubscribed_at IS NULL)) ")
 	if hasText {
 		sb.WriteString("AND m.search_tsv @@ qq ")
 	}
@@ -113,7 +127,7 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	for rows.Next() {
 		var r Result
 		if err := rows.Scan(&r.MessageID, &r.ChannelID, &r.ThreadID,
-			&r.AuthorID, &r.Snippet, &r.CreatedAt); err != nil {
+			&r.AuthorID, &r.ItemKey, &r.SpaceID, &r.Snippet, &r.CreatedAt); err != nil {
 			return nil, apperr.Internal("scan result", err)
 		}
 		out = append(out, r)
