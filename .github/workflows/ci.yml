@@ -37,6 +37,24 @@ jobs:
             exit 1
           fi
 
+  quality:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      # staticcheck: the analyzer layer beyond go vet. govulncheck: called-
+      # symbol scanning against the Go vulnerability database — it gates on
+      # vulnerabilities our code REACHES, not mere presence in go.sum.
+      # (CodeQL + Codecov are the go-public upgrades: both are paid/limited
+      # for private repos; revisit at the licensing decision.)
+      - name: staticcheck
+        run: go run honnef.co/go/tools/cmd/staticcheck@latest ./...
+      - name: govulncheck
+        run: go run golang.org/x/vuln/cmd/govulncheck@latest ./...
+
   test:
     runs-on: ubuntu-latest
     services:
@@ -61,7 +79,14 @@ jobs:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:55432/postgres
         # -p 1: test packages share one database and each resets the schema —
         # parallel packages would clobber each other.
-        run: go test -p 1 ./... -count=1
+        # Coverage is measured ACROSS packages (-coverpkg): the domain
+        # modules are exercised by the rest-layer integration tests. The
+        # floor ratchets up, never down (72% when introduced at 75.0%).
+        run: |
+          go test -p 1 -coverpkg=./internal/... ./... -count=1 -coverprofile=cover.out
+          total=$(go tool cover -func=cover.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "### internal/ statement coverage: ${total}% (floor 72%)" >> "$GITHUB_STEP_SUMMARY"
+          awk -v t="$total" 'BEGIN { if (t+0 < 72.0) { print "coverage " t "% fell below the 72% floor"; exit 1 } print "coverage " t "% clears the 72% floor" }'
       - name: Brand-token rule (docs/BRANDING.md)
         # No \b in patterns: git grep's word-boundary escape is not portable
         # across platforms (silently matches nothing on macOS libc).
