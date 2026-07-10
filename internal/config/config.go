@@ -5,6 +5,7 @@ package config
 import (
 	"fmt"
 	"os"
+	"strconv"
 
 	"github.com/abhinavjha0239/weft/internal/brand"
 )
@@ -16,6 +17,11 @@ type Config struct {
 	// any mounted volume; s3/gcs/azure are drop-in Store implementations.
 	BlobDriver string
 	BlobDir    string
+	// GC windows (days). Unclaimed: never-referenced uploads (Zulip ships
+	// 5 weeks — drafts hold uploads silently). DeadRef: files whose last
+	// referencing message was deleted (Zulip's 30-day vacuum delay).
+	GCUnclaimedDays int
+	GCDeadRefDays   int
 }
 
 func Load() (Config, error) {
@@ -28,6 +34,8 @@ func Load() (Config, error) {
 	if c.BlobDir == "" {
 		c.BlobDir = "./data/blobs"
 	}
+	c.GCUnclaimedDays = envDays("GC_UNCLAIMED_DAYS", 35)
+	c.GCDeadRefDays = envDays("GC_DEAD_REF_DAYS", 30)
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("%sDATABASE_URL is required", brand.EnvPrefix)
 	}
@@ -35,4 +43,13 @@ func Load() (Config, error) {
 		c.ListenAddr = ":8443"
 	}
 	return c, nil
+}
+
+// envDays reads a positive day count, falling back on absent or bad values.
+func envDays(name string, fallback int) int {
+	v, err := strconv.Atoi(os.Getenv(brand.EnvPrefix + name))
+	if err != nil || v < 1 {
+		return fallback
+	}
+	return v
 }

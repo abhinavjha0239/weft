@@ -129,6 +129,10 @@ func serve(ctx context.Context, cfg config.Config) error {
 	hub := gateway.NewHub(pool, log)
 	go hub.Run(ctx)
 	go notification.NewRunner(pool, hub, log).Run(ctx)
+	janitor := compliance.NewJanitor(pool, store, log)
+	janitor.UnclaimedGrace = time.Duration(cfg.GCUnclaimedDays) * 24 * time.Hour
+	janitor.DeadRefWindow = time.Duration(cfg.GCDeadRefDays) * 24 * time.Hour
+	go janitor.Run(ctx)
 
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
