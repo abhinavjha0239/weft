@@ -5,15 +5,16 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/migrations"
 )
 
 // The fixture is a miniature but structurally faithful Zulip export:
@@ -84,16 +85,8 @@ func testPool(t *testing.T) (*pgxpool.Pool, int64) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	files, _ := filepath.Glob("../../../migrations/0*.sql")
-	sort.Strings(files)
-	for _, f := range files {
-		sqlBytes, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if _, err := pool.Exec(ctx, string(sqlBytes)); err != nil {
-			t.Fatalf("apply %s: %v", f, err)
-		}
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 	// A live org with the standard bootstrap shape (#general exists → the
 	// import must rename its incoming "general").

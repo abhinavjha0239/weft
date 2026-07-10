@@ -4,8 +4,7 @@ package db
 import (
 	"context"
 	"fmt"
-	"os"
-	"path/filepath"
+	"io/fs"
 	"sort"
 
 	"github.com/jackc/pgx/v5"
@@ -55,9 +54,11 @@ func WithTx(ctx context.Context, pool *pgxpool.Pool, fn func(pgx.Tx) error) erro
 	return nil
 }
 
-// Migrate applies migrations/*.sql in filename order, tracking applied files
-// in schema_migrations. Files are append-only once released.
-func Migrate(ctx context.Context, pool *pgxpool.Pool, dir string) error {
+// Migrate applies 0*.sql from fsys in filename order, tracking applied files
+// in schema_migrations. Files are append-only once released. Callers pass the
+// embedded migrations.FS, so the runner never depends on the working
+// directory; an empty fsys is an error, never a silent no-op.
+func Migrate(ctx context.Context, pool *pgxpool.Pool, fsys fs.FS) error {
 	if _, err := pool.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS schema_migrations (
 			filename   TEXT PRIMARY KEY,
@@ -65,13 +66,15 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, dir string) error {
 		)`); err != nil {
 		return fmt.Errorf("db: migrations table: %w", err)
 	}
-	files, err := filepath.Glob(filepath.Join(dir, "0*.sql"))
+	files, err := fs.Glob(fsys, "0*.sql")
 	if err != nil {
 		return err
 	}
+	if len(files) == 0 {
+		return fmt.Errorf("db: no migration files in the provided filesystem")
+	}
 	sort.Strings(files)
-	for _, f := range files {
-		name := filepath.Base(f)
+	for _, name := range files {
 		var done bool
 		if err := pool.QueryRow(ctx,
 			`SELECT EXISTS (SELECT 1 FROM schema_migrations WHERE filename = $1)`,
@@ -81,7 +84,7 @@ func Migrate(ctx context.Context, pool *pgxpool.Pool, dir string) error {
 		if done {
 			continue
 		}
-		sql, err := os.ReadFile(f)
+		sql, err := fs.ReadFile(fsys, name)
 		if err != nil {
 			return err
 		}

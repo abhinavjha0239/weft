@@ -3,8 +3,6 @@ package perms
 import (
 	"context"
 	"os"
-	"path/filepath"
-	"sort"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -13,6 +11,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
+	"github.com/abhinavjha0239/weft/migrations"
 )
 
 func testPool(t *testing.T) *pgxpool.Pool {
@@ -30,16 +29,8 @@ func testPool(t *testing.T) *pgxpool.Pool {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	files, _ := filepath.Glob("../../../migrations/0*.sql")
-	sort.Strings(files)
-	for _, f := range files {
-		sql, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("apply %s: %v", f, err)
-		}
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 	return pool
 }

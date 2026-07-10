@@ -9,8 +9,6 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
-	"path/filepath"
-	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -18,10 +16,12 @@ import (
 	"github.com/coder/websocket"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/migrations"
 )
 
 // End-to-end M0 test: bootstrap → login-token → WebSocket → REST send →
@@ -158,19 +158,10 @@ func resetAndMigrate(t *testing.T, ctx context.Context, pool *pgxpool.Pool) {
 	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
 		t.Fatalf("reset: %v", err)
 	}
-	files, _ := filepath.Glob("../../../migrations/0*.sql")
-	if len(files) == 0 {
-		t.Fatal("no migrations found")
-	}
-	sort.Strings(files)
-	for _, f := range files {
-		sql, err := os.ReadFile(f)
-		if err != nil {
-			t.Fatalf("read %s: %v", f, err)
-		}
-		if _, err := pool.Exec(ctx, string(sql)); err != nil {
-			t.Fatalf("apply %s: %v", f, err)
-		}
+	// The production runner against the embedded schema: tests exercise the
+	// same migration path operators run.
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
+		t.Fatalf("migrate: %v", err)
 	}
 }
 
@@ -411,5 +402,50 @@ func TestRichContentEndToEnd(t *testing.T) {
 	}
 	if strings.Contains(got.Rendered, "javascript:") {
 		t.Fatalf("unsafe href survived:\n%s", got.Rendered)
+	}
+}
+
+// TestBootstrapErrorMapping: a duplicate slug is the ONLY 409; infrastructure
+// failures (e.g. an unmigrated database) must surface as 500 — the old code
+// mapped ANY org-insert failure to "org slug unavailable", which sent a live
+// debugging session hunting a phantom slug collision.
+func TestBootstrapErrorMapping(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Log: slog.Default(),
+		Identity:  identity.New(pool, perms.New(pool)),
+		Messaging: messaging.New(pool, perms.New(pool)),
+	}))
+	defer ts.Close()
+
+	body := map[string]any{"org_slug": "dup", "email": "a@d.test",
+		"password": "password123", "full_name": "A"}
+	if code := postJSONStatus(t, ts.URL+"/api/v1/orgs/bootstrap", "", body); code != http.StatusCreated {
+		t.Fatalf("first bootstrap = %d, want 201", code)
+	}
+	body["email"] = "b@d.test"
+	if code := postJSONStatus(t, ts.URL+"/api/v1/orgs/bootstrap", "", body); code != http.StatusConflict {
+		t.Fatalf("duplicate slug = %d, want 409", code)
+	}
+
+	// Empty schema (no tables): an infra failure, not a slug conflict.
+	if _, err := pool.Exec(ctx, `DROP SCHEMA public CASCADE; CREATE SCHEMA public`); err != nil {
+		t.Fatalf("reset: %v", err)
+	}
+	body["org_slug"] = "fresh"
+	if code := postJSONStatus(t, ts.URL+"/api/v1/orgs/bootstrap", "", body); code != http.StatusInternalServerError {
+		t.Fatalf("bootstrap on unmigrated db = %d, want 500", code)
 	}
 }

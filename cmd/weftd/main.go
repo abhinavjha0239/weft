@@ -24,6 +24,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
+	"github.com/abhinavjha0239/weft/migrations"
 )
 
 // version is stamped by the build (-ldflags "-X main.version=...").
@@ -44,7 +45,7 @@ func main() {
 				return err
 			}
 			defer pool.Close()
-			return db.Migrate(ctx, pool, "migrations")
+			return db.Migrate(ctx, pool, migrations.FS)
 		})
 	case "serve":
 		run(serve)
@@ -84,7 +85,7 @@ func importZulip(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer pool.Close()
-	if err := db.Migrate(ctx, pool, "migrations"); err != nil {
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
 		return err
 	}
 	var orgID int64
@@ -108,7 +109,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 	defer pool.Close()
-	if err := db.Migrate(ctx, pool, "migrations"); err != nil {
+	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
 		return err
 	}
 
