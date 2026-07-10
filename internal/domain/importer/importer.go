@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -32,13 +33,18 @@ type Report struct {
 	// Imported (lossless or transformed).
 	Users, Channels, Threads, Messages, Reactions, Subscriptions int            `json:"-"`
 	Groups, GroupMembers, GroupEdges, Watermarks                 int            `json:"-"`
+	DMConversations, DMMessages                                  int            `json:"-"`
 	ImportedCounts                                               map[string]int `json:"imported"`
 
 	// Skipped-with-reason (documented losses of this importer version).
-	BotsSkipped        int `json:"bots_skipped"`
-	DMMessagesSkipped  int `json:"dm_messages_skipped"`
-	EditHistoryDropped int `json:"edit_history_dropped"`
-	ReactionsUnmapped  int `json:"reactions_unmapped"`
+	BotsSkipped int `json:"bots_skipped"`
+	// A DM conversation imports only when EVERY participant maps to a human
+	// account: dropping a bot participant would shrink the canonical key
+	// and wrongly merge the history into a different conversation.
+	DMMessagesSkipped     int `json:"dm_messages_skipped_unmappable_participants"`
+	StreamMessagesSkipped int `json:"stream_messages_skipped_unmapped"`
+	EditHistoryDropped    int `json:"edit_history_dropped"`
+	ReactionsUnmapped     int `json:"reactions_unmapped"`
 	// Email-matched EXISTING accounts keep their current role — an import
 	// never elevates or demotes a live user. Counted when the source role
 	// was anything above plain member.
@@ -65,7 +71,8 @@ func (r *Report) finalize() {
 		"messages": r.Messages, "reactions": r.Reactions,
 		"subscriptions": r.Subscriptions, "groups": r.Groups,
 		"group_members": r.GroupMembers, "group_edges": r.GroupEdges,
-		"read_watermarks": r.Watermarks,
+		"read_watermarks":  r.Watermarks,
+		"dm_conversations": r.DMConversations, "dm_messages": r.DMMessages,
 	}
 }
 
@@ -150,10 +157,47 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 			}
 		}
 		rep.Channels = len(ex.Streams)
+		humans := map[int64]bool{}
+		for _, u := range ex.Users {
+			if !u.IsBot {
+				humans[u.ID] = true
+			}
+		}
+		// DM tkeys feed the watermark accounting below; a conversation with
+		// any non-human participant is skipped whole (write-path rule).
+		dmTkey := map[int64]string{}
+		dmConvos := map[string]bool{}
 		topics := map[string]bool{}
 		for _, m := range ex.Messages {
 			if _, ok := ex.StreamByRecipient[m.Recipient]; !ok {
-				rep.DMMessagesSkipped++
+				ids, ok := dmParticipants(ex, m)
+				allHuman := ok && humans[m.Sender]
+				if ok {
+					for _, id := range ids {
+						if !humans[id] {
+							allHuman = false
+							break
+						}
+					}
+				}
+				if !ok || !allHuman {
+					rep.DMMessagesSkipped++
+					continue
+				}
+				parts := make([]string, len(ids))
+				for i, id := range ids {
+					parts[i] = fmt.Sprint(id)
+				}
+				key := "dm:" + strings.Join(parts, ":")
+				dmTkey[m.ID] = key
+				if !dmConvos[key] {
+					dmConvos[key] = true
+					rep.DMConversations++
+				}
+				rep.DMMessages++
+				if m.EditHistory != nil && *m.EditHistory != "" && *m.EditHistory != "null" {
+					rep.EditHistoryDropped++
+				}
 				continue
 			}
 			rep.Messages++
@@ -200,6 +244,8 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 		for _, m := range ex.Messages {
 			if sid, ok := ex.StreamByRecipient[m.Recipient]; ok {
 				msgTkey[m.ID] = fmt.Sprintf("%d\x00%s", sid, m.Subject)
+			} else if tk, ok := dmTkey[m.ID]; ok {
+				msgTkey[m.ID] = tk
 			}
 		}
 		type drk struct {
@@ -577,16 +623,20 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	threadMap := map[string]int64{} // "streamID\x00subject" → thread id
 	messageMap := map[int64]int64{} // zulip message id → our id
 	msgThread := map[int64]int64{}  // zulip message id → our thread id
+	dmCache := map[string]dmInfo{}  // canonical weft key → conversation
 	for _, m := range ex.Messages {
 		streamID, ok := ex.StreamByRecipient[m.Recipient]
 		if !ok {
-			rep.DMMessagesSkipped++
+			if err := s.importDMMessage(ctx, tx, orgID, ex, m, userMap,
+				nameMap, dmCache, messageMap, msgThread, rep); err != nil {
+				return err
+			}
 			continue
 		}
 		chID, ok1 := channelMap[streamID]
 		authorID, ok2 := userMap[m.Sender]
 		if !ok1 || !ok2 {
-			rep.DMMessagesSkipped++
+			rep.StreamMessagesSkipped++
 			continue
 		}
 		tkey := fmt.Sprintf("%d\x00%s", streamID, m.Subject)
@@ -765,4 +815,151 @@ func nullableTime(t time.Time) *time.Time {
 		return nil
 	}
 	return &t
+}
+
+type dmInfo struct{ spaceID, threadID int64 }
+
+// importDMMessage lands one direct message: resolve the participant set,
+// create-or-get the conversation by its canonical key (the SAME derivation
+// the native dm module uses, so imported and native history share one
+// dm_space), then the provenance-idempotent message write. A conversation
+// with any unmappable participant (a bot) is skipped and counted — dropping
+// the participant would shrink the key and wrongly merge the history into a
+// different conversation.
+func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
+	ex *Export, m zulipMessage, userMap map[int64]int64,
+	nameMap map[string]int64, dmCache map[string]dmInfo,
+	messageMap, msgThread map[int64]int64, rep *Report) error {
+
+	zulipIDs, ok := dmParticipants(ex, m)
+	if !ok {
+		rep.DMMessagesSkipped++
+		return nil
+	}
+	weftIDs := make([]int64, 0, len(zulipIDs))
+	for _, zid := range zulipIDs {
+		uid, mapped := userMap[zid]
+		if !mapped {
+			rep.DMMessagesSkipped++
+			return nil
+		}
+		weftIDs = append(weftIDs, uid)
+	}
+	authorID, ok := userMap[m.Sender]
+	if !ok {
+		rep.DMMessagesSkipped++
+		return nil
+	}
+	sort.Slice(weftIDs, func(i, j int) bool { return weftIDs[i] < weftIDs[j] })
+	parts := make([]string, len(weftIDs))
+	for i, id := range weftIDs {
+		parts[i] = fmt.Sprint(id)
+	}
+	key := strings.Join(parts, ":")
+
+	info, cached := dmCache[key]
+	if !cached {
+		var kind int16
+		switch {
+		case len(weftIDs) == 1:
+			kind = 3
+		case len(weftIDs) == 2:
+			kind = 1
+		default:
+			kind = 2
+		}
+		err := tx.QueryRow(ctx, `
+			INSERT INTO dm_space (org_id, kind, dm_key) VALUES ($1, $2, $3)
+			ON CONFLICT (org_id, dm_key) DO NOTHING
+			RETURNING id`, orgID, kind, key).Scan(&info.spaceID)
+		if err == pgx.ErrNoRows { // native or previous-run conversation
+			if err := tx.QueryRow(ctx,
+				`SELECT id FROM dm_space WHERE org_id = $1 AND dm_key = $2`,
+				orgID, key).Scan(&info.spaceID); err != nil {
+				return fmt.Errorf("resolve dm space: %w", err)
+			}
+			if err := tx.QueryRow(ctx,
+				`SELECT id FROM thread WHERE dm_space_id = $1 AND kind = 2`,
+				info.spaceID).Scan(&info.threadID); err != nil {
+				return fmt.Errorf("resolve dm thread: %w", err)
+			}
+			rep.AlreadyImported++
+		} else if err != nil {
+			return fmt.Errorf("dm space: %w", err)
+		} else {
+			for _, uid := range weftIDs {
+				if _, err := tx.Exec(ctx,
+					`INSERT INTO dm_participant (dm_space_id, user_id) VALUES ($1, $2)`,
+					info.spaceID, uid); err != nil {
+					return fmt.Errorf("dm participant: %w", err)
+				}
+			}
+			if err := tx.QueryRow(ctx, `
+				INSERT INTO thread (org_id, dm_space_id, kind) VALUES ($1, $2, 2)
+				RETURNING id`, orgID, info.spaceID).Scan(&info.threadID); err != nil {
+				return fmt.Errorf("dm thread: %w", err)
+			}
+			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+				OrgID: orgID, ActorKind: enum.ActorImporter,
+				EntityType: enum.EntityDM, EntityID: info.spaceID, Verb: "dm.opened",
+				OccurredAt: ts(m.DateSent),
+				Payload: eventlog.MustPayload(map[string]any{
+					"dm_space_id": info.spaceID, "root_thread_id": info.threadID,
+					"user_ids": weftIDs}),
+			}); err != nil {
+				return err
+			}
+			rep.DMConversations++
+		}
+		dmCache[key] = info
+	}
+
+	if m.EditHistory != nil && *m.EditHistory != "" && *m.EditHistory != "null" {
+		rep.EditHistoryDropped++
+	}
+	doc := content.Parse(m.Content, func(label string) (int64, bool) {
+		id, ok := nameMap[label]
+		return id, ok
+	})
+	var msgID int64
+	err := tx.QueryRow(ctx, `
+		INSERT INTO message (org_id, thread_id, dm_space_id, author_id,
+			source, ast, rendered, render_version, has_link, created_at,
+			origin_system, origin_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+		ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
+		DO NOTHING
+		RETURNING id`,
+		orgID, info.threadID, info.spaceID, authorID, m.Content, doc.JSON(),
+		content.RenderHTML(doc), content.RenderVersion, doc.HasLink(),
+		ts(m.DateSent), originZulip, fmt.Sprint(m.ID)).Scan(&msgID)
+	if err == pgx.ErrNoRows {
+		rep.AlreadyImported++
+		if err := tx.QueryRow(ctx, `
+			SELECT id FROM message WHERE org_id = $1
+			 AND origin_system = $2 AND origin_id = $3`,
+			orgID, originZulip, fmt.Sprint(m.ID)).Scan(&msgID); err != nil {
+			return fmt.Errorf("resolve imported dm message: %w", err)
+		}
+		messageMap[m.ID] = msgID
+		msgThread[m.ID] = info.threadID
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("dm message %d: %w", m.ID, err)
+	}
+	messageMap[m.ID] = msgID
+	msgThread[m.ID] = info.threadID
+	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+		OrgID: orgID, ActorKind: enum.ActorImporter,
+		EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
+		OccurredAt: ts(m.DateSent),
+		Payload: eventlog.MustPayload(map[string]any{
+			"message_id": msgID, "dm_space_id": info.spaceID,
+			"thread_id": info.threadID, "mentions": doc.Mentions()}),
+	}); err != nil {
+		return err
+	}
+	rep.DMMessages++
+	return nil
 }

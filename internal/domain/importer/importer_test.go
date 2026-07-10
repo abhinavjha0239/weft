@@ -3,6 +3,7 @@ package importer
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,8 +20,8 @@ import (
 
 // The fixture is a miniature but structurally faithful Zulip export:
 // two humans + one bot; #general (collides with the bootstrap channel) and a
-// private #core-team (deactivated=false, invite_only); two topics; a DM that
-// must be skipped-with-count; a message with edit_history; an @**mention**;
+// private #core-team (deactivated=false, invite_only); two topics; a legacy-personal self-DM and a
+// 1:1 (both imported), a bot-tainted huddle (skipped whole, counted); a message with edit_history; an @**mention**;
 // a reaction; everything dated 2019 to prove backdating. Groups: four system
 // role groups (administrators/members map, fullmembers coarsens to members,
 // nobody is unmappable) + custom "engineering" with a bot member (skipped)
@@ -39,13 +40,18 @@ const fixtureRealm = `{
   "zerver_recipient": [
     {"id": 31, "type": 2, "type_id": 21},
     {"id": 32, "type": 2, "type_id": 22},
-    {"id": 33, "type": 1, "type_id": 11}
+    {"id": 33, "type": 1, "type_id": 11},
+    {"id": 34, "type": 3, "type_id": 77},
+    {"id": 35, "type": 1, "type_id": 12}
   ],
   "zerver_subscription": [
     {"id": 41, "user_profile": 11, "recipient": 31, "active": true},
     {"id": 42, "user_profile": 12, "recipient": 31, "active": true},
     {"id": 43, "user_profile": 11, "recipient": 32, "active": true},
-    {"id": 44, "user_profile": 12, "recipient": 32, "active": false}
+    {"id": 44, "user_profile": 12, "recipient": 32, "active": false},
+    {"id": 45, "user_profile": 11, "recipient": 34, "active": true},
+    {"id": 46, "user_profile": 12, "recipient": 34, "active": true},
+    {"id": 47, "user_profile": 13, "recipient": 34, "active": true}
   ],
   "zerver_namedusergroup": [
     {"id": 51, "name": "role:administrators", "description": "", "is_system_group": true, "deactivated": false, "date_created": null},
@@ -73,7 +79,9 @@ const fixtureMessages = `{
     {"id": 102, "sender": 12, "recipient": 31, "subject": "launch plan", "content": "ack @**Iago** :rocket:", "date_sent": 1554100600, "edit_history": null},
     {"id": 103, "sender": 12, "recipient": 31, "subject": "random", "content": "edited once", "date_sent": 1554200000, "edit_history": "[{\"prev_content\":\"original\"}]"},
     {"id": 104, "sender": 11, "recipient": 32, "subject": "secrets", "content": "private planning", "date_sent": 1554300000, "edit_history": null},
-    {"id": 105, "sender": 11, "recipient": 33, "subject": "", "content": "a DM that must be skipped", "date_sent": 1554400000, "edit_history": null}
+    {"id": 105, "sender": 11, "recipient": 33, "subject": "", "content": "a note to self", "date_sent": 1554400000, "edit_history": null},
+    {"id": 106, "sender": 12, "recipient": 34, "subject": "", "content": "huddle with the bot — must be skipped whole", "date_sent": 1554500000, "edit_history": null},
+    {"id": 107, "sender": 11, "recipient": 35, "subject": "", "content": "ping me when the **beta** branch is cut", "date_sent": 1554600000, "edit_history": null}
   ],
   "zerver_reaction": [
     {"id": 201, "user_profile": 11, "message": 102, "emoji_name": "tada"}
@@ -84,7 +92,8 @@ const fixtureMessages = `{
     {"id": 303, "user_profile": 12, "flags_mask": 1, "message": 102},
     {"id": 304, "user_profile": 12, "flags_mask": 0, "message": 101},
     {"id": 305, "user_profile": 11, "flags_mask": 1, "message": 105},
-    {"id": 306, "user_profile": 12, "flags_mask": 3, "message": 103}
+    {"id": 306, "user_profile": 12, "flags_mask": 3, "message": 103},
+    {"id": 307, "user_profile": 12, "flags_mask": 1, "message": 107}
   ]
 }`
 
@@ -143,9 +152,15 @@ func TestZulipImportShowcase(t *testing.T) {
 		t.Fatalf("dry run: %v", err)
 	}
 	if dry.Users != 2 || dry.BotsSkipped != 1 || dry.Channels != 2 ||
-		dry.Threads != 3 || dry.Messages != 4 || dry.DMMessagesSkipped != 1 ||
+		dry.Threads != 3 || dry.Messages != 4 ||
 		dry.EditHistoryDropped != 1 || dry.Reactions != 1 {
 		t.Fatalf("dry-run report off: %+v", dry)
+	}
+	// DMs: the self-DM and the 1:1 import (2 conversations, 2 messages);
+	// the bot-tainted huddle is skipped WHOLE — dropping the bot would
+	// shrink the canonical key onto the humans' real 1:1.
+	if dry.DMConversations != 2 || dry.DMMessages != 2 || dry.DMMessagesSkipped != 1 {
+		t.Fatalf("dry-run dm accounting off: %+v", dry)
 	}
 	// Groups: 1 custom; 3 mappable system groups (nobody has no counterpart);
 	// 2 custom memberships (the bot's is skipped); 1 edge (members⊇fullmembers
@@ -156,8 +171,9 @@ func TestZulipImportShowcase(t *testing.T) {
 	}
 	// Watermarks: Iago read both launch-plan messages; Hamlet read the NEWER
 	// launch-plan message but not the older (coarsened) and read "random"
-	// with a starred bit that must be ignored; the DM read flag maps nowhere.
-	if dry.Watermarks != 3 || dry.ReadCoarsened != 1 {
+	// with a starred bit that must be ignored; DM read flags now land too —
+	// Iago's self-DM and Hamlet's 1:1 read each add a pair.
+	if dry.Watermarks != 5 || dry.ReadCoarsened != 1 {
 		t.Fatalf("dry-run watermark accounting off: %+v", dry)
 	}
 	var n int
@@ -298,8 +314,58 @@ func TestZulipImportShowcase(t *testing.T) {
 	// Watermarks match the dry-run accounting, and Hamlet's launch-plan
 	// watermark sits on the NEWER read message (zulip 102) — the older
 	// unread message below it is the counted coarsening.
-	if rep.Watermarks != 3 || rep.ReadCoarsened != 1 {
+	if rep.Watermarks != 5 || rep.ReadCoarsened != 1 {
 		t.Fatalf("watermark report off: %+v", rep)
+	}
+	if rep.DMConversations != 2 || rep.DMMessages != 2 || rep.DMMessagesSkipped != 1 {
+		t.Fatalf("dm import report off: %+v", rep)
+	}
+	// The 1:1 landed in a dm_space whose canonical key matches what the
+	// native dm module would compute — imported and native history share
+	// one conversation.
+	var dmKind int16
+	var dmKey string
+	var dmThread int64
+	lo, hi := iagoID, hamletID
+	if hi < lo {
+		lo, hi = hi, lo
+	}
+	wantKey := fmt.Sprintf("%d:%d", lo, hi)
+	if err := pool.QueryRow(ctx, `
+		SELECT ds.kind, ds.dm_key, t.id
+		FROM dm_space ds JOIN thread t ON t.dm_space_id = ds.id AND t.kind = 2
+		WHERE ds.org_id = $1 AND ds.dm_key = $2`,
+		orgID, wantKey).Scan(&dmKind, &dmKey, &dmThread); err != nil {
+		t.Fatalf("imported 1:1 dm_space: %v", err)
+	}
+	if dmKind != 1 {
+		t.Fatalf("1:1 dm kind = %d, want 1", dmKind)
+	}
+	var dmMsgCount int
+	var weft107 int64
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM message WHERE thread_id = $1`, dmThread).Scan(&dmMsgCount)
+	_ = pool.QueryRow(ctx, `
+		SELECT id FROM message WHERE org_id = $1
+		 AND origin_system = 'zulip' AND origin_id = '107'`, orgID).Scan(&weft107)
+	if dmMsgCount != 1 || weft107 == 0 {
+		t.Fatalf("1:1 dm thread has %d messages (weft107=%d), want the imported one", dmMsgCount, weft107)
+	}
+	// Hamlet's read flag became a watermark on the DM thread.
+	var dmWM int64
+	if err := pool.QueryRow(ctx, `
+		SELECT last_read_message_id FROM thread_read_watermark
+		WHERE user_id = $1 AND thread_id = $2`, hamletID, dmThread).Scan(&dmWM); err != nil {
+		t.Fatalf("hamlet dm watermark: %v", err)
+	}
+	if dmWM != weft107 {
+		t.Fatalf("hamlet dm watermark = %d, want %d", dmWM, weft107)
+	}
+	// The self-DM imported as kind 3; the bot huddle imported NOTHING.
+	var selfCount, spaces int
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM dm_space WHERE org_id = $1 AND kind = 3`, orgID).Scan(&selfCount)
+	_ = pool.QueryRow(ctx, `SELECT count(*) FROM dm_space WHERE org_id = $1`, orgID).Scan(&spaces)
+	if selfCount != 1 || spaces != 2 {
+		t.Fatalf("dm spaces = %d (self %d), want 2 total (huddle skipped)", spaces, selfCount)
 	}
 	var hamletWM, weft102 int64
 	_ = pool.QueryRow(ctx, `
@@ -324,7 +390,8 @@ func TestZulipImportShowcase(t *testing.T) {
 	}
 	if rep2.Messages != 0 || rep2.Users != 0 || rep2.Channels != 0 ||
 		rep2.Threads != 0 || rep2.Groups != 0 || rep2.GroupMembers != 0 ||
-		rep2.GroupEdges != 0 || rep2.Watermarks != 0 {
+		rep2.GroupEdges != 0 || rep2.Watermarks != 0 ||
+		rep2.DMConversations != 0 || rep2.DMMessages != 0 {
 		t.Fatalf("re-run imported new rows: %+v", rep2)
 	}
 	if rep2.AlreadyImported == 0 {
@@ -334,8 +401,8 @@ func TestZulipImportShowcase(t *testing.T) {
 	_ = pool.QueryRow(ctx,
 		`SELECT count(*) FROM message WHERE org_id = $1 AND origin_system = 'zulip'`,
 		orgID).Scan(&msgs)
-	if msgs != 4 {
-		t.Fatalf("after re-run message count = %d, want 4 (no duplicates)", msgs)
+	if msgs != 6 {
+		t.Fatalf("after re-run message count = %d, want 6 (4 stream + 2 dm, no duplicates)", msgs)
 	}
 }
 

@@ -143,10 +143,13 @@ type Export struct {
 	Reactions     []zulipReaction
 	UserMessages  []zulipUserMessage
 
-	// recipient id → stream id (type 2 only); non-stream recipients counted
-	// as skipped DMs.
+	// recipient id → stream id (type 2 only).
 	StreamByRecipient map[int64]int64
-	DMRecipients      map[int64]bool
+	// DM routing: type 1 (legacy personal) targets one user; type 3 (direct
+	// message group — modern Zulip routes ALL DMs here, 1:1 included) gets
+	// its participants from subscriptions on the recipient.
+	PersonalTarget map[int64]int64   // recipient id → target user id
+	DMGroupMembers map[int64][]int64 // recipient id → participant user ids
 }
 
 // LoadZulipExport reads an UNPACKED export directory (realm.json +
@@ -164,13 +167,23 @@ func LoadZulipExport(dir string) (*Export, error) {
 		GroupMembers:      realm.GroupMembers,
 		GroupEdges:        realm.GroupEdges,
 		StreamByRecipient: map[int64]int64{},
-		DMRecipients:      map[int64]bool{},
+		PersonalTarget:    map[int64]int64{},
+		DMGroupMembers:    map[int64][]int64{},
 	}
+	groupRecipient := map[int64]bool{}
 	for _, r := range realm.Recipients {
-		if r.Type == 2 {
+		switch r.Type {
+		case 2:
 			ex.StreamByRecipient[r.ID] = r.TypeID
-		} else {
-			ex.DMRecipients[r.ID] = true
+		case 1:
+			ex.PersonalTarget[r.ID] = r.TypeID
+		case 3:
+			groupRecipient[r.ID] = true
+		}
+	}
+	for _, sub := range realm.Subscriptions {
+		if groupRecipient[sub.Recipient] {
+			ex.DMGroupMembers[sub.Recipient] = append(ex.DMGroupMembers[sub.Recipient], sub.UserProfile)
 		}
 	}
 
@@ -208,4 +221,29 @@ func ts(f float64) time.Time {
 	sec := int64(f)
 	nsec := int64((f - float64(sec)) * 1e9)
 	return time.Unix(sec, nsec).UTC()
+}
+
+// dmParticipants resolves a non-stream message's participant set (source
+// user ids, sorted, deduped): legacy personal recipients (type 1) pair the
+// sender with the target; direct-message groups (type 3 — modern Zulip
+// routes ALL DMs here, 1:1 included) take the recipient's subscribers.
+func dmParticipants(ex *Export, m zulipMessage) ([]int64, bool) {
+	var raw []int64
+	if target, ok := ex.PersonalTarget[m.Recipient]; ok {
+		raw = []int64{m.Sender, target}
+	} else if members, ok := ex.DMGroupMembers[m.Recipient]; ok && len(members) > 0 {
+		raw = members
+	} else {
+		return nil, false
+	}
+	set := map[int64]bool{}
+	for _, id := range raw {
+		set[id] = true
+	}
+	ids := make([]int64, 0, len(set))
+	for id := range set {
+		ids = append(ids, id)
+	}
+	sort.Slice(ids, func(i, j int) bool { return ids[i] < ids[j] })
+	return ids, true
 }
