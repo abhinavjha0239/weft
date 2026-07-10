@@ -4,12 +4,14 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/content"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 )
@@ -29,6 +31,7 @@ type Report struct {
 
 	// Imported (lossless or transformed).
 	Users, Channels, Threads, Messages, Reactions, Subscriptions int            `json:"-"`
+	Groups, GroupMembers, GroupEdges, Watermarks                 int            `json:"-"`
 	ImportedCounts                                               map[string]int `json:"imported"`
 
 	// Skipped-with-reason (documented losses of this importer version).
@@ -36,19 +39,85 @@ type Report struct {
 	DMMessagesSkipped  int `json:"dm_messages_skipped"`
 	EditHistoryDropped int `json:"edit_history_dropped"`
 	ReactionsUnmapped  int `json:"reactions_unmapped"`
+	// Email-matched EXISTING accounts keep their current role — an import
+	// never elevates or demotes a live user. Counted when the source role
+	// was anything above plain member.
+	RoleGrantsSkipped int `json:"role_grants_skipped_existing_users"`
+	// The F-7 watermark marks everything up to the highest READ message as
+	// read; sparse unread gaps BELOW that point are coarsened away. Counted,
+	// never silent.
+	ReadCoarsened int `json:"unread_below_watermark_coarsened"`
 
 	// Idempotency: rows already present from a previous run.
 	AlreadyImported int `json:"already_imported"`
 
 	// Transformations applied (visible, not silent).
 	RenamedChannels map[string]string `json:"renamed_channels,omitempty"`
+	RenamedGroups   map[string]string `json:"renamed_groups,omitempty"`
+	// Zulip system role groups map onto the seeded Weft ones (never
+	// duplicated); role:fullmembers coarsens to role:members.
+	SystemGroupsMapped int `json:"system_groups_mapped"`
 }
 
 func (r *Report) finalize() {
 	r.ImportedCounts = map[string]int{
 		"users": r.Users, "channels": r.Channels, "threads": r.Threads,
 		"messages": r.Messages, "reactions": r.Reactions,
-		"subscriptions": r.Subscriptions,
+		"subscriptions": r.Subscriptions, "groups": r.Groups,
+		"group_members": r.GroupMembers, "group_edges": r.GroupEdges,
+		"read_watermarks": r.Watermarks,
+	}
+}
+
+// weftRole maps Zulip UserProfile.role constants to Weft role presets.
+func weftRole(zulipRole int) int16 {
+	switch zulipRole {
+	case 100:
+		return 10 // realm owner → owner
+	case 200:
+		return 20 // realm administrator → admin
+	case 300:
+		return 30 // moderator
+	case 600:
+		return 50 // guest
+	default:
+		return 40 // member (400 and anything unknown)
+	}
+}
+
+// roleGroup names the seeded Weft group a role preset belongs to.
+func roleGroup(role int16) string {
+	switch role {
+	case 10:
+		return "role:owners"
+	case 20:
+		return "role:admins"
+	case 30:
+		return "role:moderators"
+	case 50:
+		return "" // guests hold no role group in the seeded set
+	default:
+		return "role:members"
+	}
+}
+
+// zulipSystemGroup maps Zulip's system group names onto the seeded Weft
+// ones. role:fullmembers coarsens to role:members (Weft has no waiting
+// period); role:nobody and role:internet have no Weft counterpart.
+func zulipSystemGroup(name string) string {
+	switch name {
+	case "role:owners":
+		return "role:owners"
+	case "role:administrators":
+		return "role:admins"
+	case "role:moderators":
+		return "role:moderators"
+	case "role:members", "role:fullmembers":
+		return "role:members"
+	case "role:everyone":
+		return "role:everyone"
+	default:
+		return ""
 	}
 }
 
@@ -65,13 +134,17 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 	if err != nil {
 		return Report{}, err
 	}
-	rep := Report{DryRun: dryRun, RenamedChannels: map[string]string{}}
+	rep := Report{DryRun: dryRun,
+		RenamedChannels: map[string]string{}, RenamedGroups: map[string]string{}}
 
-	// Dry-run: pure accounting pass.
+	// Dry-run: pure accounting pass (no DB — collision renames and
+	// existing-user role skips are only knowable at write time).
 	if dryRun {
+		bots := map[int64]bool{}
 		for _, u := range ex.Users {
 			if u.IsBot {
 				rep.BotsSkipped++
+				bots[u.ID] = true
 			} else {
 				rep.Users++
 			}
@@ -92,6 +165,74 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 		rep.Threads = len(topics)
 		rep.Reactions = len(ex.Reactions)
 		rep.Subscriptions = len(ex.Subscriptions)
+		// Groups: mirror the write-path mapping (system → seeded, fullmembers
+		// coarsening → potential self-edges dropped) without touching the DB.
+		sysWeft := map[int64]string{}
+		custom := map[int64]bool{}
+		for _, g := range ex.NamedGroups {
+			if g.IsSystem {
+				if wname := zulipSystemGroup(g.Name); wname != "" {
+					sysWeft[g.ID] = wname
+					rep.SystemGroupsMapped++
+				}
+				continue
+			}
+			custom[g.ID] = true
+			rep.Groups++
+		}
+		for _, m := range ex.GroupMembers {
+			if custom[m.UserGroup] && !bots[m.UserProfile] {
+				rep.GroupMembers++
+			}
+		}
+		for _, e := range ex.GroupEdges {
+			superSys, superOK := sysWeft[e.Supergroup]
+			subSys, subOK := sysWeft[e.Subgroup]
+			mapped := (superOK || custom[e.Supergroup]) && (subOK || custom[e.Subgroup])
+			selfEdge := superOK && subOK && superSys == subSys
+			if mapped && !selfEdge {
+				rep.GroupEdges++
+			}
+		}
+		// Read watermarks: source ids are imported in order, so
+		// max-by-source-id selects the same message the write pass lands on.
+		msgTkey := map[int64]string{}
+		for _, m := range ex.Messages {
+			if sid, ok := ex.StreamByRecipient[m.Recipient]; ok {
+				msgTkey[m.ID] = fmt.Sprintf("%d\x00%s", sid, m.Subject)
+			}
+		}
+		type drk struct {
+			user int64
+			tkey string
+		}
+		dmax := map[drk]int64{}
+		for _, um := range ex.UserMessages {
+			if um.FlagsMask&umReadFlag == 0 || bots[um.UserProfile] {
+				continue
+			}
+			tk, ok := msgTkey[um.Message]
+			if !ok {
+				continue
+			}
+			k := drk{um.UserProfile, tk}
+			if um.Message > dmax[k] {
+				dmax[k] = um.Message
+			}
+		}
+		rep.Watermarks = len(dmax)
+		for _, um := range ex.UserMessages {
+			if um.FlagsMask&umReadFlag != 0 || bots[um.UserProfile] {
+				continue
+			}
+			tk, ok := msgTkey[um.Message]
+			if !ok {
+				continue
+			}
+			if wm, ok := dmax[drk{um.UserProfile, tk}]; ok && um.Message < wm {
+				rep.ReadCoarsened++
+			}
+		}
 		rep.finalize()
 		return rep, nil
 	}
@@ -150,8 +291,31 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		return err
 	}
 
+	// Seeded role/system groups, for role grants and system-group mapping.
+	groupNameToID := map[string]int64{}
+	rows, err = tx.Query(ctx,
+		`SELECT lower(name), id FROM user_group WHERE org_id = $1`, orgID)
+	if err != nil {
+		return err
+	}
+	for rows.Next() {
+		var n string
+		var id int64
+		if err := rows.Scan(&n, &id); err != nil {
+			rows.Close()
+			return err
+		}
+		groupNameToID[n] = id
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return err
+	}
+
 	// --- Users (ADR-001 D4: unmatched authors become claimable deactivated
-	// placeholders; existing emails are matched, not duplicated).
+	// placeholders; existing emails are matched, not duplicated). Source
+	// roles carry over onto CREATED accounts only — an import never changes
+	// an existing user's role.
 	userMap := map[int64]int64{}  // zulip user id → our id
 	nameMap := map[string]int64{} // full name → our id (mention re-resolution)
 	for _, u := range ex.Users {
@@ -163,19 +327,23 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			// Email matches an existing account → map, never duplicate (D4).
 			userMap[u.ID] = existing
 			nameMap[u.FullName] = existing
+			if weftRole(u.Role) != 40 {
+				rep.RoleGrantsSkipped++
+			}
 			continue
 		}
+		role := weftRole(u.Role)
 		var id int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO user_account
 				(org_id, kind, email, full_name, role, created_at,
 				 deactivated_at, origin_system, origin_id)
-			VALUES ($1, $2, $3, $4, 40, $5,
-			        CASE WHEN $6 THEN NULL ELSE now() END, $7, $8)
+			VALUES ($1, $2, $3, $4, $5, $6,
+			        CASE WHEN $7 THEN NULL ELSE now() END, $8, $9)
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, enum.UserImportedPlaceholder, u.BestEmail(), u.FullName,
+			orgID, enum.UserImportedPlaceholder, u.BestEmail(), u.FullName, role,
 			ts(u.DateJoined), u.IsActive, originZulip, fmt.Sprint(u.ID)).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run: resolve by origin
 			if err := tx.QueryRow(ctx, `
@@ -193,6 +361,17 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}
 		userMap[u.ID] = id
 		nameMap[u.FullName] = id
+		// Role-group membership so permissions resolve when the placeholder
+		// is claimed (idempotent on re-runs).
+		if gname := roleGroup(role); gname != "" {
+			if gid, ok := groupNameToID[gname]; ok {
+				if _, err := tx.Exec(ctx, `
+					INSERT INTO user_group_member (group_id, user_id)
+					VALUES ($1, $2) ON CONFLICT DO NOTHING`, gid, id); err != nil {
+					return fmt.Errorf("role group for user %d: %w", u.ID, err)
+				}
+			}
+		}
 	}
 
 	// --- Streams → channels (+ root thread). Name collisions with existing
@@ -284,6 +463,110 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}
 	}
 
+	// --- Named user groups. System role groups map onto the seeded Weft
+	// ones (never duplicated); custom groups import with provenance and
+	// visible rename on live-name collisions. Memberships of system groups
+	// are NOT copied — role fidelity flows through user_account.role above.
+	zgroupIsSystem := map[int64]bool{}
+	zgroupToWeft := map[int64]int64{} // zulip group id → weft group id
+	for _, g := range ex.NamedGroups {
+		if g.IsSystem {
+			zgroupIsSystem[g.ID] = true
+			if wname := zulipSystemGroup(g.Name); wname != "" {
+				if wid, ok := groupNameToID[wname]; ok {
+					zgroupToWeft[g.ID] = wid
+					rep.SystemGroupsMapped++
+				}
+			}
+			continue
+		}
+		// UNIQUE (org_id, name) on user_group is unconditional (unlike
+		// channels), so even deactivated groups rename on collision.
+		name := g.Name
+		for i := 0; groupNameToID[strings.ToLower(name)] != 0; i++ {
+			name = fmt.Sprintf("%s-%s%d", g.Name, originZulip, i+1)
+		}
+		if name != g.Name {
+			rep.RenamedGroups[g.Name] = name
+		}
+		created := time.Time{}
+		if g.DateCreated != nil {
+			created = ts(*g.DateCreated)
+		}
+		var id int64
+		err := tx.QueryRow(ctx, `
+			INSERT INTO user_group (org_id, name, description, is_system,
+				created_at, deactivated_at, origin_system, origin_id)
+			VALUES ($1, $2, $3, false, COALESCE($4, now()),
+			        CASE WHEN $5 THEN now() ELSE NULL END, $6, $7)
+			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
+			DO NOTHING
+			RETURNING id`,
+			orgID, name, g.Description, nullableTime(created), g.Deactivated,
+			originZulip, fmt.Sprint(g.ID)).Scan(&id)
+		if err == pgx.ErrNoRows { // re-run
+			if err := tx.QueryRow(ctx, `
+				SELECT id FROM user_group WHERE org_id = $1
+				 AND origin_system = $2 AND origin_id = $3`,
+				orgID, originZulip, fmt.Sprint(g.ID)).Scan(&id); err != nil {
+				return fmt.Errorf("resolve imported group %q: %w", g.Name, err)
+			}
+			rep.AlreadyImported++
+			zgroupToWeft[g.ID] = id
+			continue
+		} else if err != nil {
+			return fmt.Errorf("import group %q: %w", g.Name, err)
+		}
+		groupNameToID[strings.ToLower(name)] = id
+		zgroupToWeft[g.ID] = id
+		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+			OrgID: orgID, ActorKind: enum.ActorImporter,
+			EntityType: enum.EntityGroup, EntityID: id, Verb: "usergroup.created",
+			OccurredAt: created,
+			Payload:    eventlog.MustPayload(map[string]any{"group_id": id, "name": name}),
+		}); err != nil {
+			return err
+		}
+		rep.Groups++
+	}
+	for _, m := range ex.GroupMembers {
+		if zgroupIsSystem[m.UserGroup] {
+			continue // roles carried via user_account.role, never via copy
+		}
+		gid, ok1 := zgroupToWeft[m.UserGroup]
+		uid, ok2 := userMap[m.UserProfile]
+		if !ok1 || !ok2 {
+			continue
+		}
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO user_group_member (group_id, user_id)
+			VALUES ($1, $2) ON CONFLICT DO NOTHING`, gid, uid)
+		if err != nil {
+			return fmt.Errorf("group member: %w", err)
+		}
+		if ct.RowsAffected() > 0 {
+			rep.GroupMembers++
+		}
+	}
+	for _, e := range ex.GroupEdges {
+		super, ok1 := zgroupToWeft[e.Supergroup]
+		sub, ok2 := zgroupToWeft[e.Subgroup]
+		// Equal ids arise when two source groups coarsen onto one Weft group
+		// (role:fullmembers + role:members); a self-edge is meaningless.
+		if !ok1 || !ok2 || super == sub {
+			continue
+		}
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO user_group_subgroup (group_id, subgroup_id)
+			VALUES ($1, $2) ON CONFLICT DO NOTHING`, super, sub)
+		if err != nil {
+			return fmt.Errorf("group edge: %w", err)
+		}
+		if ct.RowsAffected() > 0 {
+			rep.GroupEdges++
+		}
+	}
+
 	// --- Messages: topic → titled Thread (the showcase mapping); content
 	// re-rendered through OUR engine with mentions re-resolved against the
 	// imported directory; created_at backdated (E3).
@@ -293,6 +576,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	}
 	threadMap := map[string]int64{} // "streamID\x00subject" → thread id
 	messageMap := map[int64]int64{} // zulip message id → our id
+	msgThread := map[int64]int64{}  // zulip message id → our thread id
 	for _, m := range ex.Messages {
 		streamID, ok := ex.StreamByRecipient[m.Recipient]
 		if !ok {
@@ -367,12 +651,14 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 				return fmt.Errorf("resolve imported message: %w", err)
 			}
 			messageMap[m.ID] = msgID
+			msgThread[m.ID] = thID
 			continue
 		}
 		if err != nil {
 			return fmt.Errorf("message %d: %w", m.ID, err)
 		}
 		messageMap[m.ID] = msgID
+		msgThread[m.ID] = thID
 		if _, err := tx.Exec(ctx, `
 			UPDATE thread SET message_count = message_count + 1,
 			       last_activity_at = GREATEST(last_activity_at, $2),
@@ -412,5 +698,71 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			rep.Reactions++
 		}
 	}
+
+	// --- Read watermarks from usermessage read flags (F-7). Per (user,
+	// thread), the watermark lands on the highest READ message; sparse
+	// unread gaps below it are coarsened away and counted. Deliberately not
+	// event-logged — read state stays off the durable spine (scale
+	// contract), exactly like live mark-read.
+	type rk struct{ user, thread int64 }
+	maxRead := map[rk]int64{}
+	for _, um := range ex.UserMessages {
+		if um.FlagsMask&umReadFlag == 0 {
+			continue
+		}
+		uid, ok1 := userMap[um.UserProfile]
+		mid, ok2 := messageMap[um.Message]
+		if !ok1 || !ok2 {
+			continue // flags on unimported (DM) messages carry nothing
+		}
+		k := rk{uid, msgThread[um.Message]}
+		if mid > maxRead[k] {
+			maxRead[k] = mid
+		}
+	}
+	for _, um := range ex.UserMessages {
+		if um.FlagsMask&umReadFlag != 0 {
+			continue
+		}
+		uid, ok1 := userMap[um.UserProfile]
+		mid, ok2 := messageMap[um.Message]
+		if !ok1 || !ok2 {
+			continue
+		}
+		if wm, ok := maxRead[rk{uid, msgThread[um.Message]}]; ok && mid < wm {
+			rep.ReadCoarsened++
+		}
+	}
+	for k, mid := range maxRead {
+		// Monotone like MarkRead: the guard makes re-runs true no-ops, so
+		// idempotency is visible in the count too.
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO thread_read_watermark (user_id, thread_id, last_read_message_id, updated_at)
+			VALUES ($1, $2, $3, now())
+			ON CONFLICT (user_id, thread_id) DO UPDATE
+			SET last_read_message_id = EXCLUDED.last_read_message_id, updated_at = now()
+			WHERE thread_read_watermark.last_read_message_id < EXCLUDED.last_read_message_id`,
+			k.user, k.thread, mid)
+		if err != nil {
+			return fmt.Errorf("watermark: %w", err)
+		}
+		if ct.RowsAffected() > 0 {
+			rep.Watermarks++
+		}
+	}
+
+	// Role grants and group writes above bypass the perms service, so the
+	// flattened closure is rebuilt once here (same recursive CTE the
+	// service uses).
+	if err := perms.New(s.pool).RebuildClosure(ctx, tx, orgID); err != nil {
+		return fmt.Errorf("closure rebuild: %w", err)
+	}
 	return nil
+}
+
+func nullableTime(t time.Time) *time.Time {
+	if t.IsZero() {
+		return nil
+	}
+	return &t
 }
