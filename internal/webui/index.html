@@ -271,6 +271,7 @@ const S = {
   ch: null, thread: 0, isRoot: true,
   spaces: [], space: null, items: [], statuses: [],
   dms: [], dm: null, dmUnreads: {}, online: new Set(),
+  msgsCursor: "", msgsHasMore: false, msgsLoading: false,
   view: "chan", // "chan" (channel/thread chat) | "board" | "item" | "dm"
   lastSeq: -1, ws: null, wsTries: 0,
   typingUntil: 0, typers: new Map(),
@@ -447,13 +448,56 @@ $("#crumb").onclick = ()=>{
 };
 
 async function loadMessages(){
-  const r = await api(`/threads/${S.thread}/messages?limit=100`);
+  const thread = S.thread;
+  const r = await api(`/threads/${thread}/messages?limit=100`);
+  if (S.thread !== thread) return; // view changed while fetching
+  S.msgsCursor = r.next_cursor||"";
+  S.msgsHasMore = !!S.msgsCursor;
   const msgs = (r.messages||[]).slice().reverse();
   await resolveUsers(msgs.map(m=>m.author_id));
   const el = $("#msgs"); el.innerHTML="";
-  if (!msgs.length) el.innerHTML = `<div class="sys">No messages yet — say hello 👋</div>`;
+  if (!msgs.length){
+    el.innerHTML = `<div class="sys">No messages yet — say hello 👋</div>`;
+  } else if (!S.msgsHasMore){
+    el.appendChild(beginningMarker());
+  }
   msgs.forEach(m=>el.appendChild(renderMsg(m)));
   el.scrollTop = el.scrollHeight;
+}
+
+function beginningMarker(){
+  const d = document.createElement("div");
+  d.className = "sys"; d.dataset.marker = "begin";
+  d.textContent = "— beginning of conversation —";
+  return d;
+}
+
+// Scrollback: nearing the top loads the previous page and prepends it,
+// keeping the viewport anchored on what the reader was looking at.
+async function loadOlder(){
+  if (S.msgsLoading || !S.msgsHasMore || !S.thread) return;
+  S.msgsLoading = true;
+  const el = $("#msgs");
+  const loader = document.createElement("div");
+  loader.className = "sys"; loader.textContent = "Loading earlier messages…";
+  el.insertBefore(loader, el.firstChild);
+  const thread = S.thread;
+  try {
+    const r = await api(`/threads/${thread}/messages?limit=50&before=${S.msgsCursor}`);
+    loader.remove();
+    if (S.thread !== thread) return;
+    S.msgsCursor = r.next_cursor||"";
+    S.msgsHasMore = !!S.msgsCursor;
+    const older = (r.messages||[]).slice().reverse();
+    await resolveUsers(older.map(m=>m.author_id));
+    const frag = document.createDocumentFragment();
+    if (!S.msgsHasMore) frag.appendChild(beginningMarker());
+    older.forEach(m=>frag.appendChild(renderMsg(m)));
+    const prevHeight = el.scrollHeight;
+    el.insertBefore(frag, el.firstChild);
+    el.scrollTop += el.scrollHeight - prevHeight;
+  } catch(err){ loader.remove(); toast(err.message); }
+  finally { S.msgsLoading = false; }
 }
 
 function renderMsg(m){
@@ -802,6 +846,7 @@ $("#input").addEventListener("keydown", e=>{
 });
 $("#input").addEventListener("input", updateMentionPop);
 $("#input").addEventListener("blur", ()=>setTimeout(closeMentionPop, 150));
+$("#msgs").addEventListener("scroll", ()=>{ if ($("#msgs").scrollTop < 60) loadOlder(); });
 
 /* ---------- search ---------- */
 let searchTimer = 0;
