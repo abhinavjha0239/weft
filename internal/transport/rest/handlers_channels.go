@@ -67,3 +67,29 @@ func (a *api) handleLeaveChannel(w http.ResponseWriter, r *http.Request, id auth
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
+
+// handleUpdateChannel is the lifecycle endpoint: rename (F-22 alias
+// reservation), description, archive/unarchive.
+func (a *api) handleUpdateChannel(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	channelID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad channel id")
+		return
+	}
+	type req struct {
+		Name        *string `json:"name"`
+		Description *string `json:"description"`
+		Archived    *bool   `json:"archived"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Messaging.UpdateChannel(r.Context(), id, channelID, messaging.UpdateChannelParams{
+		Name: in.Name, Description: in.Description, Archived: in.Archived,
+	}); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

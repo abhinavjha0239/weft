@@ -57,6 +57,9 @@ func (s *Service) CreateThread(ctx context.Context, actor auth.Identity, p Creat
 		if err := s.requireMember(ctx, tx, p.ChannelID, actor.UserID); err != nil {
 			return err
 		}
+		if err := s.requireLiveChannel(ctx, tx, actor.OrgID, p.ChannelID); err != nil {
+			return err
+		}
 
 		var title *string
 		if p.Title != "" {
@@ -432,6 +435,9 @@ func (s *Service) SendToThread(ctx context.Context, actor auth.Identity, threadI
 				return err
 			}
 			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+				return err
+			}
+			if err := s.requireLiveChannel(ctx, tx, actor.OrgID, *channelID); err != nil {
 				return err
 			}
 		case dmSpaceID != nil:

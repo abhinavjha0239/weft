@@ -148,3 +148,152 @@ func listChannels(t *testing.T, base, token string) map[string]messaging.Channel
 	}
 	return out
 }
+
+// TestChannelLifecycle: rename with F-22 alias reservation, archive
+// freezing writes while history stays readable, unarchive with the
+// name-collision guard, and the admin gate.
+func TestChannelLifecycle(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "lfc", "email": "a@l.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@l.test", "Bob Ray", "boblfctok")
+
+	var ops struct {
+		ChannelID    int64 `json:"channel_id"`
+		RootThreadID int64 `json:"root_thread_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "ops"}, &ops)
+	chURL := fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, ops.ChannelID)
+
+	// A plain member cannot administer.
+	if code := patchJSON(t, chURL, bobTok, map[string]any{"name": "bobs-club"}); code != http.StatusForbidden {
+		t.Fatalf("member rename = %d, want 403", code)
+	}
+
+	// Rename reserves the old name for THIS channel.
+	if code := patchJSON(t, chURL, boot.Token, map[string]any{"name": "operations"}); code != http.StatusOK {
+		t.Fatalf("rename = %d, want 200", code)
+	}
+	if code := postJSONStatus(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "ops"}); code != http.StatusConflict {
+		t.Fatalf("create on reserved name = %d, want 409", code)
+	}
+	var second struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "intruder"}, &second)
+	if code := patchJSON(t, fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, second.ChannelID),
+		boot.Token, map[string]any{"name": "ops"}); code != http.StatusConflict {
+		t.Fatalf("rename onto reserved name = %d, want 409", code)
+	}
+	// The owning channel can take its old name back; the reservation flips.
+	if code := patchJSON(t, chURL, boot.Token, map[string]any{"name": "ops"}); code != http.StatusOK {
+		t.Fatalf("self re-take = %d, want 200", code)
+	}
+	var aliasOwner int64
+	if err := pool.QueryRow(ctx, `
+		SELECT channel_id FROM channel_name_alias WHERE org_id = $1 AND name = 'operations'`,
+		boot.OrgID).Scan(&aliasOwner); err != nil || aliasOwner != ops.ChannelID {
+		t.Fatalf("operations alias owner = %d (%v), want %d", aliasOwner, err, ops.ChannelID)
+	}
+
+	// Archive: writes freeze, join blocks, history stays readable, the
+	// channel leaves the list.
+	postJSON(t, chURL+"/messages", boot.Token, map[string]any{"content": "pre-archive"}, nil)
+	if code := patchJSON(t, chURL, boot.Token, map[string]any{"archived": true}); code != http.StatusOK {
+		t.Fatalf("archive = %d, want 200", code)
+	}
+	if code := postJSONStatus(t, chURL+"/messages", boot.Token,
+		map[string]any{"content": "frozen?"}); code != http.StatusBadRequest {
+		t.Fatalf("send into archived = %d, want 400", code)
+	}
+	if code := postJSONStatus(t, chURL+"/threads", boot.Token,
+		map[string]any{"content": "frozen thread?"}); code != http.StatusBadRequest {
+		t.Fatalf("thread in archived = %d, want 400", code)
+	}
+	// Join treats archived as gone (the lookup predicate excludes them).
+	if code := postJSONStatus(t, chURL+"/join", bobTok, nil); code != http.StatusNotFound {
+		t.Fatalf("join archived = %d, want 404", code)
+	}
+	var hist struct {
+		Messages []struct {
+			Source string `json:"source"`
+		} `json:"messages"`
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, ops.RootThreadID),
+		boot.Token, &hist); code != http.StatusOK || len(hist.Messages) != 1 {
+		t.Fatalf("archived history read = %d (%d msgs), want 200 with history", code, len(hist.Messages))
+	}
+	var list struct {
+		Channels []struct {
+			ID int64 `json:"id"`
+		} `json:"channels"`
+	}
+	getJSON(t, ts.URL+"/api/v1/channels", boot.Token, &list)
+	for _, c := range list.Channels {
+		if c.ID == ops.ChannelID {
+			t.Fatal("archived channel still listed")
+		}
+	}
+
+	// While archived the name is free; a squatter blocks unarchive.
+	var squat struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "OPS"}, &squat)
+	if code := patchJSON(t, chURL, boot.Token, map[string]any{"archived": false}); code != http.StatusConflict {
+		t.Fatalf("unarchive with squatted name = %d, want 409", code)
+	}
+	if code := patchJSON(t, fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, squat.ChannelID),
+		boot.Token, map[string]any{"archived": true}); code != http.StatusOK {
+		t.Fatalf("archive squatter = %d", code)
+	}
+	if code := patchJSON(t, chURL, boot.Token, map[string]any{"archived": false}); code != http.StatusOK {
+		t.Fatalf("unarchive = %d, want 200", code)
+	}
+	if code := postJSONStatus(t, chURL+"/messages", boot.Token,
+		map[string]any{"content": "thawed"}); code != http.StatusCreated {
+		t.Fatalf("send after unarchive = %d, want 201", code)
+	}
+
+	// The lifecycle wrote its history.
+	for _, verb := range []string{"channel.renamed", "channel.archived", "channel.unarchived"} {
+		var n int
+		_ = pool.QueryRow(ctx,
+			`SELECT count(*) FROM event_log WHERE org_id = $1 AND verb = $2`,
+			boot.OrgID, verb).Scan(&n)
+		if n == 0 {
+			t.Fatalf("no %s event recorded", verb)
+		}
+	}
+}
