@@ -331,3 +331,19 @@ func MentionIDs(ast []byte) []int64 {
 	walk(doc)
 	return out
 }
+
+// Links returns every link destination in document order (message-write
+// hooks scan these for attachment references).
+func (n *Node) Links() []string {
+	var out []string
+	n.walk(func(node *Node) {
+		for _, m := range node.Marks {
+			if m.Type == MarkLink {
+				if href := attrString(m.Attrs, "href"); href != "" {
+					out = append(out, href)
+				}
+			}
+		}
+	})
+	return out
+}

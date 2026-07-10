@@ -14,6 +14,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
+	"github.com/abhinavjha0239/weft/internal/domain/files"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
@@ -34,6 +35,7 @@ type Deps struct {
 	DM        *dm.Service
 	// Notifications is optional in tests that never hit the endpoints.
 	Notifications *notification.Service
+	Files         *files.Service
 }
 
 type api struct {
@@ -93,6 +95,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/me", a.withAuth(a.handleMe))
 	mux.HandleFunc("GET /api/v1/users", a.withAuth(a.handleListUsers))
 	mux.HandleFunc("GET /api/v1/presence", a.withAuth(a.handlePresence))
+	mux.HandleFunc("POST /api/v1/files", a.withAuth(a.handleUploadFile))
+	mux.HandleFunc("GET /api/v1/files/{id}", a.withAuth(a.handleDownloadFile))
 	mux.HandleFunc("GET /api/v1/notifications", a.withAuth(a.handleListNotifications))
 	mux.HandleFunc("POST /api/v1/notifications/seen", a.withAuth(a.handleMarkNotificationsSeen))
 	mux.HandleFunc("POST /api/v1/spaces", a.withAuth(a.handleCreateSpace))

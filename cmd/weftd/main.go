@@ -17,6 +17,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/config"
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
+	"github.com/abhinavjha0239/weft/internal/domain/files"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/importer"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
@@ -24,6 +25,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/internal/platform/blob"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
 	"github.com/abhinavjha0239/weft/migrations"
@@ -115,12 +117,18 @@ func serve(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
+	store, err := blob.Open(cfg.BlobDriver, cfg.BlobDir)
+	if err != nil {
+		return err
+	}
 	hub := gateway.NewHub(pool, log)
 	go hub.Run(ctx)
 	go notification.NewRunner(pool, hub, log).Run(ctx)
 
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
+	filesSvc := files.New(pool, store)
+	msgSvc.SetFiles(filesSvc)
 	apiHandler := rest.Handler(ctx, rest.Deps{
 		Pool: pool, Hub: hub, Log: log,
 		Identity:      identity.New(pool, permsSvc),
@@ -128,6 +136,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Worktrack:     worktrack.New(pool, permsSvc, msgSvc),
 		DM:            dm.New(pool),
 		Notifications: notification.New(pool),
+		Files:         filesSvc,
 	})
 	ui, err := webui.Handler()
 	if err != nil {
