@@ -2,6 +2,7 @@ package content
 
 import (
 	"bytes"
+	"strings"
 
 	"github.com/yuin/goldmark"
 	gast "github.com/yuin/goldmark/ast"
@@ -189,7 +190,7 @@ func (c *converter) inlines(dst *Node, parent gast.Node, marks []Mark) {
 		case *gast.Image:
 			// Markdown images render as links in chat (files travel via the
 			// attachment pipeline, ADR-012).
-			alt := string(v.Text(c.src))
+			alt := inlineText(v, c.src)
 			if alt == "" {
 				alt = string(v.Destination)
 			}
@@ -321,4 +322,16 @@ var emojiMap = map[string]string{
 	"+1": "👍", "-1": "👎", "tada": "🎉", "rocket": "🚀", "fire": "🔥",
 	"eyes": "👀", "thinking": "🤔", "check": "✅", "x": "❌", "wave": "👋",
 	"clap": "👏", "pray": "🙏", "bug": "🐛", "sparkles": "✨", "warning": "⚠️",
+}
+
+// inlineText concatenates the text segments under an inline container (the
+// replacement for goldmark's deprecated Node.Text helper).
+func inlineText(n gast.Node, src []byte) string {
+	var b strings.Builder
+	for c := n.FirstChild(); c != nil; c = c.NextSibling() {
+		if t, ok := c.(*gast.Text); ok {
+			b.Write(t.Segment.Value(src))
+		}
+	}
+	return b.String()
 }
