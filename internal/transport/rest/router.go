@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/domain/automation"
 	"github.com/abhinavjha0239/weft/internal/domain/compliance"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/files"
@@ -39,6 +40,8 @@ type Deps struct {
 	Files         *files.Service
 	// Compliance is optional in tests that never hit the admin endpoints.
 	Compliance *compliance.Service
+	// Automations is optional in tests that never hit the endpoints.
+	Automations *automation.Service
 }
 
 type api struct {
@@ -118,6 +121,12 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/legal-holds", a.withAuth(a.handleCreateLegalHold))
 	mux.HandleFunc("GET /api/v1/admin/legal-holds", a.withAuth(a.handleListLegalHolds))
 	mux.HandleFunc("POST /api/v1/admin/legal-holds/{id}/release", a.withAuth(a.handleReleaseLegalHold))
+	mux.HandleFunc("POST /api/v1/automations", a.withAuth(a.handleCreateAutomation))
+	mux.HandleFunc("GET /api/v1/automations", a.withAuth(a.handleListAutomations))
+	mux.HandleFunc("PATCH /api/v1/automations/{id}", a.withAuth(a.handleUpdateAutomation))
+	mux.HandleFunc("DELETE /api/v1/automations/{id}", a.withAuth(a.handleDeleteAutomation))
+	mux.HandleFunc("POST /api/v1/automations/{id}/consent", a.withAuth(a.handleConsentAutomation))
+	mux.HandleFunc("GET /api/v1/automations/{id}/runs", a.withAuth(a.handleListAutomationRuns))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
