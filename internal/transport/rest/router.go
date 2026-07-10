@@ -88,6 +88,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/threads/{id}", a.withAuth(a.handleUpdateThread))
 	mux.HandleFunc("GET /api/v1/threads/{id}/messages", a.withAuth(a.handleListThreadMessages))
 	mux.HandleFunc("POST /api/v1/threads/{id}/read", a.withAuth(a.handleMarkRead))
+	mux.HandleFunc("PUT /api/v1/threads/{id}/subscription", a.withAuth(a.handleThreadSubscription))
+	mux.HandleFunc("PUT /api/v1/channels/{id}/notification", a.withAuth(a.handleChannelNotification))
 	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
 	mux.HandleFunc("POST /api/v1/dms", a.withAuth(a.handleOpenDM))
 	mux.HandleFunc("GET /api/v1/dms", a.withAuth(a.handleListDMs))

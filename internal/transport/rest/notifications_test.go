@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -190,4 +191,198 @@ func TestNotificationPipeline(t *testing.T) {
 	if len(in.Notifications) != 2 || !in.Notifications[0].Seen {
 		t.Fatalf("after mark-seen: %+v", in.Notifications)
 	}
+}
+
+// TestNotificationDepth: N-1 steps 2–3 — followed threads boost, level=all
+// yields activity pings, the SEPARATE mute flag suppresses both while
+// mentions break through, an unmuted thread revives activity inside a muted
+// channel, and more specific reasons win (one row per user+message).
+func TestNotificationDepth(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	runner := notification.NewRunner(pool, hub, slog.Default())
+	go runner.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:      identity.New(pool, permsSvc),
+		Messaging:     messaging.New(pool, permsSvc),
+		Notifications: notification.New(pool),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		UserID    int64  `json:"user_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "dep", "email": "a@dp.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@dp.test", "Bob Ray", "bobdeptok")
+	charlieTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"charlie@dp.test", "Charlie Kim", "charliedeptok")
+
+	chURL := fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, boot.ChannelID)
+
+	// Resolution reads CURRENT settings, so a settings change racing an
+	// unprocessed older event would mint extra (legitimate) rows on slow
+	// runners. The cursor is ordered: wait for the materializer to catch
+	// up before every settings mutation to keep expectations exact.
+	waitForConsumer := func() {
+		t.Helper()
+		deadline := time.Now().Add(8 * time.Second)
+		for {
+			var lag int
+			_ = pool.QueryRow(ctx, `
+				SELECT count(*) FROM event_log e
+				WHERE e.org_id = $1 AND e.id > COALESCE((
+				  SELECT last_id FROM event_consumer_cursor
+				  WHERE consumer = 'notifications' AND org_id = $1), 0)`,
+				boot.OrgID).Scan(&lag)
+			if lag == 0 {
+				return
+			}
+			if time.Now().After(deadline) {
+				t.Fatal("notification consumer never caught up")
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	var th struct {
+		ThreadID int64 `json:"thread_id"`
+	}
+	postJSON(t, chURL+"/threads", boot.Token,
+		map[string]any{"title": "spec", "content": "spec discussion"}, &th)
+	thURL := fmt.Sprintf("%s/api/v1/threads/%d", ts.URL, th.ThreadID)
+
+	// Bob follows the thread → an unmentioned reply pings him (kind 3).
+	waitForConsumer()
+	if code := putJSON(t, thURL+"/subscription", bobTok, map[string]any{"state": 1}); code != http.StatusOK {
+		t.Fatalf("follow = %d", code)
+	}
+	postJSON(t, thURL+"/messages", boot.Token, map[string]any{"content": "first update"}, nil)
+	in := pollInbox(t, ts.URL, bobTok, 1)
+	if in.Notifications[0].Kind != notification.KindFollowedThread {
+		t.Fatalf("bob kind = %d, want followed", in.Notifications[0].Kind)
+	}
+	pollInbox(t, ts.URL, charlieTok, 0)
+
+	waitForConsumer()
+	// Charlie opts into level=all → a root message pings him (kind 5).
+	if code := putJSON(t, chURL+"/notification", charlieTok, map[string]any{"level": 1}); code != http.StatusOK {
+		t.Fatalf("level = %d", code)
+	}
+	postJSON(t, chURL+"/messages", boot.Token, map[string]any{"content": "general chatter"}, nil)
+	in = pollInbox(t, ts.URL, charlieTok, 1)
+	if in.Notifications[0].Kind != notification.KindChannelActivity {
+		t.Fatalf("charlie kind = %d, want activity", in.Notifications[0].Kind)
+	}
+	pollInbox(t, ts.URL, bobTok, 1) // unchanged
+
+	// Bob mutes the channel (follow kept): the next reply is SUPPRESSED for
+	// him, while level=all charlie still gets activity.
+	waitForConsumer()
+	if code := putJSON(t, chURL+"/notification", bobTok, map[string]any{"muted": true}); code != http.StatusOK {
+		t.Fatalf("mute = %d", code)
+	}
+	postJSON(t, thURL+"/messages", boot.Token, map[string]any{"content": "second update"}, nil)
+	pollInbox(t, ts.URL, charlieTok, 2)
+	time.Sleep(500 * time.Millisecond)
+	pollInbox(t, ts.URL, bobTok, 1) // mute suppressed the follow
+
+	// ...but a direct mention breaks through bob's mute (kind 2), and it is
+	// the ONLY row for that message (specificity beats follow).
+	postJSON(t, thURL+"/messages", boot.Token,
+		map[string]any{"content": "breakthrough @**Bob Ray**"}, nil)
+	in = pollInbox(t, ts.URL, bobTok, 2)
+	if in.Notifications[0].Kind != notification.KindMention {
+		t.Fatalf("breakthrough kind = %d, want mention", in.Notifications[0].Kind)
+	}
+	if len(in.Notifications) != 2 {
+		t.Fatalf("bob rows = %d, want 2 (one per message)", len(in.Notifications))
+	}
+	pollInbox(t, ts.URL, charlieTok, 3) // activity continues for charlie
+
+	// Charlie mutes too → root activity stops; unmuting THE THREAD revives
+	// activity inside the muted channel (state 3).
+	waitForConsumer()
+	if code := putJSON(t, chURL+"/notification", charlieTok, map[string]any{"muted": true}); code != http.StatusOK {
+		t.Fatalf("charlie mute = %d", code)
+	}
+	postJSON(t, chURL+"/messages", boot.Token, map[string]any{"content": "into the void"}, nil)
+	time.Sleep(500 * time.Millisecond)
+	pollInbox(t, ts.URL, charlieTok, 3)
+	waitForConsumer()
+	if code := putJSON(t, thURL+"/subscription", charlieTok, map[string]any{"state": 3}); code != http.StatusOK {
+		t.Fatalf("unmute thread = %d", code)
+	}
+	postJSON(t, thURL+"/messages", boot.Token, map[string]any{"content": "revival"}, nil)
+	in = pollInbox(t, ts.URL, charlieTok, 4)
+	if in.Notifications[0].Kind != notification.KindChannelActivity {
+		t.Fatalf("revival kind = %d, want activity", in.Notifications[0].Kind)
+	}
+
+	// The root thread rejects follow state (F-15).
+	var rootID int64
+	_ = pool.QueryRow(ctx, `SELECT root_thread_id FROM channel WHERE id = $1`,
+		boot.ChannelID).Scan(&rootID)
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/subscription", ts.URL, rootID),
+		bobTok, map[string]any{"state": 1}); code != http.StatusBadRequest {
+		t.Fatalf("follow root = %d, want 400", code)
+	}
+
+	// Replay idempotency holds under STABLE settings (the materializer
+	// resolves against current preferences — a deliberate cursor reset
+	// re-evaluates history under today's settings, so the test first
+	// returns charlie to defaults).
+	waitForConsumer()
+	if code := putJSON(t, chURL+"/notification", charlieTok,
+		map[string]any{"level": 0, "muted": false}); code != http.StatusOK {
+		t.Fatalf("charlie reset = %d", code)
+	}
+	if code := putJSON(t, thURL+"/subscription", charlieTok, map[string]any{"state": 0}); code != http.StatusOK {
+		t.Fatalf("charlie clear sub = %d", code)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE event_consumer_cursor SET last_id = 0
+		WHERE consumer = 'notifications' AND org_id = $1`, boot.OrgID); err != nil {
+		t.Fatalf("reset cursor: %v", err)
+	}
+	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
+		t.Fatalf("replay: %v", err)
+	}
+	pollInbox(t, ts.URL, bobTok, 2)     // muted follow suppressed, mention deduped
+	pollInbox(t, ts.URL, charlieTok, 4) // level back to default: nothing re-qualifies
+}
+
+func putJSON(t *testing.T, url, token string, body any) int {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PUT", url, bytes.NewReader(b))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("PUT %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	return resp.StatusCode
 }

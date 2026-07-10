@@ -17,10 +17,14 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
-// Reason classes (notification.kind), in the schema comment's order.
+// Reason classes (notification.kind), in the schema comment's order
+// (dm/mention/followed/keyword/item-event); channel activity extends it.
 const (
-	KindDM      = 1
-	KindMention = 2
+	KindDM              = 1
+	KindMention         = 2
+	KindFollowedThread  = 3
+	kindKeywordReserved = 4 // alert words — a later reason
+	KindChannelActivity = 5
 )
 
 type Service struct {
