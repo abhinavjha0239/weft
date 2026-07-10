@@ -31,3 +31,31 @@ func (a *api) handleMarkNotificationsSeen(w http.ResponseWriter, r *http.Request
 	}
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
+
+// handleListNotificationPrefs / handleSetNotificationPref: the N-1 step 4
+// medium matrix (email only in v1).
+func (a *api) handleListNotificationPrefs(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	out, err := a.Notifications.ListMediumPrefs(r.Context(), id)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"prefs": out})
+}
+
+func (a *api) handleSetNotificationPref(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	type req struct {
+		Kind    int16 `json:"kind"`
+		Medium  int16 `json:"medium"`
+		Enabled bool  `json:"enabled"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Notifications.SetMediumPref(r.Context(), id, in.Kind, in.Medium, in.Enabled); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"kind": in.Kind, "medium": in.Medium, "enabled": in.Enabled})
+}
