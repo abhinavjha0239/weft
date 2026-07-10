@@ -55,8 +55,12 @@ const (
 // defaultAssignments seeds org-scope defaults at bootstrap. Deliberately
 // conservative; admins can reassign any verb to any group later.
 var defaultAssignments = map[string]string{
-	VerbSendMessage:       GroupMembers,
-	VerbCreateThread:      GroupMembers,
+	// send/thread-create seed to EVERYONE: membership still gates WHERE, so
+	// the only principals this adds are guests speaking in their own
+	// channels (Slack/Zulip parity). Admins retarget via PUT /admin/verbs
+	// (announcement-style orgs, muted guests).
+	VerbSendMessage:       GroupEveryone,
+	VerbCreateThread:      GroupEveryone,
 	VerbEditThreadTitle:   GroupMembers,
 	VerbResolveThreads:    GroupMembers,
 	VerbCreateChannel:     GroupMembers,

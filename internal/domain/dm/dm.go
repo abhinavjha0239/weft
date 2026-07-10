@@ -85,6 +85,25 @@ func (s *Service) Open(ctx context.Context, actor auth.Identity, userIDs []int64
 		if live != len(ids) {
 			return apperr.Invalid("unknown or deactivated participant")
 		}
+		// P-5: a guest may only start conversations with people who share
+		// a channel with them — the org beyond their channels is invisible.
+		if actor.IsGuest() && len(ids) > 1 {
+			var reachable int
+			if err := tx.QueryRow(ctx, `
+				SELECT count(DISTINCT them.user_id)
+				FROM channel_member me
+				JOIN channel_member them ON them.channel_id = me.channel_id
+				WHERE me.user_id = $1 AND me.unsubscribed_at IS NULL
+				  AND them.user_id = ANY($2) AND them.unsubscribed_at IS NULL`,
+				actor.UserID, ids).Scan(&reachable); err != nil {
+				return apperr.Internal("guest reach check", err)
+			}
+			// The join counts the guest too when others share their channel;
+			// require every OTHER participant reachable (self always is).
+			if reachable < len(ids) {
+				return apperr.Forbidden("guests can only message people in their channels")
+			}
+		}
 		err := tx.QueryRow(ctx, `
 			INSERT INTO dm_space (org_id, kind, dm_key) VALUES ($1, $2, $3)
 			ON CONFLICT (org_id, dm_key) DO NOTHING

@@ -182,6 +182,15 @@ func (s *Service) Me(ctx context.Context, actor auth.Identity) (MyProfile, error
 	return p, nil
 }
 
+// guestVisibleClause is the P-5 boundary on people-read surfaces: guests
+// resolve only themselves and users sharing a live channel membership.
+// $3 = viewer id, $4 = viewer-is-guest; non-guests pass everything.
+const guestVisibleClause = `(NOT $4 OR u.id = $3 OR EXISTS (
+	SELECT 1 FROM channel_member me
+	JOIN channel_member them ON them.channel_id = me.channel_id
+	WHERE me.user_id = $3 AND me.unsubscribed_at IS NULL
+	  AND them.user_id = u.id AND them.unsubscribed_at IS NULL))`
+
 const maxProfileIDs = 100
 
 // Profiles batch-resolves user ids to display data, pinned to the actor's
@@ -197,8 +206,9 @@ func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, full_name, kind, deactivated_at IS NOT NULL
-		FROM user_account WHERE org_id = $1 AND id = ANY($2)
-		ORDER BY id`, actor.OrgID, ids)
+		FROM user_account u WHERE org_id = $1 AND id = ANY($2)
+		  AND `+guestVisibleClause+`
+		ORDER BY id`, actor.OrgID, ids, actor.UserID, actor.IsGuest())
 	if err != nil {
 		return nil, apperr.Internal("profiles", err)
 	}
@@ -223,10 +233,11 @@ func (s *Service) Directory(ctx context.Context, actor auth.Identity, limit int)
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT id, full_name, kind, false
-		FROM user_account
+		FROM user_account u
 		WHERE org_id = $1 AND deactivated_at IS NULL AND kind IN (1, 2)
+		  AND `+guestVisibleClause+`
 		ORDER BY lower(full_name), id
-		LIMIT $2`, actor.OrgID, limit)
+		LIMIT $2`, actor.OrgID, limit, actor.UserID, actor.IsGuest())
 	if err != nil {
 		return nil, apperr.Internal("directory", err)
 	}
