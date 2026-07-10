@@ -2,6 +2,8 @@ module github.com/abhinavjha0239/weft
 
 go 1.25.5
 
+toolchain go1.25.12
+
 require (
 	github.com/coder/websocket v1.8.15
 	github.com/jackc/pgx/v5 v5.10.0
