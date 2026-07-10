@@ -433,6 +433,28 @@ func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor au
 	return msgID, nil
 }
 
+// PostToChannelAsAutomation posts into a channel's root thread on behalf of
+// an automation, inside the CALLER'S transaction — the runner commits the
+// run row, the message, and its event atomically. No permission gate: the
+// scope's admin authorized the rule at creation (AU-2); the org pin and the
+// live-channel check still hold. The event carries ActorAutomation + the
+// automation's id (the loop guard's signal) and the chain depth as a hint.
+func (s *Service) PostToChannelAsAutomation(ctx context.Context, tx pgx.Tx, orgID, authorID, automationID, channelID int64, depth int, source string) (int64, error) {
+	var rootThreadID int64
+	err := tx.QueryRow(ctx, `
+		SELECT root_thread_id FROM channel
+		WHERE id = $1 AND org_id = $2 AND archived_at IS NULL`,
+		channelID, orgID).Scan(&rootThreadID)
+	if err != nil {
+		return 0, apperr.NotFound("channel not found or archived")
+	}
+	hint := eventlog.MustPayload(map[string]any{"automation_depth": depth})
+	return s.insertThreadMessageAs(ctx, tx,
+		auth.Identity{UserID: authorID, OrgID: orgID},
+		enum.ActorAutomation, &automationID, hint,
+		rootThreadID, &channelID, nil, source)
+}
+
 // SendToThread posts into any thread by its governing container (F-5):
 // channel threads require send_message + membership; DM threads require
 // participation (participation IS the permission); space threads (work

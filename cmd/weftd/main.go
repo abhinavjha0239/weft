@@ -137,6 +137,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
+	go automation.NewRunner(pool, msgSvc, log).Run(ctx)
 	filesSvc := files.New(pool, store)
 	msgSvc.SetFiles(filesSvc)
 	apiHandler := rest.Handler(ctx, rest.Deps{
