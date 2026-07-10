@@ -320,7 +320,10 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 			}
 			page.Messages = append(page.Messages, m)
 		}
-		return rows.Err()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		return attachReactions(ctx, tx, actor.UserID, page.Messages)
 	})
 	if err != nil {
 		return MessagePage{}, err

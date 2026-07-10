@@ -120,12 +120,13 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 }
 
 type Message struct {
-	ID        int64  `json:"id"`
-	ChannelID int64  `json:"channel_id"`
-	ThreadID  int64  `json:"thread_id"`
-	AuthorID  int64  `json:"author_id"`
-	Source    string `json:"source"`
-	Rendered  string `json:"rendered"`
+	ID        int64         `json:"id"`
+	ChannelID int64         `json:"channel_id"`
+	ThreadID  int64         `json:"thread_id"`
+	AuthorID  int64         `json:"author_id"`
+	Source    string        `json:"source"`
+	Rendered  string        `json:"rendered"`
+	Reactions []ReactionAgg `json:"reactions,omitempty"`
 }
 
 // Get fetches one message the actor may read — the same visibility rule as
@@ -154,5 +155,9 @@ func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Me
 	if err != nil {
 		return Message{}, apperr.Internal("get message", err)
 	}
-	return m, nil
+	one := []Message{m}
+	if err := attachReactions(ctx, s.pool, actor.UserID, one); err != nil {
+		return Message{}, err
+	}
+	return one[0], nil
 }

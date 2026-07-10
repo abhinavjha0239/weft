@@ -71,6 +71,7 @@ type Step struct {
 // The event log makes chat and work-tracking one trigger vocabulary (AU-1).
 var triggerVerbs = map[string]bool{
 	"message.created":         true,
+	"reaction.added":          true,
 	"workitem.created":        true,
 	"workitem.status_changed": true,
 }
