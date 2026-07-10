@@ -22,6 +22,12 @@ type Config struct {
 	// referencing message was deleted (Zulip's 30-day vacuum delay).
 	GCUnclaimedDays int
 	GCDeadRefDays   int
+	// Outbound mail seam: "log" (default, never sends) or "smtp".
+	MailDriver string
+	SMTPAddr   string
+	SMTPFrom   string
+	SMTPUser   string
+	SMTPPass   string
 }
 
 func Load() (Config, error) {
@@ -36,6 +42,11 @@ func Load() (Config, error) {
 	}
 	c.GCUnclaimedDays = envDays("GC_UNCLAIMED_DAYS", 35)
 	c.GCDeadRefDays = envDays("GC_DEAD_REF_DAYS", 30)
+	c.MailDriver = os.Getenv(brand.EnvPrefix + "MAIL_DRIVER")
+	c.SMTPAddr = os.Getenv(brand.EnvPrefix + "SMTP_ADDR")
+	c.SMTPFrom = os.Getenv(brand.EnvPrefix + "SMTP_FROM")
+	c.SMTPUser = os.Getenv(brand.EnvPrefix + "SMTP_USER")
+	c.SMTPPass = os.Getenv(brand.EnvPrefix + "SMTP_PASS")
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("%sDATABASE_URL is required", brand.EnvPrefix)
 	}
