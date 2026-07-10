@@ -143,3 +143,65 @@ func (s *Service) Login(ctx context.Context, orgSlug, email, password string) (s
 	}
 	return token, nil
 }
+
+type Profile struct {
+	ID          int64  `json:"id"`
+	FullName    string `json:"full_name"`
+	Kind        int16  `json:"kind"`
+	Deactivated bool   `json:"deactivated,omitempty"`
+}
+
+type MyProfile struct {
+	UserID   int64  `json:"user_id"`
+	OrgID    int64  `json:"org_id"`
+	FullName string `json:"full_name"`
+	Email    string `json:"email,omitempty"`
+	Role     int16  `json:"role"`
+	Kind     int16  `json:"kind"`
+}
+
+// Me returns the actor's own profile — the client's boot identity.
+func (s *Service) Me(ctx context.Context, actor auth.Identity) (MyProfile, error) {
+	var p MyProfile
+	err := s.pool.QueryRow(ctx, `
+		SELECT id, org_id, full_name, COALESCE(email, ''), role, kind
+		FROM user_account WHERE id = $1 AND org_id = $2`,
+		actor.UserID, actor.OrgID).Scan(&p.UserID, &p.OrgID, &p.FullName,
+		&p.Email, &p.Role, &p.Kind)
+	if err != nil {
+		return MyProfile{}, apperr.Internal("me", err)
+	}
+	return p, nil
+}
+
+const maxProfileIDs = 100
+
+// Profiles batch-resolves user ids to display data, pinned to the actor's
+// org. Deactivated users are included and flagged — they authored history
+// that still renders. Unknown or foreign ids are silently absent from the
+// result, never an error.
+func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64) ([]Profile, error) {
+	if len(ids) == 0 {
+		return nil, apperr.Invalid("ids required")
+	}
+	if len(ids) > maxProfileIDs {
+		return nil, apperr.Invalid("too many ids (max 100)")
+	}
+	rows, err := s.pool.Query(ctx, `
+		SELECT id, full_name, kind, deactivated_at IS NOT NULL
+		FROM user_account WHERE org_id = $1 AND id = ANY($2)
+		ORDER BY id`, actor.OrgID, ids)
+	if err != nil {
+		return nil, apperr.Internal("profiles", err)
+	}
+	defer rows.Close()
+	var out []Profile
+	for rows.Next() {
+		var p Profile
+		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated); err != nil {
+			return nil, apperr.Internal("scan profile", err)
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}

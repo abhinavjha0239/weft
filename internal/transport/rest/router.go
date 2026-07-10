@@ -80,6 +80,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/threads/{id}/read", a.withAuth(a.handleMarkRead))
 	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
 	mux.HandleFunc("GET /api/v1/search", a.withAuth(a.handleSearch))
+	mux.HandleFunc("GET /api/v1/me", a.withAuth(a.handleMe))
+	mux.HandleFunc("GET /api/v1/users", a.withAuth(a.handleListUsers))
 	mux.HandleFunc("POST /api/v1/spaces", a.withAuth(a.handleCreateSpace))
 	mux.HandleFunc("GET /api/v1/spaces", a.withAuth(a.handleListSpaces))
 	mux.HandleFunc("POST /api/v1/spaces/{id}/items", a.withAuth(a.handleCreateItem))
