@@ -301,3 +301,33 @@ func attrString(a map[string]any, k string) string {
 	s, _ := a[k].(string)
 	return s
 }
+
+// MentionIDs extracts resolved mention user ids from a STORED ast (the
+// message row's JSONB) — used to diff mentions across an edit without
+// re-resolving names against a directory that may have changed.
+func MentionIDs(ast []byte) []int64 {
+	var doc map[string]any
+	if json.Unmarshal(ast, &doc) != nil {
+		return nil
+	}
+	var out []int64
+	var walk func(n map[string]any)
+	walk = func(n map[string]any) {
+		if n["type"] == "mention" {
+			if attrs, ok := n["attrs"].(map[string]any); ok {
+				if id, ok := attrs["user_id"].(float64); ok {
+					out = append(out, int64(id))
+				}
+			}
+		}
+		if kids, ok := n["content"].([]any); ok {
+			for _, k := range kids {
+				if m, ok := k.(map[string]any); ok {
+					walk(m)
+				}
+			}
+		}
+	}
+	walk(doc)
+	return out
+}

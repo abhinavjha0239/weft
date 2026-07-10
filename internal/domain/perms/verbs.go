@@ -14,6 +14,7 @@ const (
 	VerbEditItems         = "edit_items" // covers field edits + transitions in the v1 slice
 	VerbInviteMembers     = "invite_members"
 	VerbAdministerChannel = "administer_channel"
+	VerbModerateMessages  = "moderate_messages" // delete others' messages; never edit them
 	VerbManageOrg         = "manage_org"
 	VerbManageBilling     = "manage_billing"
 	VerbComplianceOfficer = "compliance_officer" // F-9: NOT in any preset
@@ -42,6 +43,7 @@ var defaultAssignments = map[string]string{
 	VerbEditItems:         GroupMembers,
 	VerbInviteMembers:     GroupMembers,
 	VerbAdministerChannel: GroupAdmins,
+	VerbModerateMessages:  GroupModerators,
 	VerbManageOrg:         GroupAdmins,
 	VerbManageBilling:     GroupOwners,
 	// compliance_officer is intentionally NOT seeded (F-9): content-touching

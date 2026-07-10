@@ -108,11 +108,12 @@ func (r *Runner) sweep(ctx context.Context) {
 }
 
 type messagePayload struct {
-	MessageID int64   `json:"message_id"`
-	ThreadID  int64   `json:"thread_id"`
-	ChannelID int64   `json:"channel_id"`
-	DMSpaceID int64   `json:"dm_space_id"`
-	Mentions  []int64 `json:"mentions"`
+	MessageID   int64   `json:"message_id"`
+	ThreadID    int64   `json:"thread_id"`
+	ChannelID   int64   `json:"channel_id"`
+	DMSpaceID   int64   `json:"dm_space_id"`
+	Mentions    []int64 `json:"mentions"`
+	NewMentions []int64 `json:"new_mentions"`
 }
 
 // ProcessOrg drains the org's pending events into notification rows and
@@ -142,7 +143,8 @@ func (r *Runner) ProcessOrg(ctx context.Context, orgID int64) error {
 
 func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	// Backfill semantics (ADR-003 E4): imported history never notifies.
-	if ev.Verb != "message.created" || ev.ActorKind == enum.ActorImporter {
+	if (ev.Verb != "message.created" && ev.Verb != "message.edited") ||
+		ev.ActorKind == enum.ActorImporter {
 		return nil
 	}
 	var p messagePayload
@@ -154,8 +156,14 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 		author = *ev.ActorID
 	}
 
+	// An edit pings only the NEWLY-added mentions; the dedupe key would
+	// swallow repeats anyway, but the intent belongs in the code.
+	mentionList := p.Mentions
+	if ev.Verb == "message.edited" {
+		mentionList = p.NewMentions
+	}
 	mentioned := map[int64]bool{}
-	for _, uid := range p.Mentions {
+	for _, uid := range mentionList {
 		if uid == author {
 			continue // self-mentions never notify
 		}
@@ -166,7 +174,8 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	}
 	// DM messages notify every OTHER participant; a mention in the same
 	// message wins (more specific reason), so those users are skipped.
-	if p.DMSpaceID != 0 {
+	// Edits never re-ping the conversation.
+	if p.DMSpaceID != 0 && ev.Verb == "message.created" {
 		rows, err := r.pool.Query(ctx,
 			`SELECT user_id FROM dm_participant WHERE dm_space_id = $1`, p.DMSpaceID)
 		if err != nil {
