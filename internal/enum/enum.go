@@ -33,6 +33,7 @@ const (
 	EntityLegalHold  EntityType = 12
 	EntityAutomation EntityType = 13
 	EntityExportJob  EntityType = 14
+	EntityScheduled  EntityType = 15
 )
 
 // UserKind is user_account.kind (CC-5: agent covers all non-human principals).
