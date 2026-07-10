@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -369,6 +370,16 @@ func (s *Service) requireParticipant(ctx context.Context, tx pgx.Tx, dmSpaceID, 
 // (the v1 space-visibility slice). DM events carry dm_space_id so the
 // gateway fans out to participants only.
 func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, channelID, dmSpaceID *int64, source string) (int64, error) {
+	return s.insertThreadMessageAs(ctx, tx, actor, enum.ActorHuman, &actor.UserID, nil,
+		threadID, channelID, dmSpaceID, source)
+}
+
+// insertThreadMessageAs is the one message-insert path with the event actor
+// made explicit: automations post with ActorAutomation + the automation's id
+// as the event actor (the loop guard reads it) and consumer metadata in the
+// event hint (chain depth), while the message row's author stays a real
+// user_account (the acting principal).
+func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor auth.Identity, actorKind enum.ActorKind, eventActorID *int64, hint json.RawMessage, threadID int64, channelID, dmSpaceID *int64, source string) (int64, error) {
 	doc := content.Parse(source, func(label string) (int64, bool) {
 		var uid int64
 		err := tx.QueryRow(ctx, `
@@ -413,13 +424,35 @@ func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth
 		payload["dm_space_id"] = *dmSpaceID
 	}
 	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
-		OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
+		OrgID: actor.OrgID, ActorKind: actorKind, ActorID: eventActorID,
 		EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
-		Payload: eventlog.MustPayload(payload),
+		Payload: eventlog.MustPayload(payload), Hint: hint,
 	}); err != nil {
 		return 0, apperr.Internal("append event", err)
 	}
 	return msgID, nil
+}
+
+// PostToChannelAsAutomation posts into a channel's root thread on behalf of
+// an automation, inside the CALLER'S transaction — the runner commits the
+// run row, the message, and its event atomically. No permission gate: the
+// scope's admin authorized the rule at creation (AU-2); the org pin and the
+// live-channel check still hold. The event carries ActorAutomation + the
+// automation's id (the loop guard's signal) and the chain depth as a hint.
+func (s *Service) PostToChannelAsAutomation(ctx context.Context, tx pgx.Tx, orgID, authorID, automationID, channelID int64, depth int, source string) (int64, error) {
+	var rootThreadID int64
+	err := tx.QueryRow(ctx, `
+		SELECT root_thread_id FROM channel
+		WHERE id = $1 AND org_id = $2 AND archived_at IS NULL`,
+		channelID, orgID).Scan(&rootThreadID)
+	if err != nil {
+		return 0, apperr.NotFound("channel not found or archived")
+	}
+	hint := eventlog.MustPayload(map[string]any{"automation_depth": depth})
+	return s.insertThreadMessageAs(ctx, tx,
+		auth.Identity{UserID: authorID, OrgID: orgID},
+		enum.ActorAutomation, &automationID, hint,
+		rootThreadID, &channelID, nil, source)
 }
 
 // SendToThread posts into any thread by its governing container (F-5):

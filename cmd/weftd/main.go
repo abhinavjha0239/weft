@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/brand"
 	"github.com/abhinavjha0239/weft/internal/config"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/automation"
 	"github.com/abhinavjha0239/weft/internal/domain/compliance"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/files"
@@ -136,6 +137,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
+	go automation.NewRunner(pool, msgSvc, log).Run(ctx)
 	filesSvc := files.New(pool, store)
 	msgSvc.SetFiles(filesSvc)
 	apiHandler := rest.Handler(ctx, rest.Deps{
@@ -147,6 +149,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Notifications: notification.New(pool),
 		Files:         filesSvc,
 		Compliance:    compliance.New(pool, permsSvc),
+		Automations:   automation.New(pool, permsSvc),
 	})
 	ui, err := webui.Handler()
 	if err != nil {
