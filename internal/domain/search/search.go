@@ -79,10 +79,15 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	}
 	sb.WriteString("WHERE m.org_id = " + orgP + " AND m.deleted_at IS NULL ")
 	// Read ACL (matches messaging.Get/ListMessages): membership for channel
-	// messages; channel-less space-thread messages are org-visible.
-	sb.WriteString("AND (m.channel_id IS NULL OR EXISTS (" +
+	// messages, participation for DM messages, org-visible only for
+	// space-thread messages (neither container).
+	sb.WriteString("AND ((m.channel_id IS NOT NULL AND EXISTS (" +
 		"SELECT 1 FROM channel_member cm WHERE cm.channel_id = m.channel_id " +
-		"AND cm.user_id = " + actorP + " AND cm.unsubscribed_at IS NULL)) ")
+		"AND cm.user_id = " + actorP + " AND cm.unsubscribed_at IS NULL)) " +
+		"OR (m.dm_space_id IS NOT NULL AND EXISTS (" +
+		"SELECT 1 FROM dm_participant dp WHERE dp.dm_space_id = m.dm_space_id " +
+		"AND dp.user_id = " + actorP + ")) " +
+		"OR (m.channel_id IS NULL AND m.dm_space_id IS NULL)) ")
 	if hasText {
 		sb.WriteString("AND m.search_tsv @@ qq ")
 	}

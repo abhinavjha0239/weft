@@ -83,7 +83,7 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 
 		// Shared write path: AST parse (in-tx mention resolution), insert,
 		// message.created event with mention ids (F-4: ids, never content).
-		msgID, err = s.InsertThreadMessage(ctx, tx, actor, threadID, &p.ChannelID, p.Content)
+		msgID, err = s.InsertThreadMessage(ctx, tx, actor, threadID, &p.ChannelID, nil, p.Content)
 		if err != nil {
 			return err
 		}
@@ -114,18 +114,23 @@ type Message struct {
 }
 
 // Get fetches one message the actor may read — the same visibility rule as
-// ListMessages: channel messages require membership of the governing channel;
-// space-thread messages (no channel) are org-visible in the v1 slice.
+// ListMessages: channel messages require membership of the governing
+// channel; DM messages require participation; space-thread messages
+// (neither container) are org-visible in the v1 slice.
 func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Message, error) {
 	var m Message
 	err := s.pool.QueryRow(ctx, `
 		SELECT m.id, COALESCE(m.channel_id, 0), m.thread_id, m.author_id, m.source, m.rendered
 		FROM message m
 		WHERE m.id = $1 AND m.org_id = $3 AND m.deleted_at IS NULL
-		  AND (m.channel_id IS NULL OR EXISTS (
-		      SELECT 1 FROM channel_member cm
-		      WHERE cm.channel_id = m.channel_id AND cm.user_id = $2
-		        AND cm.unsubscribed_at IS NULL))`,
+		  AND ((m.channel_id IS NOT NULL AND EXISTS (
+		         SELECT 1 FROM channel_member cm
+		         WHERE cm.channel_id = m.channel_id AND cm.user_id = $2
+		           AND cm.unsubscribed_at IS NULL))
+		    OR (m.dm_space_id IS NOT NULL AND EXISTS (
+		         SELECT 1 FROM dm_participant dp
+		         WHERE dp.dm_space_id = m.dm_space_id AND dp.user_id = $2))
+		    OR (m.channel_id IS NULL AND m.dm_space_id IS NULL))`,
 		msgID, actor.UserID, actor.OrgID).Scan(&m.ID, &m.ChannelID, &m.ThreadID,
 		&m.AuthorID, &m.Source, &m.Rendered)
 	if errors.Is(err, pgx.ErrNoRows) {
