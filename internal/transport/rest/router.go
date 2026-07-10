@@ -121,6 +121,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/files/{id}", a.withAuth(a.handleDownloadFile))
 	mux.HandleFunc("GET /api/v1/notifications", a.withAuth(a.handleListNotifications))
 	mux.HandleFunc("POST /api/v1/notifications/seen", a.withAuth(a.handleMarkNotificationsSeen))
+	mux.HandleFunc("GET /api/v1/notification-prefs", a.withAuth(a.handleListNotificationPrefs))
+	mux.HandleFunc("PUT /api/v1/notification-prefs", a.withAuth(a.handleSetNotificationPref))
 	mux.HandleFunc("POST /api/v1/spaces", a.withAuth(a.handleCreateSpace))
 	mux.HandleFunc("GET /api/v1/spaces", a.withAuth(a.handleListSpaces))
 	mux.HandleFunc("POST /api/v1/spaces/{id}/items", a.withAuth(a.handleCreateItem))

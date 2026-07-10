@@ -28,6 +28,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
+	"github.com/abhinavjha0239/weft/internal/platform/mail"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
 	"github.com/abhinavjha0239/weft/migrations"
@@ -130,6 +131,12 @@ func serve(ctx context.Context, cfg config.Config) error {
 	hub := gateway.NewHub(pool, log)
 	go hub.Run(ctx)
 	go notification.NewRunner(pool, hub, log).Run(ctx)
+	sender, err := mail.Open(cfg.MailDriver, cfg.SMTPAddr, cfg.SMTPFrom,
+		cfg.SMTPUser, cfg.SMTPPass, log)
+	if err != nil {
+		return err
+	}
+	go notification.NewEmailWorker(pool, sender, log).Run(ctx)
 	janitor := compliance.NewJanitor(pool, store, log)
 	janitor.UnclaimedGrace = time.Duration(cfg.GCUnclaimedDays) * 24 * time.Hour
 	janitor.DeadRefWindow = time.Duration(cfg.GCDeadRefDays) * 24 * time.Hour
