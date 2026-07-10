@@ -92,12 +92,16 @@ func importZulip(ctx context.Context, cfg config.Config) error {
 	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
 		return err
 	}
+	store, err := blob.Open(cfg.BlobDriver, cfg.BlobDir)
+	if err != nil {
+		return err
+	}
 	var orgID int64
 	if err := pool.QueryRow(ctx,
 		`SELECT id FROM org WHERE slug = $1`, *orgSlug).Scan(&orgID); err != nil {
 		return fmt.Errorf("org %q not found: %w", *orgSlug, err)
 	}
-	rep, err := importer.New(pool).Run(ctx, orgID, *dir, *dryRun)
+	rep, err := importer.New(pool, store).Run(ctx, orgID, *dir, *dryRun)
 	if err != nil {
 		return err
 	}

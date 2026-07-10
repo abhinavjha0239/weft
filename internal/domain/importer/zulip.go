@@ -30,6 +30,8 @@ type zulipRealmFile struct {
 	NamedGroups   []zulipNamedGroup   `json:"zerver_namedusergroup"`
 	GroupMembers  []zulipGroupMember  `json:"zerver_usergroupmembership"`
 	GroupEdges    []zulipGroupEdge    `json:"zerver_groupgroupmembership"`
+	Attachments   []zulipAttachment   `json:"zerver_attachment"`
+	AttachmentMsg []zulipAttachMsg    `json:"zerver_attachment_messages"`
 }
 
 type zulipUser struct {
@@ -108,6 +110,45 @@ type zulipUserMessage struct {
 
 const umReadFlag = 1
 
+// zulipAttachment mirrors zerver_attachment; the bytes live in the export's
+// uploads/<path_id> tree, and message content links them as
+// /user_uploads/<path_id>.
+type zulipAttachment struct {
+	ID          int64   `json:"id"`
+	FileName    string  `json:"file_name"`
+	PathID      string  `json:"path_id"`
+	Owner       int64   `json:"owner"`
+	Size        int64   `json:"size"`
+	ContentType *string `json:"content_type"`
+	CreateTime  float64 `json:"create_time"`
+}
+
+type zulipAttachMsg struct {
+	Attachment int64 `json:"attachment"`
+	Message    int64 `json:"message"`
+}
+
+// editEntry is one EditHistoryEvent (zerver/lib/types.py): only content
+// edits carry prev_content; user_id is null for pre-2017 history.
+type editEntry struct {
+	UserID      *int64  `json:"user_id"`
+	Timestamp   float64 `json:"timestamp"`
+	PrevContent *string `json:"prev_content"`
+}
+
+// parseEditHistory decodes a message's edit_history JSON, oldest first.
+func parseEditHistory(raw *string) []editEntry {
+	if raw == nil || *raw == "" || *raw == "null" {
+		return nil
+	}
+	var entries []editEntry
+	if json.Unmarshal([]byte(*raw), &entries) != nil {
+		return nil
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Timestamp < entries[j].Timestamp })
+	return entries
+}
+
 type zulipMessageFile struct {
 	Messages     []zulipMessage     `json:"zerver_message"`
 	Reactions    []zulipReaction    `json:"zerver_reaction"`
@@ -133,12 +174,15 @@ type zulipReaction struct {
 
 // Export is the parsed source, pre-indexed for the writer.
 type Export struct {
+	Dir           string // the unpacked export root (uploads/ lives here)
 	Users         []zulipUser
 	Streams       []zulipStream
 	Subscriptions []zulipSubscription
 	NamedGroups   []zulipNamedGroup
 	GroupMembers  []zulipGroupMember
 	GroupEdges    []zulipGroupEdge
+	Attachments   []zulipAttachment
+	AttachmentMsg []zulipAttachMsg
 	Messages      []zulipMessage
 	Reactions     []zulipReaction
 	UserMessages  []zulipUserMessage
@@ -160,12 +204,15 @@ func LoadZulipExport(dir string) (*Export, error) {
 		return nil, fmt.Errorf("importer: realm.json: %w", err)
 	}
 	ex := &Export{
+		Dir:               dir,
 		Users:             realm.Users,
 		Streams:           realm.Streams,
 		Subscriptions:     realm.Subscriptions,
 		NamedGroups:       realm.NamedGroups,
 		GroupMembers:      realm.GroupMembers,
 		GroupEdges:        realm.GroupEdges,
+		Attachments:       realm.Attachments,
+		AttachmentMsg:     realm.AttachmentMsg,
 		StreamByRecipient: map[int64]int64{},
 		PersonalTarget:    map[int64]int64{},
 		DMGroupMembers:    map[int64][]int64{},

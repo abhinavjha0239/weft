@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/platform/blob"
 	"github.com/abhinavjha0239/weft/migrations"
 )
 
@@ -70,14 +72,20 @@ const fixtureRealm = `{
   "zerver_groupgroupmembership": [
     {"id": 71, "supergroup": 52, "subgroup": 55},
     {"id": 72, "supergroup": 52, "subgroup": 53}
+  ],
+  "zerver_attachment": [
+    {"id": 401, "file_name": "test.txt", "path_id": "2/ab/test.txt", "owner": 11, "size": 15, "content_type": "text/plain", "create_time": 1554000000}
+  ],
+  "zerver_attachment_messages": [
+    {"id": 501, "attachment": 401, "message": 101}
   ]
 }`
 
 const fixtureMessages = `{
   "zerver_message": [
-    {"id": 101, "sender": 11, "recipient": 31, "subject": "launch plan", "content": "kickoff for **v1**", "date_sent": 1554100000, "edit_history": null},
+    {"id": 101, "sender": 11, "recipient": 31, "subject": "launch plan", "content": "kickoff for **v1** [notes](/user_uploads/2/ab/test.txt)", "date_sent": 1554100000, "edit_history": null},
     {"id": 102, "sender": 12, "recipient": 31, "subject": "launch plan", "content": "ack @**Iago** :rocket:", "date_sent": 1554100600, "edit_history": null},
-    {"id": 103, "sender": 12, "recipient": 31, "subject": "random", "content": "edited once", "date_sent": 1554200000, "edit_history": "[{\"prev_content\":\"original\"}]"},
+    {"id": 103, "sender": 12, "recipient": 31, "subject": "random", "content": "edited once", "date_sent": 1554200000, "edit_history": "[{\"prev_content\":\"original\",\"user_id\":12,\"timestamp\":1554210000},{\"prev_content\":\"most original\",\"timestamp\":1554205000}]"},
     {"id": 104, "sender": 11, "recipient": 32, "subject": "secrets", "content": "private planning", "date_sent": 1554300000, "edit_history": null},
     {"id": 105, "sender": 11, "recipient": 33, "subject": "", "content": "a note to self", "date_sent": 1554400000, "edit_history": null},
     {"id": 106, "sender": 12, "recipient": 34, "subject": "", "content": "huddle with the bot — must be skipped whole", "date_sent": 1554500000, "edit_history": null},
@@ -104,6 +112,13 @@ func writeFixture(t *testing.T) string {
 		t.Fatal(err)
 	}
 	if err := os.WriteFile(filepath.Join(dir, "messages-000001.json"), []byte(fixtureMessages), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(dir, "uploads", "2", "ab"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "uploads", "2", "ab", "test.txt"),
+		[]byte("the roadmap doc"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	return dir
@@ -144,7 +159,11 @@ func TestZulipImportShowcase(t *testing.T) {
 	pool, orgID := testPool(t)
 	ctx := context.Background()
 	dir := writeFixture(t)
-	svc := New(pool)
+	store, err := blob.Open("fs", t.TempDir())
+	if err != nil {
+		t.Fatalf("blob: %v", err)
+	}
+	svc := New(pool, store)
 
 	// Dry run first: full accounting, zero writes.
 	dry, err := svc.Run(ctx, orgID, dir, true)
@@ -152,9 +171,14 @@ func TestZulipImportShowcase(t *testing.T) {
 		t.Fatalf("dry run: %v", err)
 	}
 	if dry.Users != 2 || dry.BotsSkipped != 1 || dry.Channels != 2 ||
-		dry.Threads != 3 || dry.Messages != 4 ||
-		dry.EditHistoryDropped != 1 || dry.Reactions != 1 {
+		dry.Threads != 3 || dry.Messages != 4 || dry.Reactions != 1 {
 		t.Fatalf("dry-run report off: %+v", dry)
+	}
+	// Edits: hamlet's attributed entry imports; the null-editor entry is a
+	// counted skip. The attachment's bytes are present on disk.
+	if dry.MessageEdits != 1 || dry.EditEntriesSkipped != 1 ||
+		dry.Attachments != 1 || dry.AttachmentFilesMissing != 0 {
+		t.Fatalf("dry-run edit/attachment accounting off: %+v", dry)
 	}
 	// DMs: the self-DM and the 1:1 import (2 conversations, 2 messages);
 	// the bot-tainted huddle is skipped WHOLE — dropping the bot would
@@ -383,6 +407,64 @@ func TestZulipImportShowcase(t *testing.T) {
 		t.Fatalf("hamlet watermark = %d, want %d (weft id of zulip 102)", hamletWM, weft102)
 	}
 
+	// Attachment lane: file row with provenance, blob readable through the
+	// store, message content rewritten to the managed URL, reference + flag.
+	if rep.Attachments != 1 || rep.AttachmentFilesMissing != 0 {
+		t.Fatalf("attachment report off: %+v", rep)
+	}
+	var fileID int64
+	var storageKey string
+	if err := pool.QueryRow(ctx, `
+		SELECT id, storage_key FROM file
+		WHERE org_id = $1 AND origin_system = 'zulip' AND origin_id = '401'`,
+		orgID).Scan(&fileID, &storageKey); err != nil {
+		t.Fatalf("imported file: %v", err)
+	}
+	rc, err := store.Open(ctx, storageKey)
+	if err != nil {
+		t.Fatalf("blob open: %v", err)
+	}
+	blobBytes, _ := io.ReadAll(rc)
+	rc.Close()
+	if string(blobBytes) != "the roadmap doc" {
+		t.Fatalf("blob content = %q", blobBytes)
+	}
+	var src101 string
+	var attach101 bool
+	_ = pool.QueryRow(ctx, `
+		SELECT source, has_attachment FROM message
+		WHERE org_id = $1 AND origin_system = 'zulip' AND origin_id = '101'`,
+		orgID).Scan(&src101, &attach101)
+	if !strings.Contains(src101, fmt.Sprintf("/api/v1/files/%d", fileID)) || !attach101 {
+		t.Fatalf("rewrite/flag wrong: attach=%v src=%q", attach101, src101)
+	}
+	var refCount int
+	_ = pool.QueryRow(ctx,
+		`SELECT count(*) FROM file_reference WHERE file_id = $1`, fileID).Scan(&refCount)
+	if refCount != 1 {
+		t.Fatalf("file references = %d, want 1", refCount)
+	}
+
+	// Edit-history lane: one attributed kind-1 revision on message 103 with
+	// backdated edited_at; the null-editor entry was skipped.
+	if rep.MessageEdits != 1 || rep.EditEntriesSkipped != 1 {
+		t.Fatalf("edit report off: %+v", rep)
+	}
+	var prevSrc string
+	var editedBy int64
+	var editedAt, msgEditedAt time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT r.prev_source, r.edited_by, r.edited_at, m.edited_at
+		FROM message m JOIN message_revision r ON r.message_id = m.id AND r.kind = 1
+		WHERE m.org_id = $1 AND m.origin_system = 'zulip' AND m.origin_id = '103'`,
+		orgID).Scan(&prevSrc, &editedBy, &editedAt, &msgEditedAt); err != nil {
+		t.Fatalf("imported revision: %v", err)
+	}
+	if prevSrc != "original" || editedBy != hamletID ||
+		editedAt.Year() != 2019 || msgEditedAt.Year() != 2019 {
+		t.Fatalf("revision wrong: prev=%q by=%d at=%v msg=%v", prevSrc, editedBy, editedAt, msgEditedAt)
+	}
+
 	// Idempotency (D5): a re-run imports nothing new and duplicates nothing.
 	rep2, err := svc.Run(ctx, orgID, dir, false)
 	if err != nil {
@@ -391,7 +473,8 @@ func TestZulipImportShowcase(t *testing.T) {
 	if rep2.Messages != 0 || rep2.Users != 0 || rep2.Channels != 0 ||
 		rep2.Threads != 0 || rep2.Groups != 0 || rep2.GroupMembers != 0 ||
 		rep2.GroupEdges != 0 || rep2.Watermarks != 0 ||
-		rep2.DMConversations != 0 || rep2.DMMessages != 0 {
+		rep2.DMConversations != 0 || rep2.DMMessages != 0 ||
+		rep2.Attachments != 0 || rep2.MessageEdits != 0 {
 		t.Fatalf("re-run imported new rows: %+v", rep2)
 	}
 	if rep2.AlreadyImported == 0 {

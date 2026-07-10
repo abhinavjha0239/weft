@@ -2,7 +2,12 @@ package importer
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
+	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -12,18 +17,25 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/content"
+	"github.com/abhinavjha0239/weft/internal/domain/files"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
+	"github.com/abhinavjha0239/weft/internal/platform/blob"
 )
 
 const originZulip = "zulip"
 
 type Service struct {
-	pool *pgxpool.Pool
+	pool  *pgxpool.Pool
+	store blob.Store
 }
 
-func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+// New takes the blob seam for the attachments lane — the importer derives
+// keys through files.StorageKey so backfilled blobs dedup with live uploads.
+func New(pool *pgxpool.Pool, store blob.Store) *Service {
+	return &Service{pool: pool, store: store}
+}
 
 // Report is the fidelity contract (ADR-001: "nobody trusts a migrator that
 // hides its losses"). Every source entity lands in exactly one bucket.
@@ -33,7 +45,7 @@ type Report struct {
 	// Imported (lossless or transformed).
 	Users, Channels, Threads, Messages, Reactions, Subscriptions int            `json:"-"`
 	Groups, GroupMembers, GroupEdges, Watermarks                 int            `json:"-"`
-	DMConversations, DMMessages                                  int            `json:"-"`
+	DMConversations, DMMessages, Attachments, MessageEdits       int            `json:"-"`
 	ImportedCounts                                               map[string]int `json:"imported"`
 
 	// Skipped-with-reason (documented losses of this importer version).
@@ -43,8 +55,15 @@ type Report struct {
 	// and wrongly merge the history into a different conversation.
 	DMMessagesSkipped     int `json:"dm_messages_skipped_unmappable_participants"`
 	StreamMessagesSkipped int `json:"stream_messages_skipped_unmapped"`
-	EditHistoryDropped    int `json:"edit_history_dropped"`
-	ReactionsUnmapped     int `json:"reactions_unmapped"`
+	// Edit-history entries without a mappable editor (bots, or the null
+	// user_id of pre-2017 Zulip history) are skipped — attribution is
+	// never invented. Topic/stream-move entries carry no prev_content and
+	// are not message revisions.
+	EditEntriesSkipped int `json:"edit_entries_skipped_unattributable"`
+	// Attachment rows whose bytes are absent from the export's uploads/
+	// tree (truncated exports).
+	AttachmentFilesMissing int `json:"attachment_files_missing"`
+	ReactionsUnmapped      int `json:"reactions_unmapped"`
 	// Email-matched EXISTING accounts keep their current role — an import
 	// never elevates or demotes a live user. Counted when the source role
 	// was anything above plain member.
@@ -73,6 +92,7 @@ func (r *Report) finalize() {
 		"group_members": r.GroupMembers, "group_edges": r.GroupEdges,
 		"read_watermarks":  r.Watermarks,
 		"dm_conversations": r.DMConversations, "dm_messages": r.DMMessages,
+		"attachments": r.Attachments, "message_edits": r.MessageEdits,
 	}
 }
 
@@ -195,20 +215,45 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 					rep.DMConversations++
 				}
 				rep.DMMessages++
-				if m.EditHistory != nil && *m.EditHistory != "" && *m.EditHistory != "null" {
-					rep.EditHistoryDropped++
+				for _, e := range parseEditHistory(m.EditHistory) {
+					if e.PrevContent == nil {
+						continue
+					}
+					if e.UserID == nil || !humans[*e.UserID] {
+						rep.EditEntriesSkipped++
+					} else {
+						rep.MessageEdits++
+					}
 				}
 				continue
 			}
 			rep.Messages++
-			if m.EditHistory != nil && *m.EditHistory != "" && *m.EditHistory != "null" {
-				rep.EditHistoryDropped++
+			for _, e := range parseEditHistory(m.EditHistory) {
+				if e.PrevContent == nil {
+					continue
+				}
+				if e.UserID == nil || !humans[*e.UserID] {
+					rep.EditEntriesSkipped++
+				} else {
+					rep.MessageEdits++
+				}
 			}
 			topics[fmt.Sprintf("%d\x00%s", ex.StreamByRecipient[m.Recipient], m.Subject)] = true
 		}
 		rep.Threads = len(topics)
 		rep.Reactions = len(ex.Reactions)
 		rep.Subscriptions = len(ex.Subscriptions)
+		for _, a := range ex.Attachments {
+			if a.PathID == "" || strings.Contains(a.PathID, "..") {
+				rep.AttachmentFilesMissing++
+				continue
+			}
+			if _, err := os.Stat(filepath.Join(ex.Dir, "uploads", a.PathID)); err != nil {
+				rep.AttachmentFilesMissing++
+			} else {
+				rep.Attachments++
+			}
+		}
 		// Groups: mirror the write-path mapping (system → seeded, fullmembers
 		// coarsening → potential self-edges dropped) without touching the DB.
 		sysWeft := map[int64]string{}
@@ -623,12 +668,17 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	threadMap := map[string]int64{} // "streamID\x00subject" → thread id
 	messageMap := map[int64]int64{} // zulip message id → our id
 	msgThread := map[int64]int64{}  // zulip message id → our thread id
-	dmCache := map[string]dmInfo{}  // canonical weft key → conversation
+	pathToFile, fileByAttach, err := s.importAttachments(ctx, tx, orgID, ex, userMap, rep)
+	if err != nil {
+		return err
+	}
+
+	dmCache := map[string]dmInfo{} // canonical weft key → conversation
 	for _, m := range ex.Messages {
 		streamID, ok := ex.StreamByRecipient[m.Recipient]
 		if !ok {
 			if err := s.importDMMessage(ctx, tx, orgID, ex, m, userMap,
-				nameMap, dmCache, messageMap, msgThread, rep); err != nil {
+				nameMap, dmCache, pathToFile, messageMap, msgThread, rep); err != nil {
 				return err
 			}
 			continue
@@ -676,21 +726,19 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			threadMap[tkey] = thID
 		}
 
-		if m.EditHistory != nil && *m.EditHistory != "" && *m.EditHistory != "null" {
-			rep.EditHistoryDropped++
-		}
-		doc := content.Parse(m.Content, resolve)
+		src, hasAttach := rewriteUploads(m.Content, pathToFile)
+		doc := content.Parse(src, resolve)
 		var msgID int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO message (org_id, thread_id, channel_id, author_id,
-				source, ast, rendered, render_version, has_link, created_at,
-				origin_system, origin_id)
-			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+				source, ast, rendered, render_version, has_link, has_attachment,
+				created_at, origin_system, origin_id)
+			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, thID, chID, authorID, m.Content, doc.JSON(),
-			content.RenderHTML(doc), content.RenderVersion, doc.HasLink(),
+			orgID, thID, chID, authorID, src, doc.JSON(),
+			content.RenderHTML(doc), content.RenderVersion, doc.HasLink(), hasAttach,
 			ts(m.DateSent), originZulip, fmt.Sprint(m.ID)).Scan(&msgID)
 		if err == pgx.ErrNoRows {
 			rep.AlreadyImported++
@@ -726,6 +774,9 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}); err != nil {
 			return err
 		}
+		if err := s.importEditHistory(ctx, tx, msgID, m, userMap, resolve, rep); err != nil {
+			return err
+		}
 		rep.Messages++
 	}
 
@@ -746,6 +797,27 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}
 		if ct.RowsAffected() > 0 {
 			rep.Reactions++
+		}
+	}
+
+	// --- Attachment references (the export's m2m is authoritative): each
+	// mapped (attachment, message) pair becomes a file_reference, and the
+	// message is flagged even when its content carried no inline link.
+	for _, am := range ex.AttachmentMsg {
+		fid, ok1 := fileByAttach[am.Attachment]
+		mid, ok2 := messageMap[am.Message]
+		if !ok1 || !ok2 {
+			continue
+		}
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO file_reference (file_id, entity_type, entity_id)
+			VALUES ($1, $2, $3) ON CONFLICT DO NOTHING`,
+			fid, int16(enum.EntityMessage), mid); err != nil {
+			return fmt.Errorf("attachment reference: %w", err)
+		}
+		if _, err := tx.Exec(ctx,
+			`UPDATE message SET has_attachment = true WHERE id = $1`, mid); err != nil {
+			return err
 		}
 	}
 
@@ -828,7 +900,7 @@ type dmInfo struct{ spaceID, threadID int64 }
 // different conversation.
 func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 	ex *Export, m zulipMessage, userMap map[int64]int64,
-	nameMap map[string]int64, dmCache map[string]dmInfo,
+	nameMap map[string]int64, dmCache map[string]dmInfo, pathToFile map[string]int64,
 	messageMap, msgThread map[int64]int64, rep *Report) error {
 
 	zulipIDs, ok := dmParticipants(ex, m)
@@ -914,24 +986,23 @@ func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 		dmCache[key] = info
 	}
 
-	if m.EditHistory != nil && *m.EditHistory != "" && *m.EditHistory != "null" {
-		rep.EditHistoryDropped++
-	}
-	doc := content.Parse(m.Content, func(label string) (int64, bool) {
+	src, hasAttach := rewriteUploads(m.Content, pathToFile)
+	resolve := func(label string) (int64, bool) {
 		id, ok := nameMap[label]
 		return id, ok
-	})
+	}
+	doc := content.Parse(src, resolve)
 	var msgID int64
 	err := tx.QueryRow(ctx, `
 		INSERT INTO message (org_id, thread_id, dm_space_id, author_id,
-			source, ast, rendered, render_version, has_link, created_at,
-			origin_system, origin_id)
-		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+			source, ast, rendered, render_version, has_link, has_attachment,
+			created_at, origin_system, origin_id)
+		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
 		ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 		DO NOTHING
 		RETURNING id`,
-		orgID, info.threadID, info.spaceID, authorID, m.Content, doc.JSON(),
-		content.RenderHTML(doc), content.RenderVersion, doc.HasLink(),
+		orgID, info.threadID, info.spaceID, authorID, src, doc.JSON(),
+		content.RenderHTML(doc), content.RenderVersion, doc.HasLink(), hasAttach,
 		ts(m.DateSent), originZulip, fmt.Sprint(m.ID)).Scan(&msgID)
 	if err == pgx.ErrNoRows {
 		rep.AlreadyImported++
@@ -960,6 +1031,161 @@ func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 	}); err != nil {
 		return err
 	}
+	if err := s.importEditHistory(ctx, tx, msgID, m, userMap, resolve, rep); err != nil {
+		return err
+	}
 	rep.DMMessages++
+	return nil
+}
+
+// importAttachments stores every attachment blob (content-addressed through
+// files.StorageKey, so backfilled bytes dedup with live uploads) and records
+// provenance-idempotent file rows. Returns path_id→file id (for content
+// link rewriting) and attachment id→file id (for the m2m references).
+func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export, userMap map[int64]int64, rep *Report) (map[string]int64, map[int64]int64, error) {
+	pathToFile := map[string]int64{}
+	fileByAttach := map[int64]int64{}
+	for _, a := range ex.Attachments {
+		if a.PathID == "" || strings.Contains(a.PathID, "..") {
+			rep.AttachmentFilesMissing++
+			continue
+		}
+		full := filepath.Join(ex.Dir, "uploads", a.PathID)
+		f, err := os.Open(full)
+		if err != nil {
+			rep.AttachmentFilesMissing++
+			continue
+		}
+		h := sha256.New()
+		size, err := io.Copy(h, f)
+		if err != nil {
+			f.Close()
+			return nil, nil, fmt.Errorf("hash attachment %d: %w", a.ID, err)
+		}
+		if _, err := f.Seek(0, io.SeekStart); err != nil {
+			f.Close()
+			return nil, nil, err
+		}
+		sum := h.Sum(nil)
+		key := files.StorageKey(orgID, hex.EncodeToString(sum))
+		// Put is idempotent (content-addressed): a crash between blob write
+		// and commit just re-puts on the retry.
+		err = s.store.Put(ctx, key, f)
+		f.Close()
+		if err != nil {
+			return nil, nil, fmt.Errorf("store attachment %d: %w", a.ID, err)
+		}
+		mime := "application/octet-stream"
+		if a.ContentType != nil && *a.ContentType != "" {
+			mime = *a.ContentType
+		}
+		var owner *int64
+		if uid, ok := userMap[a.Owner]; ok {
+			owner = &uid
+		}
+		var id int64
+		err = tx.QueryRow(ctx, `
+			INSERT INTO file (org_id, kind, name, mime, size_bytes, sha256,
+				storage_key, uploader_id, created_at, origin_system, origin_id)
+			VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
+			DO NOTHING
+			RETURNING id`,
+			orgID, a.FileName, mime, size, sum, key, owner,
+			ts(a.CreateTime), originZulip, fmt.Sprint(a.ID)).Scan(&id)
+		if err == pgx.ErrNoRows { // re-run
+			if err := tx.QueryRow(ctx, `
+				SELECT id FROM file WHERE org_id = $1
+				 AND origin_system = $2 AND origin_id = $3`,
+				orgID, originZulip, fmt.Sprint(a.ID)).Scan(&id); err != nil {
+				return nil, nil, fmt.Errorf("resolve imported file %d: %w", a.ID, err)
+			}
+			rep.AlreadyImported++
+		} else if err != nil {
+			return nil, nil, fmt.Errorf("import attachment %d: %w", a.ID, err)
+		} else {
+			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+				OrgID: orgID, ActorKind: enum.ActorImporter,
+				EntityType: enum.EntityFile, EntityID: id, Verb: "file.uploaded",
+				OccurredAt: ts(a.CreateTime),
+				Payload: eventlog.MustPayload(map[string]any{
+					"file_id": id, "name": a.FileName, "size_bytes": size}),
+			}); err != nil {
+				return nil, nil, err
+			}
+			rep.Attachments++
+		}
+		pathToFile[a.PathID] = id
+		fileByAttach[a.ID] = id
+	}
+	return pathToFile, fileByAttach, nil
+}
+
+// rewriteUploads swaps /user_uploads/<path_id> links (relative or absolute)
+// for our managed-file URLs so imported content renders working links.
+func rewriteUploads(contentSrc string, pathToFile map[string]int64) (string, bool) {
+	if len(pathToFile) == 0 || !strings.Contains(contentSrc, "/user_uploads/") {
+		return contentSrc, false
+	}
+	changed := false
+	for path, id := range pathToFile {
+		needle := "/user_uploads/" + path
+		if strings.Contains(contentSrc, needle) {
+			contentSrc = strings.ReplaceAll(contentSrc, needle, fmt.Sprintf("/api/v1/files/%d", id))
+			changed = true
+		}
+	}
+	return contentSrc, changed
+}
+
+// importEditHistory materializes a message's content edits as kind-1
+// revisions, oldest first, re-parsing prior content through our engine.
+// Entries without an attributable editor are skipped and counted; topic and
+// stream moves carry no prev_content and are not message revisions.
+func (s *Service) importEditHistory(ctx context.Context, tx pgx.Tx, msgID int64, m zulipMessage, userMap map[int64]int64, resolve func(string) (int64, bool), rep *Report) error {
+	entries := parseEditHistory(m.EditHistory)
+	if len(entries) == 0 {
+		return nil
+	}
+	revNo := 0
+	var lastEdit float64
+	for _, e := range entries {
+		if e.PrevContent == nil {
+			continue
+		}
+		if e.UserID == nil {
+			rep.EditEntriesSkipped++
+			continue
+		}
+		editor, ok := userMap[*e.UserID]
+		if !ok {
+			rep.EditEntriesSkipped++
+			continue
+		}
+		revNo++
+		prevDoc := content.Parse(*e.PrevContent, resolve)
+		ct, err := tx.Exec(ctx, `
+			INSERT INTO message_revision
+				(message_id, revision_no, kind, prev_source, prev_ast, edited_by, edited_at)
+			VALUES ($1, $2, 1, $3, $4, $5, $6)
+			ON CONFLICT (message_id, revision_no) DO NOTHING`,
+			msgID, revNo, *e.PrevContent, prevDoc.JSON(), editor, ts(e.Timestamp))
+		if err != nil {
+			return fmt.Errorf("import revision: %w", err)
+		}
+		if ct.RowsAffected() > 0 {
+			rep.MessageEdits++
+		}
+		if e.Timestamp > lastEdit {
+			lastEdit = e.Timestamp
+		}
+	}
+	if lastEdit > 0 {
+		if _, err := tx.Exec(ctx,
+			`UPDATE message SET edited_at = $1 WHERE id = $2 AND edited_at IS NULL`,
+			ts(lastEdit), msgID); err != nil {
+			return fmt.Errorf("stamp edited_at: %w", err)
+		}
+	}
 	return nil
 }

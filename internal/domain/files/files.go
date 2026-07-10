@@ -79,7 +79,7 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	}
 	sum := h.Sum(nil)
 	shaHex := hex.EncodeToString(sum)
-	key := fmt.Sprintf("%d/%s/%s/%s", actor.OrgID, shaHex[:2], shaHex[2:4], shaHex)
+	key := StorageKey(actor.OrgID, shaHex)
 
 	if _, err := spool.Seek(0, io.SeekStart); err != nil {
 		return File{}, apperr.Internal("rewind spool", err)
@@ -204,6 +204,13 @@ func (s *Service) AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor 
 		}
 	}
 	return attached, nil
+}
+
+// StorageKey is THE content-addressed blob key derivation: org-scoped with
+// directory fan-out. Every writer (uploads, the importer's backfill lane)
+// must derive keys here so dedup and idempotent puts hold across producers.
+func StorageKey(orgID int64, shaHex string) string {
+	return fmt.Sprintf("%d/%s/%s/%s", orgID, shaHex[:2], shaHex[2:4], shaHex)
 }
 
 // sanitizeName keeps a plain base name: no paths, no control characters,
