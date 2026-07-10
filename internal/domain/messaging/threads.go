@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -369,6 +370,16 @@ func (s *Service) requireParticipant(ctx context.Context, tx pgx.Tx, dmSpaceID, 
 // (the v1 space-visibility slice). DM events carry dm_space_id so the
 // gateway fans out to participants only.
 func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, channelID, dmSpaceID *int64, source string) (int64, error) {
+	return s.insertThreadMessageAs(ctx, tx, actor, enum.ActorHuman, &actor.UserID, nil,
+		threadID, channelID, dmSpaceID, source)
+}
+
+// insertThreadMessageAs is the one message-insert path with the event actor
+// made explicit: automations post with ActorAutomation + the automation's id
+// as the event actor (the loop guard reads it) and consumer metadata in the
+// event hint (chain depth), while the message row's author stays a real
+// user_account (the acting principal).
+func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor auth.Identity, actorKind enum.ActorKind, eventActorID *int64, hint json.RawMessage, threadID int64, channelID, dmSpaceID *int64, source string) (int64, error) {
 	doc := content.Parse(source, func(label string) (int64, bool) {
 		var uid int64
 		err := tx.QueryRow(ctx, `
@@ -413,9 +424,9 @@ func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth
 		payload["dm_space_id"] = *dmSpaceID
 	}
 	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
-		OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
+		OrgID: actor.OrgID, ActorKind: actorKind, ActorID: eventActorID,
 		EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
-		Payload: eventlog.MustPayload(payload),
+		Payload: eventlog.MustPayload(payload), Hint: hint,
 	}); err != nil {
 		return 0, apperr.Internal("append event", err)
 	}
