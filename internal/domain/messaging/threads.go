@@ -374,7 +374,7 @@ func (s *Service) requireParticipant(ctx context.Context, tx pgx.Tx, dmSpaceID, 
 // gateway fans out to participants only.
 func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, channelID, dmSpaceID *int64, source string) (int64, error) {
 	return s.insertThreadMessageAs(ctx, tx, actor, enum.ActorHuman, &actor.UserID, nil,
-		threadID, channelID, dmSpaceID, source)
+		threadID, channelID, dmSpaceID, source, true)
 }
 
 // insertThreadMessageAs is the one message-insert path with the event actor
@@ -382,7 +382,7 @@ func (s *Service) InsertThreadMessage(ctx context.Context, tx pgx.Tx, actor auth
 // as the event actor (the loop guard reads it) and consumer metadata in the
 // event hint (chain depth), while the message row's author stays a real
 // user_account (the acting principal).
-func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor auth.Identity, actorKind enum.ActorKind, eventActorID *int64, hint json.RawMessage, threadID int64, channelID, dmSpaceID *int64, source string) (int64, error) {
+func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor auth.Identity, actorKind enum.ActorKind, eventActorID *int64, hint json.RawMessage, threadID int64, channelID, dmSpaceID *int64, source string, attachFiles bool) (int64, error) {
 	doc := content.Parse(source, func(label string) (int64, bool) {
 		var uid int64
 		err := tx.QueryRow(ctx, `
@@ -404,7 +404,9 @@ func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor au
 	// Attachment references: any /api/v1/files/{id} link in the content
 	// becomes a file_reference (union-of-referencing-ACLs, ADR-012) —
 	// unattachable ids are skipped by the files service, never an error.
-	if s.files != nil {
+	// Forwards pass attachFiles=false: the links quoted from the source stay
+	// inert text, so a forward creates no new file_reference rows (P-03).
+	if attachFiles && s.files != nil {
 		if ids := fileIDsFromLinks(doc.Links()); len(ids) > 0 {
 			attached, err := s.files.AttachMessageReferences(ctx, tx, actor, msgID, ids)
 			if err != nil {
@@ -455,7 +457,7 @@ func (s *Service) PostToChannelAsAutomation(ctx context.Context, tx pgx.Tx, orgI
 	return s.insertThreadMessageAs(ctx, tx,
 		auth.Identity{UserID: authorID, OrgID: orgID},
 		enum.ActorAutomation, &automationID, hint,
-		rootThreadID, &channelID, nil, source)
+		rootThreadID, &channelID, nil, source, true)
 }
 
 // SendToThread posts into any thread by its governing container (F-5):
@@ -523,11 +525,22 @@ func (s *Service) requireThreadSend(ctx context.Context, tx pgx.Tx, actor auth.I
 // deliverToThread is the gated in-transaction delivery: container gate,
 // insert, activity bump (never on channel roots, F-15).
 func (s *Service) deliverToThread(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, contentSrc string) (int64, error) {
+	return s.deliverToThreadOpts(ctx, tx, actor, threadID, contentSrc, true)
+}
+
+// deliverToThreadOpts is deliverToThread with explicit control over file
+// attachment. A normal send (attachFiles=true) records file_reference rows
+// for the /api/v1/files/{id} links it contains; a forward passes false so the
+// links quoted from the source remain inert text and no new references are
+// created (P-03 / ADR-012). Both run the identical send gate — this is THE
+// gated delivery path.
+func (s *Service) deliverToThreadOpts(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64, contentSrc string, attachFiles bool) (int64, error) {
 	channelID, dmSpaceID, kind, err := s.requireThreadSend(ctx, tx, actor, threadID)
 	if err != nil {
 		return 0, err
 	}
-	msgID, err := s.InsertThreadMessage(ctx, tx, actor, threadID, channelID, dmSpaceID, contentSrc)
+	msgID, err := s.insertThreadMessageAs(ctx, tx, actor, enum.ActorHuman, &actor.UserID, nil,
+		threadID, channelID, dmSpaceID, contentSrc, attachFiles)
 	if err != nil {
 		return 0, err
 	}
