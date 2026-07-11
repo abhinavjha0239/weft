@@ -131,6 +131,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PUT /api/v1/dnd", a.withAuth(a.handleSetDND))
 	mux.HandleFunc("GET /api/v1/vips", a.withAuth(a.handleListVIPs))
 	mux.HandleFunc("PUT /api/v1/vips", a.withAuth(a.handleSetVIPs))
+	mux.HandleFunc("POST /api/v1/dms/{id}/breakthrough", a.withAuth(a.handleDMBreakthrough))
 	mux.HandleFunc("POST /api/v1/spaces", a.withAuth(a.handleCreateSpace))
 	mux.HandleFunc("GET /api/v1/spaces", a.withAuth(a.handleListSpaces))
 	mux.HandleFunc("POST /api/v1/spaces/{id}/items", a.withAuth(a.handleCreateItem))

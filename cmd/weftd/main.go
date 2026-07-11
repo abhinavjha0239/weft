@@ -142,6 +142,8 @@ func serve(ctx context.Context, cfg config.Config) error {
 	janitor.DeadRefWindow = time.Duration(cfg.GCDeadRefDays) * 24 * time.Hour
 	go janitor.Run(ctx)
 
+	notifSvc := notification.New(pool)
+	notifSvc.SetFanout(hub)
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
 	go automation.NewRunner(pool, msgSvc, log).Run(ctx)
@@ -158,7 +160,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Messaging:     msgSvc,
 		Worktrack:     worktrack.New(pool, permsSvc, msgSvc),
 		DM:            dm.New(pool),
-		Notifications: notification.New(pool),
+		Notifications: notifSvc,
 		Files:         filesSvc,
 		Compliance:    complianceSvc,
 		Automations:   automation.New(pool, permsSvc),

@@ -2,6 +2,7 @@ package rest
 
 import (
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
@@ -58,4 +59,21 @@ func (a *api) handleSetVIPs(w http.ResponseWriter, r *http.Request, id auth.Iden
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"user_ids": out})
+}
+
+// handleDMBreakthrough spends the caller's one daily "notify anyway" for a
+// snoozed recipient in a 1:1 conversation (ADR-011 N-2). The {id} path value
+// is the dm_space id; the notification module owns the N-2 logic.
+func (a *api) handleDMBreakthrough(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	dmSpaceID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad conversation id")
+		return
+	}
+	out, err := a.Notifications.Breakthrough(r.Context(), id, dmSpaceID)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
 }
