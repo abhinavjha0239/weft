@@ -297,13 +297,41 @@ func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, 
 		return err
 	}
 	if ct.RowsAffected() > 0 && r.fan != nil {
-		payload, _ := json.Marshal(map[string]any{
-			"kind": kind, "entity_type": int16(enum.EntityMessage),
-			"entity_id": p.MessageID, "thread_id": p.ThreadID, "actor_id": author,
-		})
-		r.fan.NotifyUser(ctx, ev.OrgID, userID, payload)
+		suppressed, err := r.dndSuppressed(ctx, userID, author)
+		if err != nil {
+			return err
+		}
+		if !suppressed {
+			payload, _ := json.Marshal(map[string]any{
+				"kind": kind, "entity_type": int16(enum.EntityMessage),
+				"entity_id": p.MessageID, "thread_id": p.ThreadID, "actor_id": author,
+			})
+			r.fan.NotifyUser(ctx, ev.OrgID, userID, payload)
+		}
 	}
 	return nil
+}
+
+// dndSuppressed reports whether the live ping to userID should be withheld:
+// the recipient is snoozed (dnd_setting.snoozed_until in the future) AND the
+// message's actor is not on their priority-contact (VIP) list — the N-2 DND
+// gate with the VIP pierce. Only the live DELIVERY is suppressed; the in-app
+// row already landed (N-4: the badge accrues even when delivery is
+// suppressed). Runs only when a fan would otherwise happen, one indexed
+// lookup on the recipient's PK row.
+func (r *Runner) dndSuppressed(ctx context.Context, userID, author int64) (bool, error) {
+	var suppressed bool
+	if err := r.pool.QueryRow(ctx, `
+		SELECT EXISTS (
+		    SELECT 1 FROM dnd_setting d
+		    WHERE d.user_id = $1 AND d.snoozed_until > now()
+		      AND NOT EXISTS (
+		          SELECT 1 FROM priority_contact pc
+		          WHERE pc.user_id = $1 AND pc.contact_id = $2))`,
+		userID, author).Scan(&suppressed); err != nil {
+		return false, err
+	}
+	return suppressed, nil
 }
 
 // keywordMatches finds channel members whose alert words appear in the

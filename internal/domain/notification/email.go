@@ -87,6 +87,16 @@ func (w *EmailWorker) RunOnce(ctx context.Context, olderThan time.Time) (int, er
 				  AND COALESCE((SELECT p.enabled FROM notification_medium_pref p
 				        WHERE p.user_id = n.user_id AND p.kind = n.kind AND p.medium = $2),
 				      n.kind IN (1, 2))
+				  -- N-2 DND: skip rows for a recipient who is snoozed right now,
+				  -- unless the row's actor is one of their VIPs. Left UNMARKED
+				  -- (emailed_at stays NULL), so once the snooze lapses the next
+				  -- sweep picks them up — a delay, never a drop.
+				  AND NOT EXISTS (
+				      SELECT 1 FROM dnd_setting d
+				      WHERE d.user_id = n.user_id AND d.snoozed_until > now()
+				        AND NOT EXISTS (
+				            SELECT 1 FROM priority_contact pc
+				            WHERE pc.user_id = n.user_id AND pc.contact_id = n.actor_id))
 				ORDER BY n.user_id, n.id
 				LIMIT $3
 				FOR UPDATE OF n SKIP LOCKED`,

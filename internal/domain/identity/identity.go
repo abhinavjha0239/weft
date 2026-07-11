@@ -157,6 +157,10 @@ type Profile struct {
 	FullName    string `json:"full_name"`
 	Kind        int16  `json:"kind"`
 	Deactivated bool   `json:"deactivated,omitempty"`
+	// User status (ADR-011 N-3): the current unexpired manual status, empty
+	// when unset or lapsed. A LEFT JOIN with the expiry filter supplies it.
+	StatusEmoji string `json:"emoji,omitempty"`
+	StatusText  string `json:"status_text,omitempty"`
 }
 
 type MyProfile struct {
@@ -205,10 +209,14 @@ func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64
 		return nil, apperr.Invalid("too many ids (max 100)")
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, full_name, kind, deactivated_at IS NOT NULL
-		FROM user_account u WHERE org_id = $1 AND id = ANY($2)
+		SELECT u.id, u.full_name, u.kind, u.deactivated_at IS NOT NULL,
+		       COALESCE(st.emoji, ''), COALESCE(st.status_text, '')
+		FROM user_account u
+		LEFT JOIN user_status st ON st.user_id = u.id
+		  AND (st.expires_at IS NULL OR st.expires_at > now())
+		WHERE u.org_id = $1 AND u.id = ANY($2)
 		  AND `+guestVisibleClause+`
-		ORDER BY id`, actor.OrgID, ids, actor.UserID, actor.IsGuest())
+		ORDER BY u.id`, actor.OrgID, ids, actor.UserID, actor.IsGuest())
 	if err != nil {
 		return nil, apperr.Internal("profiles", err)
 	}
@@ -216,7 +224,8 @@ func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64
 	var out []Profile
 	for rows.Next() {
 		var p Profile
-		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated); err != nil {
+		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated,
+			&p.StatusEmoji, &p.StatusText); err != nil {
 			return nil, apperr.Internal("scan profile", err)
 		}
 		out = append(out, p)
@@ -232,11 +241,14 @@ func (s *Service) Directory(ctx context.Context, actor auth.Identity, limit int)
 		limit = 200
 	}
 	rows, err := s.pool.Query(ctx, `
-		SELECT id, full_name, kind, false
+		SELECT u.id, u.full_name, u.kind, false,
+		       COALESCE(st.emoji, ''), COALESCE(st.status_text, '')
 		FROM user_account u
-		WHERE org_id = $1 AND deactivated_at IS NULL AND kind IN (1, 2)
+		LEFT JOIN user_status st ON st.user_id = u.id
+		  AND (st.expires_at IS NULL OR st.expires_at > now())
+		WHERE u.org_id = $1 AND u.deactivated_at IS NULL AND u.kind IN (1, 2)
 		  AND `+guestVisibleClause+`
-		ORDER BY lower(full_name), id
+		ORDER BY lower(u.full_name), u.id
 		LIMIT $2`, actor.OrgID, limit, actor.UserID, actor.IsGuest())
 	if err != nil {
 		return nil, apperr.Internal("directory", err)
@@ -245,7 +257,8 @@ func (s *Service) Directory(ctx context.Context, actor auth.Identity, limit int)
 	var out []Profile
 	for rows.Next() {
 		var p Profile
-		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated); err != nil {
+		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated,
+			&p.StatusEmoji, &p.StatusText); err != nil {
 			return nil, apperr.Internal("scan directory", err)
 		}
 		out = append(out, p)
