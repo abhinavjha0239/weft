@@ -29,9 +29,16 @@ const (
 
 type Service struct {
 	pool *pgxpool.Pool
+	fan  Fanout
 }
 
 func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+
+// SetFanout wires the live-ping seam (the gateway Hub in production, a capture
+// in tests), set at composition time like messaging.SetFiles. The DM
+// breakthrough re-fans a DND-suppressed ping through it; nil = no live
+// delivery (the notification row stays the durable truth either way).
+func (s *Service) SetFanout(f Fanout) { s.fan = f }
 
 type Notification struct {
 	ID         int64     `json:"id"`
