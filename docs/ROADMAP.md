@@ -27,7 +27,7 @@ export (#45), drafts+scheduled (#46), invites+guests (#47), email medium
 
 ## Tier 1 — SPEC-READY (dispatch in this order unless the user reorders)
 
-### P-01 `notification: DM breakthrough (N-2).` — S
+### P-01 `notification: DM breakthrough (N-2).` — S — **[x] shipped #53**
 Completes N-2. The `dm_breakthrough` table (0006) gives a DM sender ONE
 "notify anyway" per recipient per day when the recipient is snoozed.
 **Design (decided):**
@@ -61,7 +61,7 @@ sleep); not-snoozed 409 (use not burned — assert no row); no-pending 409
 **Gaps to record:** client affordance (the "notify anyway" button) is
 client work; per-org disable knob later.
 
-### P-02 `messaging: Pins and saved items.` — M
+### P-02 `messaging: Pins and saved items.` — M — **[x] saved items shipped #54; pins → P-02b**
 Wakes `pin` and `saved_item` (0004 — read their DDL first).
 **Design (decided):**
 - Pins are PER-CONTAINER curation, gated like moderation-lite:
@@ -94,8 +94,34 @@ migration without flagging).
 participant pin, cap 409, event emitted once, saved privacy (other users
 never see your saved list), tombstone rendering, ACL 404s.
 **Gaps:** pin ordering is insertion-order v1; no pin "system message".
+**EXECUTION NOTE (#54):** the executor correctly STOPPED on the pins
+half — this spec required DM/space pins but the `pin` table is
+`channel_id NOT NULL` (channel-only). Saved items shipped alone; pins
+re-specced below as P-02b.
 
-### P-03 `messaging: Forwarding and quoting.` — M
+### P-02b `messaging: Channel pins.` — S
+Pins, re-specced to MATCH the 0004 schema: channel messages only.
+**Design (decided):**
+- `PUT/DELETE /api/v1/messages/{id}/pin` — CHANNEL messages only
+  (DM/space-thread messages → 400 "pins are for channel messages";
+  their pin support is a schema change deferred until the fusion UX
+  needs it — record as the gap). Actor needs the three-way read ACL
+  AND `administer_channel` on the message's channel (ChannelScope).
+- `GET /api/v1/channels/{id}/pins` — member-gated (requireMember),
+  newest-pinned first, message previews (id, author_id, ≤160-rune
+  excerpt via the saved-items helper, pinned_by, pinned_at); deleted
+  messages are auto-dropped from the list (the JOIN filters
+  deleted_at) AND DeleteMessage clears the message's pin rows in the
+  same tx (add that — it keeps the cap honest).
+- Cap 50 per channel (409). Idempotent double-pin/unpin (RowsAffected
+  gate, no second event). Events `message.pinned`/`message.unpinned`
+  (entity=message, payload carries channel_id for gateway routing).
+**Tests:** permission matrix (member 403 / admin 200 / non-member 404
+oracle-free), DM message 400, cap 409, idempotence + single event,
+delete-clears-pin, list ordering + preview shape, guest visibility
+(guest sees pins only in their channels via the member gate).
+
+### P-03 `messaging: Forwarding and quoting.` — M — **[x] shipped #55**
 The `message.forwarded_from_message_id` column (0004) wakes.
 **Design (decided):**
 - `POST /api/v1/messages/{id}/forward` {thread_id, comment?} — copies
