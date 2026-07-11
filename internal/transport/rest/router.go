@@ -117,6 +117,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/me", a.withAuth(a.handleMe))
 	mux.HandleFunc("GET /api/v1/users", a.withAuth(a.handleListUsers))
 	mux.HandleFunc("GET /api/v1/presence", a.withAuth(a.handlePresence))
+	mux.HandleFunc("PUT /api/v1/status", a.withAuth(a.handleSetStatus))
+	mux.HandleFunc("DELETE /api/v1/status", a.withAuth(a.handleClearStatus))
 	mux.HandleFunc("POST /api/v1/files", a.withAuth(a.handleUploadFile))
 	mux.HandleFunc("GET /api/v1/files/{id}", a.withAuth(a.handleDownloadFile))
 	mux.HandleFunc("GET /api/v1/notifications", a.withAuth(a.handleListNotifications))
