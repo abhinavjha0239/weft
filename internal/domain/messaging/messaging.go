@@ -131,6 +131,10 @@ type Message struct {
 	Source    string        `json:"source"`
 	Rendered  string        `json:"rendered"`
 	Reactions []ReactionAgg `json:"reactions,omitempty"`
+	// ForwardedFrom is the source message id when this message was created by
+	// a forward (P-03); null otherwise. Clients resolve it to render the
+	// original's context. Populated by Get; list endpoints leave it null.
+	ForwardedFrom *int64 `json:"forwarded_from"`
 }
 
 // Get fetches one message the actor may read — the same visibility rule as
@@ -140,7 +144,8 @@ type Message struct {
 func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Message, error) {
 	var m Message
 	err := s.pool.QueryRow(ctx, `
-		SELECT m.id, COALESCE(m.channel_id, 0), m.thread_id, m.author_id, m.source, m.rendered
+		SELECT m.id, COALESCE(m.channel_id, 0), m.thread_id, m.author_id, m.source,
+		       m.rendered, m.forwarded_from_message_id
 		FROM message m
 		WHERE m.id = $1 AND m.org_id = $3 AND m.deleted_at IS NULL
 		  AND ((m.channel_id IS NOT NULL AND EXISTS (
@@ -152,7 +157,7 @@ func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Me
 		         WHERE dp.dm_space_id = m.dm_space_id AND dp.user_id = $2))
 		    OR (m.channel_id IS NULL AND m.dm_space_id IS NULL))`,
 		msgID, actor.UserID, actor.OrgID).Scan(&m.ID, &m.ChannelID, &m.ThreadID,
-		&m.AuthorID, &m.Source, &m.Rendered)
+		&m.AuthorID, &m.Source, &m.Rendered, &m.ForwardedFrom)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return Message{}, apperr.NotFound("message not found")
 	}

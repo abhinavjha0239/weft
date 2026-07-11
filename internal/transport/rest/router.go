@@ -93,6 +93,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/messages/{id}", a.withAuth(a.handleGetMessage))
 	mux.HandleFunc("PATCH /api/v1/messages/{id}", a.withAuth(a.handleEditMessage))
 	mux.HandleFunc("DELETE /api/v1/messages/{id}", a.withAuth(a.handleDeleteMessage))
+	mux.HandleFunc("POST /api/v1/messages/{id}/forward", a.withAuth(a.handleForwardMessage))
 	mux.HandleFunc("POST /api/v1/scheduled-messages", a.withAuth(a.handleScheduleMessage))
 	mux.HandleFunc("GET /api/v1/scheduled-messages", a.withAuth(a.handleListScheduled))
 	mux.HandleFunc("PATCH /api/v1/scheduled-messages/{id}", a.withAuth(a.handleUpdateScheduled))
