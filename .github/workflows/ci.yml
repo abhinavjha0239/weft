@@ -102,7 +102,8 @@ jobs:
           # name the brand. Prose (docs/, README) and package metadata may —
           # the rule protects rebrandability of code/config, not documentation.
           if git grep -liw weft -- ':(exclude)*.go' ':(exclude)docs/' \
-              ':(exclude)README.md' ':(exclude)go.mod' ':(exclude)go.sum' \
+              ':(exclude)README.md' ':(exclude)CLAUDE.md' ':(exclude)AGENTS.md' \
+              ':(exclude)go.mod' ':(exclude)go.sum' \
               ':(exclude).github'; then
             echo 'brand literal in a non-Go machine surface (config/migration/manifest)'; exit 1
           fi
