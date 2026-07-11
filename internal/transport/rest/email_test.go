@@ -110,11 +110,11 @@ func TestNotificationEmails(t *testing.T) {
 	var prefs struct {
 		Prefs []notification.MediumPref `json:"prefs"`
 	}
-	if code := getJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok, &prefs); code != 200 || len(prefs.Prefs) != 4 {
+	if code := getJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok, &prefs); code != 200 || len(prefs.Prefs) != 5 {
 		t.Fatalf("prefs = %d %+v", code, prefs.Prefs)
 	}
 	for _, p := range prefs.Prefs {
-		want := p.Kind == 1 || p.Kind == 2
+		want := p.Kind == 1 || p.Kind == 2 || p.Kind == 4
 		if p.Enabled != want {
 			t.Fatalf("default pref kind %d = %v, want %v", p.Kind, p.Enabled, want)
 		}
@@ -205,8 +205,8 @@ func TestNotificationEmails(t *testing.T) {
 
 	// Bad pref inputs: unknown kind, unsettable medium.
 	if code := putJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok,
-		map[string]any{"kind": 4, "medium": 2, "enabled": true}); code != http.StatusBadRequest {
-		t.Fatalf("reserved kind = %d, want 400", code)
+		map[string]any{"kind": 9, "medium": 2, "enabled": true}); code != http.StatusBadRequest {
+		t.Fatalf("unknown kind = %d, want 400", code)
 	}
 	if code := putJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok,
 		map[string]any{"kind": 1, "medium": 1, "enabled": false}); code != http.StatusBadRequest {
