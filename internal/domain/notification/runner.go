@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"log/slog"
+	"regexp"
 	"strconv"
 	"time"
 
@@ -166,12 +167,20 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	if ev.Verb == "message.edited" {
 		mentionList = p.NewMentions
 	}
+	// Keyword candidates resolve BEFORE the passes so specificity can win:
+	// followed (3) beats keyword (4) beats channel activity (5).
+	keyworded, err := r.keywordMatches(ctx, ev, p, author)
+	if err != nil {
+		return err
+	}
+
 	mentioned := map[int64]bool{}
 	for _, uid := range mentionList {
 		if uid == author {
 			continue // self-mentions never notify
 		}
 		mentioned[uid] = true
+		delete(keyworded, uid)
 		if err := r.insert(ctx, ev, p, uid, KindMention, author); err != nil {
 			return err
 		}
@@ -218,10 +227,21 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 			kind := int16(KindChannelActivity)
 			if x.followed {
 				kind = KindFollowedThread
+			} else if keyworded[x.uid] {
+				kind = KindKeyword // a keyword upgrades plain activity
 			}
+			delete(keyworded, x.uid)
 			if err := r.insert(ctx, ev, p, x.uid, kind, author); err != nil {
 				return err
 			}
+		}
+	}
+
+	// Remaining keyword matches (members outside the level/follow pass, or
+	// edits that newly introduced a word) get the kind-4 row.
+	for uid := range keyworded {
+		if err := r.insert(ctx, ev, p, uid, KindKeyword, author); err != nil {
+			return err
 		}
 	}
 
@@ -284,4 +304,63 @@ func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, 
 		r.fan.NotifyUser(ctx, ev.OrgID, userID, payload)
 	}
 	return nil
+}
+
+// keywordMatches finds channel members whose alert words appear in the
+// message (kind 4): a cheap substring prefilter in SQL over the channel's
+// members' words, refined to WORD boundaries in Go. Mute-respecting like
+// plain activity (a muted thread suppresses; an unmuted thread revives
+// inside a muted channel) — keywords do not break through mute the way
+// mentions do. Users already notified for this message are excluded (the
+// message.edited path must not double-ping), and DMs are skipped: the DM
+// row itself already pings every participant.
+func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messagePayload, author int64) (map[int64]bool, error) {
+	if p.ChannelID == 0 || p.ThreadID == 0 {
+		return nil, nil
+	}
+	var source string
+	if err := r.pool.QueryRow(ctx,
+		`SELECT source FROM message WHERE id = $1 AND deleted_at IS NULL`,
+		p.MessageID).Scan(&source); err != nil {
+		return nil, nil // deleted or gone: nothing to match
+	}
+	rows, err := r.pool.Query(ctx, `
+		SELECT aw.user_id, aw.word
+		FROM alert_word aw
+		JOIN channel_member cm ON cm.user_id = aw.user_id
+		LEFT JOIN thread_subscription ts
+		  ON ts.thread_id = $2 AND ts.user_id = aw.user_id
+		WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL
+		  AND aw.user_id <> $3
+		  AND COALESCE(ts.state, 0) <> 2
+		  AND (NOT cm.muted OR COALESCE(ts.state, 0) = 3)
+		  AND position(aw.word IN lower($4)) > 0
+		  AND NOT EXISTS (
+		      SELECT 1 FROM notification n
+		      WHERE n.user_id = aw.user_id AND n.entity_type = $5 AND n.entity_id = $6)`,
+		p.ChannelID, p.ThreadID, author, source,
+		int16(enum.EntityMessage), p.MessageID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	matched := map[int64]bool{}
+	for rows.Next() {
+		var uid int64
+		var word string
+		if rows.Scan(&uid, &word) != nil {
+			continue
+		}
+		if matched[uid] {
+			continue
+		}
+		re, err := regexp.Compile(`(?i)\b` + regexp.QuoteMeta(word) + `\b`)
+		if err != nil {
+			continue
+		}
+		if re.MatchString(source) {
+			matched[uid] = true
+		}
+	}
+	return matched, rows.Err()
 }

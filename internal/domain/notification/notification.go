@@ -23,7 +23,7 @@ const (
 	KindDM              = 1
 	KindMention         = 2
 	KindFollowedThread  = 3
-	kindKeywordReserved = 4 // alert words — a later reason
+	KindKeyword         = 4 // alert words (N-1 kind 4)
 	KindChannelActivity = 5
 )
 

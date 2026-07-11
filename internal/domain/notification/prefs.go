@@ -16,14 +16,15 @@ const (
 	MediumEmail int16 = 2
 )
 
-// defaultEmailEnabled is the zero-rows matrix: email for DMs and mentions
-// (the Zulip default), quiet for follows and channel activity.
+// defaultEmailEnabled is the zero-rows matrix: email for DMs, mentions,
+// and keywords (setting an alert word IS the opt-in — the user asked for
+// that signal); quiet for follows and channel activity.
 func defaultEmailEnabled(kind int16) bool {
-	return kind == KindDM || kind == KindMention
+	return kind == KindDM || kind == KindMention || kind == KindKeyword
 }
 
-// prefKinds are the settable reason classes (kind 4 keyword is reserved).
-var prefKinds = []int16{KindDM, KindMention, KindFollowedThread, KindChannelActivity}
+// prefKinds are the settable reason classes.
+var prefKinds = []int16{KindDM, KindMention, KindFollowedThread, KindKeyword, KindChannelActivity}
 
 type MediumPref struct {
 	Kind    int16 `json:"kind"`
@@ -77,7 +78,7 @@ func (s *Service) SetMediumPref(ctx context.Context, actor auth.Identity, kind, 
 		}
 	}
 	if !valid {
-		return apperr.Invalid("kind must be 1 (dm), 2 (mention), 3 (followed), or 5 (channel activity)")
+		return apperr.Invalid("kind must be 1 (dm), 2 (mention), 3 (followed), 4 (keyword), or 5 (channel activity)")
 	}
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO notification_medium_pref (user_id, kind, medium, enabled)
