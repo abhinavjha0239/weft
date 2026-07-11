@@ -253,10 +253,21 @@ append + consumer. `internal/transport/rest/` thin handlers only — no
 SQL, no business rules. `internal/platform/` blob, mail, apperr,
 ratelimit. `internal/webui/` the dogfood client (one HTML file).
 
+## The PR queue
+
+`docs/ROADMAP.md` is the work queue: every upcoming PR as a spec.
+Executors implement **SPEC-READY (Tier 1)** entries verbatim — all
+design, edge cases, and performance decisions are already written
+there. `Tier 2` / `NEEDS-DESIGN` entries must NOT be dispatched or
+improvised: the strongest model finalizes their spec first. Every
+executed slice is reviewed before push. Mark entries shipped (with
+PR#) as they land.
+
 ## Session bootstrap checklist
 
 1. `cat ~/Documents/oss-chat-platform/TIMELINE.md | tail -40` → STATE.
 2. `cd ~/Documents/weft && git checkout dev && git pull && git log --oneline -5`.
 3. `docker ps | grep weft-pg` (start it if gone; port 55432).
-4. Read the REALITY rows + ADR sections for the slice you're about to
-   propose. Then propose it and wait for approval.
+4. Read `docs/ROADMAP.md` (the queue) + the REALITY rows + ADR sections
+   for the slice you're about to propose. Then propose it and wait for
+   approval.
