@@ -1,6 +1,6 @@
 // Package messaging: channels, threads, messages, reactions, read state
 // (ARCHITECTURE.md module map). Owns: channel*, thread*, message*, reaction,
-// pin, draft, scheduled_message, reminder, *_watermark/flag tables.
+// pin, custom_emoji, draft, scheduled_message, reminder, *_watermark/flag tables.
 package messaging
 
 import (
