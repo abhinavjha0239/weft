@@ -182,11 +182,15 @@ type Meta struct {
 	Size int64
 }
 
-// OpenDownload enforces the F-12 union rule per (viewer, reference) at
-// query time: the uploader always reads their own file; anyone else needs
-// at least one referencing message they can see — the same three-way
-// container ACL as message fetch.
-func (s *Service) OpenDownload(ctx context.Context, actor auth.Identity, fileID int64) (Meta, io.ReadCloser, error) {
+// authorizeDownload runs the F-12 union ACL and returns the file's meta and
+// its storage key WITHOUT opening the blob. It is shared by OpenDownload
+// (which then opens the blob) and the signed-link minter (P-07), which must
+// authorize a download but must NOT open the bytes just to hand out a URL.
+// The uploader always reads their own file; anyone else needs at least one
+// referencing message they can see — the same three-way container ACL as
+// message fetch. Unauthorized and nonexistent are indistinguishable (no
+// file-id oracle).
+func (s *Service) authorizeDownload(ctx context.Context, actor auth.Identity, fileID int64) (Meta, string, error) {
 	var m Meta
 	var key string
 	var uploader *int64
@@ -196,7 +200,7 @@ func (s *Service) OpenDownload(ctx context.Context, actor auth.Identity, fileID 
 		WHERE id = $1 AND org_id = $2 AND kind = 1 AND deleted_at IS NULL`,
 		fileID, actor.OrgID).Scan(&m.Name, &m.Mime, &m.Size, &key, &uploader)
 	if err != nil {
-		return Meta{}, nil, apperr.NotFound("file not found")
+		return Meta{}, "", apperr.NotFound("file not found")
 	}
 	allowed := uploader != nil && *uploader == actor.UserID
 	if !allowed {
@@ -216,12 +220,21 @@ func (s *Service) OpenDownload(ctx context.Context, actor auth.Identity, fileID 
 			           WHERE dp.dm_space_id = m.dm_space_id AND dp.user_id = $2))
 			      OR (m.channel_id IS NULL AND m.dm_space_id IS NULL)))`,
 			fileID, actor.UserID, int16(enum.EntityMessage), actor.OrgID).Scan(&allowed); err != nil {
-			return Meta{}, nil, apperr.Internal("reference check", err)
+			return Meta{}, "", apperr.Internal("reference check", err)
 		}
 	}
 	if !allowed {
-		// Indistinguishable from nonexistent: no file-id oracle.
-		return Meta{}, nil, apperr.NotFound("file not found")
+		return Meta{}, "", apperr.NotFound("file not found")
+	}
+	return m, key, nil
+}
+
+// OpenDownload authorizes the viewer (the F-12 union rule) and opens the
+// blob for streaming.
+func (s *Service) OpenDownload(ctx context.Context, actor auth.Identity, fileID int64) (Meta, io.ReadCloser, error) {
+	m, key, err := s.authorizeDownload(ctx, actor, fileID)
+	if err != nil {
+		return Meta{}, nil, err
 	}
 	rc, err := s.store.Open(ctx, key)
 	if err != nil {
