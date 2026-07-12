@@ -154,6 +154,8 @@ type ChannelSummary struct {
 	Private      bool   `json:"private"`
 	Member       bool   `json:"member"`
 	RootThreadID int64  `json:"root_thread_id"`
+	// FolderID is the channel's sidebar folder (P-09); null when unfiled.
+	FolderID *int64 `json:"folder_id"`
 }
 
 // ListChannels: the ADR-008 C-2 read-model slice — public channels are
@@ -162,7 +164,7 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 	// Guests (P-5) see ONLY their channels; members also see public ones.
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id, c.name, c.description, c.visibility = 2,
-		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0)
+		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0), c.folder_id
 		FROM channel c
 		LEFT JOIN channel_member cm
 		  ON cm.channel_id = c.id AND cm.user_id = $2 AND cm.unsubscribed_at IS NULL
@@ -177,7 +179,7 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 	var out []ChannelSummary
 	for rows.Next() {
 		var c ChannelSummary
-		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member, &c.RootThreadID); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member, &c.RootThreadID, &c.FolderID); err != nil {
 			return nil, apperr.Internal("scan channel", err)
 		}
 		out = append(out, c)
