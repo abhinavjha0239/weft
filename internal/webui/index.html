@@ -338,7 +338,9 @@ async function enter(){
   // moment a conversation existed.
   const [me, pres] = await Promise.all([api("/me"), api("/presence")]);
   S.me = me;
-  S.online = new Set(pres.online||[]);
+  // /presence is now a tri-state map {userId: "active"|"idle"}; the sidebar
+  // dot only marks "connected", so treat any present user as online.
+  S.online = new Set(Object.keys(pres.presence||{}).map(Number));
   S.users[me.user_id] = {id: me.user_id, full_name: me.full_name};
   $("#meName").textContent = me.full_name;
   await Promise.all([refreshChannels(), refreshSpaces(), refreshDMs(), refreshNotifBadge()]);
@@ -977,7 +979,7 @@ function connectWS(){
       case "dm.opened": refreshDMs(); break;
       case "notification.created": refreshNotifBadge(); break;
       case "presence.changed":
-        if (p.state==="online") S.online.add(p.user_id);
+        if (p.state==="active"||p.state==="idle") S.online.add(p.user_id);
         else S.online.delete(p.user_id);
         renderDMs(); break;
       case "workitem.created": case "workitem.updated":
@@ -990,6 +992,20 @@ function connectWS(){
     }
   };
 }
+
+// P-05 liveness: nudge the gateway that we're active on focus/interaction,
+// throttled to at most once a minute — it only ever refreshes the idle timer,
+// so a coarse cadence is enough and keeps the signal plane quiet.
+let lastActiveSent = 0;
+function sendActive(){
+  const now = Date.now();
+  if (now - lastActiveSent < 60000) return;
+  lastActiveSent = now;
+  if (S.ws && S.ws.readyState===1) S.ws.send(JSON.stringify({type:"active"}));
+}
+document.addEventListener("visibilitychange", ()=>{ if (!document.hidden) sendActive(); });
+document.addEventListener("keydown", sendActive);
+document.addEventListener("click", sendActive);
 
 async function onMessage(p){
   // Space-thread messages carry no channel_id — they only matter here when

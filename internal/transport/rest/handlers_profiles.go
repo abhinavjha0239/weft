@@ -56,11 +56,8 @@ func (a *api) handleListUsers(w http.ResponseWriter, r *http.Request, id auth.Id
 }
 
 // handlePresence is the bootstrap snapshot for the ephemeral presence plane:
-// clients read it once, then apply presence.changed signals.
+// a tri-state map of connected users → "active"|"idle" (offline users are
+// absent); clients read it once, then apply presence.changed signals.
 func (a *api) handlePresence(w http.ResponseWriter, r *http.Request, id auth.Identity) {
-	online := a.Hub.OnlineUsers(id.OrgID)
-	if online == nil {
-		online = []int64{}
-	}
-	writeJSON(w, http.StatusOK, map[string]any{"online": online})
+	writeJSON(w, http.StatusOK, map[string]any{"presence": a.Hub.PresenceSnapshot(id.OrgID)})
 }

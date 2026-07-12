@@ -282,31 +282,27 @@ func TestDMTypingAndPresence(t *testing.T) {
 	alice.waitFor(t, "ready")
 	bob1 := dialClient(t, ctx, ts.URL, bobTok)
 	bob1.waitFor(t, "ready")
-	alice.waitForPresence(t, bobID, "online")
+	alice.waitForPresence(t, bobID, "active")
 	bob2 := dialClient(t, ctx, ts.URL, bobTok)
 	bob2.waitFor(t, "ready")
 	alice.expectSilence(t, "presence.changed", 700*time.Millisecond)
 
-	// Snapshot has both while connected.
+	// Snapshot is the tri-state map; both are active while freshly connected.
 	var pres struct {
-		Online []int64 `json:"online"`
+		Presence map[int64]string `json:"presence"`
 	}
 	getJSON(t, ts.URL+"/api/v1/presence", boot.Token, &pres)
-	onSet := map[int64]bool{}
-	for _, id := range pres.Online {
-		onSet[id] = true
-	}
-	if !onSet[boot.UserID] || !onSet[bobID] {
-		t.Fatalf("presence snapshot = %v, want alice+bob", pres.Online)
+	if pres.Presence[boot.UserID] != "active" || pres.Presence[bobID] != "active" {
+		t.Fatalf("presence snapshot = %v, want alice+bob active", pres.Presence)
 	}
 
 	// DM typing: alice → bob (scoped payload); charlie hears nothing, and a
 	// non-participant's frame is dropped at the sender gate.
 	charlie := dialClient(t, ctx, ts.URL, charlieTok)
 	charlie.waitFor(t, "ready")
-	// Drain charlie's own online broadcast from alice's queue so the
+	// Drain charlie's own active broadcast from alice's queue so the
 	// multi-device silence assertions below are payload-clean.
-	alice.waitForPresence(t, charlieID, "online")
+	alice.waitForPresence(t, charlieID, "active")
 	alice.send(t, ctx, map[string]any{"type": "typing", "dm_space_id": opened.ID, "state": "start"})
 	ev := bob2.waitFor(t, "typing.started")
 	var tp struct {
@@ -329,5 +325,70 @@ func TestDMTypingAndPresence(t *testing.T) {
 	_ = bob1.conn.CloseNow()
 	alice.expectSilence(t, "presence.changed", 700*time.Millisecond)
 	_ = bob2.conn.CloseNow()
+	alice.waitForPresence(t, bobID, "offline")
+}
+
+// TestIdlePresence: P-05 — a connected-but-silent user demotes active→idle
+// after IdleAfter (shrunk to 50ms; the sweep is bounded-polled, never slept),
+// any inbound frame promotes them back to active, and disconnect is offline.
+func TestIdlePresence(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	// Shrink the idle threshold BEFORE Run so the sweep ticker picks it up;
+	// the test then polls for transitions rather than sleeping a fixed time.
+	hub.IdleAfter = 50 * time.Millisecond
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "idl", "email": "a@idl.test", "password": "password123",
+		"full_name": "Alice",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@idl.test", "Bob", "bobidltok")
+	var bobID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM user_account WHERE email = 'bob@idl.test'`).Scan(&bobID); err != nil {
+		t.Fatalf("bob id: %v", err)
+	}
+
+	// alice observes; bob is the subject. Bob comes online active.
+	alice := dialClient(t, ctx, ts.URL, boot.Token)
+	defer alice.conn.CloseNow()
+	alice.waitFor(t, "ready")
+	bob := dialClient(t, ctx, ts.URL, bobTok)
+	alice.waitForPresence(t, bobID, "active")
+
+	// Silent past IdleAfter → the sweep demotes bob to idle.
+	alice.waitForPresence(t, bobID, "idle")
+
+	// Any inbound frame (the explicit keepalive) promotes bob back to active.
+	bob.send(t, ctx, map[string]any{"type": "active"})
+	alice.waitForPresence(t, bobID, "active")
+
+	// Disconnect → offline.
+	_ = bob.conn.CloseNow()
 	alice.waitForPresence(t, bobID, "offline")
 }

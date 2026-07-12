@@ -63,14 +63,20 @@ type Hub struct {
 	// (nil = signal ignored), set via SetMarkReader at wiring time.
 	markReader MarkReader
 
+	// IdleAfter is how long a connected user may be silent before presence
+	// demotes active→idle (P-05). Exported so tests shrink it; default 10min.
+	IdleAfter time.Duration
+
 	mu    sync.Mutex
 	conns map[int64]map[*client]struct{} // orgID → clients
-	// Live connection counts per user (presence is derived, per-process).
-	userConns map[int64]map[int64]int
+	// Per-user derived presence (connection count + last activity + idle
+	// flag); per-process, never stored (the UNLOGGED presence table is unused).
+	userConns map[int64]map[int64]*userPresence
 }
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
-	return &Hub{pool: pool, log: log, conns: map[int64]map[*client]struct{}{}}
+	return &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
+		conns: map[int64]map[*client]struct{}{}}
 }
 
 // SetMarkReader wires the durable read-state service (rest layer adapts
@@ -81,6 +87,7 @@ func (h *Hub) SetMarkReader(m MarkReader) { h.markReader = m }
 // connections; a slow sweep covers missed notifications. Blocks until ctx ends.
 func (h *Hub) Run(ctx context.Context) {
 	go h.sweep(ctx)
+	go h.presenceSweep(ctx)
 	for ctx.Err() == nil {
 		if err := h.listenLoop(ctx); err != nil && ctx.Err() == nil {
 			h.log.Warn("gateway: listen loop restarting", "err", err)
@@ -177,10 +184,10 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		h.conns[id.OrgID] = map[*client]struct{}{}
 	}
 	h.conns[id.OrgID][c] = struct{}{}
-	cameOnline := h.trackConnect(id.OrgID, id.UserID)
+	announce := h.trackConnect(id.OrgID, id.UserID, time.Now())
 	h.mu.Unlock()
-	if cameOnline {
-		h.broadcastPresence(ctx, id.OrgID, id.UserID, "online")
+	if announce {
+		h.broadcastPresence(ctx, id.OrgID, id.UserID, "active")
 	}
 	defer func() {
 		h.mu.Lock()
