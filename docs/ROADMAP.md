@@ -286,59 +286,62 @@ a leaked link cannot cross orgs.
 → 401; tampered → 401; foreign-org sig → 404), config-missing error,
 fs-suite regression green.
 
-### P-08 `dm: Group conversation management.` — M
+### P-08 `dm: Group-DM leave.` — M — RE-DESIGNED 2026-07-12 (audit)
+**Audit correction:** dm_key = join(sorted ids, ":") is the canonical
+MEMBERSHIP IDENTITY, shared verbatim by dm.Open create-or-get AND the
+importer's huddle path. So "add a participant to an existing group keeping
+history" fights the data model — changing the set changes the conversation's
+identity. The old add/remove-with-rekey spec is WITHDRAWN.
 **Design (decided):**
-- Group DMs (kind 2) gain `POST /api/v1/dms/{id}/participants`
-  {user_ids} (add) and `DELETE /api/v1/dms/{id}/participants/{userID}`
-  (remove SELF only — leaving; nobody removes others, Slack model).
-  1:1 and self conversations: 400 (immutable participant sets — a 1:1
-  plus one = a NEW group conversation; clients call POST /dms with the
-  three ids).
-- CRITICAL consistency rule: dm_space.dm_key is the canonical sorted
-  participant set. Changing participants MUST recompute and update
-  dm_key in the same tx. If the new key collides with an EXISTING
-  conversation (unique index) → 409 "a conversation with these people
-  already exists" (do not merge histories — Slack behavior).
-- Adders must be participants; added users must be live org members
-  (guest rule: a GUEST may only be added by someone sharing a channel
-  with them; a guest ADDER may only add people from their channels —
-  reuse the P-5 reach predicate from dm.Open).
-- History visibility: joiners see FULL history (dm participation is the
-  permission — document that this is the Slack-group-DM model, not
-  channels' history_from).
-- Events: `dm.participants_changed` with user_ids (the gateway filter
-  already refreshes DM views on dm.opened; extend the filter's refresh
-  trigger to this verb for affected users — read gateway.go filter
-  first).
-- Cap: 9 participants (Slack parity), 400 beyond.
-**Tests:** add → new member reads history + sends; leave → 404 on read
-after; dm_key recompute asserted; collision 409; guest reach matrix;
-cap; non-participant adder 404.
+- "Adding people" is NOT a mutation: it is opening the conversation for the
+  new set via the existing `POST /dms` create-or-get (Slack's "this starts a
+  new conversation"). No add endpoint. Document that clients call POST /dms
+  with the enlarged id set; the existing guest-reach gate already applies.
+- The ONE new operation is LEAVE: `DELETE /api/v1/dms/{id}/participants/me`.
+  Migration 0013 adds `left_at TIMESTAMPTZ` to dm_participant. Leaving sets
+  left_at (a SOFT leave) — the row STAYS so dm_key remains canonical and
+  create-or-get for the original set still resolves. The leaver is filtered
+  from dm.List (WHERE left_at IS NULL), excluded from gateway loadDMs, and
+  gets 404 on read/send (requireParticipant treats left_at IS NOT NULL as
+  not-a-participant). Re-opening the same set via POST /dms clears left_at
+  (rejoin). Group (kind 2) only; 1:1/self → 400 "cannot leave a direct
+  conversation".
+- Event `dm.participants_changed` {dm_space_id, user_ids:[leaver]}; the
+  gateway filter refreshes the leaver like dm.opened (read gateway.go filter).
+**Invariants preserved:** dm_key never re-keyed (no collision case); importer
+untouched; participation-is-permission unchanged for remaining members.
+**Tests:** leave hides from the leaver's list + 404s their read/send; other
+participants still see it; fan-out skips the leaver; rejoin clears left_at;
+1:1 leave 400; dm_key row unchanged after leave.
 
-### P-09 `messaging: Channel folders and default channels.` — M
-Wakes `channel_folder`, `default_channel`, `sidebar_section` (0003).
-**Design (decided):** SPLIT — this slice ships folders + defaults;
-sidebar_section (personal ordering) is P-14.
-- Folders: org-level named groups of channels for the directory/sidebar.
-  `POST/GET/PATCH/DELETE /api/v1/channel-folders` (name 1..60 unique per
-  org live, soft delete? — decided: hard delete, folders are pure
-  organization; channels in a deleted folder get folder_id NULL) gated
-  `manage_org`. `PATCH /api/v1/channels/{id}` gains `folder_id`
-  (administer_channel, validated org-local + live folder).
-  ListChannels response gains folder_id. Event-logged
-  (`folder.created/updated/deleted`, `channel.updated` carries folder).
-- Default channels: `PUT /api/v1/default-channels` {channel_ids}
-  replace-set (manage_org; ≤20; public live channels only — 400 for
-  private: defaults must be joinable) + GET. CONSUMER (the honest-rungs
-  requirement): invite acceptance auto-joins the org's default channels
-  IN ADDITION to the invite's explicit channels (dedup; guests do NOT
-  get defaults — their channels are exactly the invite's enumeration,
-  P-5). Bootstrap seeds #general as a default.
-**Tests:** folder CRUD + channel assignment + list surfacing; default-set
-validation (private 400); invite accept lands member in defaults ∪
-explicit; guest gets explicit only; bootstrap seed asserted.
+### P-09 `messaging: Channel folders and default channels.` — M — RE-DESIGNED 2026-07-12 (audit)
+**Audit correction:** the schema is WORKSPACE-scoped, not org-flat:
+channel_folder(org_id, workspace_id nullable, name, position) and
+default_channel PK(workspace_id, channel_id) + `bundle` (C-3
+DefaultChannelGroup). Weft seeds one workspace/org at bootstrap and has no
+workspace-selection API yet (org-hierarchy UX is Tier-2). Two honest-rung
+reductions, both documented in the PR:
+**Design (decided):**
+- Resolve "the workspace" server-side as the org's bootstrap workspace for
+  v1; the API stays workspace-implicit. Org-hierarchy later threads
+  workspace_id through.
+- Folders: `POST/GET/PATCH/DELETE /api/v1/channel-folders` (name 1..60,
+  position; workspace = resolved; manage_org; HARD delete → member channels'
+  folder_id NULL). `PATCH /channels/{id}` gains folder_id (administer_channel;
+  folder must be same-workspace + live). ListChannels surfaces folder_id.
+  Events folder.created/updated/deleted.
+- Defaults: `PUT/GET /api/v1/default-channels` {channel_ids} replace-set into
+  default_channel with **bundle=NULL** (the "always" bundle; the C-3 bundle
+  concept stays DORMANT — documented reduction). manage_org; <=20; PUBLIC live
+  channels only (private → 400). CONSUMER (honest-rungs): invite-accept
+  auto-joins the resolved workspace's default channels (bundle IS NULL) IN
+  ADDITION to the invite's explicit channels (dedup); GUESTS get explicit only
+  (P-5). Bootstrap seeds #general as a default.
+**Tests:** folder CRUD + assignment + list; default-set validation (private
+400); invite accept = defaults ∪ explicit; guest gets explicit only; bootstrap
+seed asserted.
 
-### P-10 `search: Query operators.` — M
+### P-10 `search: Query operators.` — M — **[x] shipped #63** (most pre-existed; #63 added has:attachment, has:image, is:dm, from:<id>)
 **Design (decided):**
 - Extend `GET /api/v1/search` q parsing with operators:
   `from:<user-id-or-@**Name**>`, `in:<channel-id-or-name>`, `has:link`,
