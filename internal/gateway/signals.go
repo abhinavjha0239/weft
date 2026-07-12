@@ -17,6 +17,7 @@ import (
 //   {"type":"typing","channel_id":N,"state":"start"|"stop"}
 //   {"type":"typing","dm_space_id":N,"state":"start"|"stop"}
 //   {"type":"read_marker","thread_id":N,"up_to":N}
+//   {"type":"active"}  // liveness keepalive (P-05), throttled client-side
 //
 // Fan-out:
 //   typing      → org connections whose membership view contains the scope
@@ -25,8 +26,10 @@ import (
 //   read_marker → durable MarkRead, then readstate.synced to the SAME USER's
 //                 other connections (multi-device sync)
 //
-// Presence (online/offline) also lives on this plane but is server-derived
-// from the connection registry — see presence.go.
+// Presence (active/idle/offline) also lives on this plane but is server-
+// derived from the connection registry + last-activity time — see presence.go.
+// EVERY inbound frame counts as activity (P-05), promoting an idle user back
+// to active.
 
 // MarkReader is the durable read-state dependency (implemented by
 // messaging.Service); an interface keeps gateway free of a domain import.
@@ -62,11 +65,16 @@ func (h *Hub) handleClientFrame(ctx context.Context, c *client, data []byte) {
 		h.sendEphemeral(ctx, c, "error", map[string]any{"message": "malformed frame"})
 		return
 	}
+	// Any well-formed inbound frame is a liveness signal (P-05): refresh the
+	// user's activity and promote them from idle before dispatching the frame.
+	h.recordActivity(ctx, c)
 	switch f.Type {
 	case "typing":
 		h.handleTyping(ctx, c, f)
 	case "read_marker":
 		h.handleReadMarker(ctx, c, f)
+	case "active":
+		// A pure keepalive: its only effect is the activity recorded above.
 	default:
 		h.sendEphemeral(ctx, c, "error", map[string]any{"message": "unknown frame type"})
 	}
