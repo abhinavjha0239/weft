@@ -312,8 +312,11 @@ func (h *Hub) pump(ctx context.Context, c *client) error {
 // filter applies the read ACL: channel-scoped events require membership,
 // DM-scoped events require participation, container-less events (spaces)
 // deliver org-wide. Events about this user's own membership trigger a view
-// refresh; dm.opened decides from its participant list because the invited
-// side's view predates the new conversation.
+// refresh. dm.opened and dm.participants_changed decide from their user_ids
+// list rather than current participation: dm.opened reaches the invited side
+// whose view predates the new conversation, and dm.participants_changed
+// reaches the leaver whose view must now drop it (their dm_participant row is
+// already gone, so a participation check would wrongly withhold it).
 func (c *client) filter(verb string, payload json.RawMessage) (deliver, refresh bool) {
 	var p struct {
 		ChannelID int64   `json:"channel_id"`
@@ -325,7 +328,7 @@ func (c *client) filter(verb string, payload json.RawMessage) (deliver, refresh 
 	if (verb == "member.joined" || verb == "member.left") && p.UserID == c.id.UserID {
 		refresh = true
 	}
-	if verb == "dm.opened" {
+	if verb == "dm.opened" || verb == "dm.participants_changed" {
 		for _, uid := range p.UserIDs {
 			if uid == c.id.UserID {
 				return true, true

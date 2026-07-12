@@ -2,6 +2,7 @@ package rest
 
 import (
 	"net/http"
+	"strconv"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
@@ -35,4 +36,20 @@ func (a *api) handleListDMs(w http.ResponseWriter, r *http.Request, id auth.Iden
 		dms = []dm.Summary{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"dms": dms})
+}
+
+// handleLeaveDM removes the caller from a group DM: DELETE
+// /dms/{id}/participants/me. Only the literal "me" form exists — there is no
+// remove-other endpoint. See dm.Leave for the hard-delete + rejoin semantics.
+func (a *api) handleLeaveDM(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	dmSpaceID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad conversation id")
+		return
+	}
+	if err := a.DM.Leave(r.Context(), id, dmSpaceID); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }

@@ -128,6 +128,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/unreads", a.withAuth(a.handleUnreads))
 	mux.HandleFunc("POST /api/v1/dms", a.withAuth(a.handleOpenDM))
 	mux.HandleFunc("GET /api/v1/dms", a.withAuth(a.handleListDMs))
+	mux.HandleFunc("DELETE /api/v1/dms/{id}/participants/me", a.withAuth(a.handleLeaveDM))
 	mux.HandleFunc("GET /api/v1/search", a.withAuth(a.handleSearch))
 	mux.HandleFunc("GET /api/v1/me", a.withAuth(a.handleMe))
 	mux.HandleFunc("GET /api/v1/users", a.withAuth(a.handleListUsers))
