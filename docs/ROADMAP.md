@@ -99,7 +99,7 @@ half — this spec required DM/space pins but the `pin` table is
 `channel_id NOT NULL` (channel-only). Saved items shipped alone; pins
 re-specced below as P-02b.
 
-### P-02b `messaging: Channel pins.` — S
+### P-02b `messaging: Channel pins.` — S — **[x] shipped #57**
 Pins, re-specced to MATCH the 0004 schema: channel messages only.
 **Design (decided):**
 - `PUT/DELETE /api/v1/messages/{id}/pin` — CHANNEL messages only
@@ -153,7 +153,7 @@ quote truncation; attachment not re-referenced (no new file_reference
 row); forwarded_from surfaced.
 **Performance:** one tx, two gates, one insert — same cost as a send.
 
-### P-04 `messaging: Move a message between threads.` — M
+### P-04 `messaging: Move a message between threads.` — M — **[x] shipped #58**
 Revision kind 3 (`prev_thread_id`) wakes — Zulip's "move message".
 **Design (decided):**
 - `POST /api/v1/messages/{id}/move` {thread_id} — target thread must be
@@ -182,7 +182,7 @@ decided: acceptable v1, note in PR (Zulip has the same wrinkle).
 cross-channel 400; DM 400; root-message 400; counters on both threads
 asserted; revision row (kind 3, prev_thread_id) asserted; event payload.
 
-### P-05 `gateway: Idle and away presence.` — M
+### P-05 `gateway: Idle and away presence.` — M — **[x] shipped #59**
 Presence currently binary (online on first socket, offline on last).
 **Design (decided):**
 - States: 1 active, 2 idle, 3 offline (matches the presence table
@@ -216,7 +216,7 @@ bounded polling, no fixed sleeps); activity frame promotes back;
 disconnect → offline.
 **Performance:** one ticker per hub, O(connections) sweep per minute.
 
-### P-06 `files: Avatars and custom emoji.` — L
+### P-06 `files: Avatars and custom emoji.` — L — **[x] shipped #60**
 `user_account.avatar_file_id` and `custom_emoji` (0004/0006 FKs) wake.
 **Design (decided):**
 - `PUT /api/v1/me/avatar` — multipart "file", image-only allowlist BY
@@ -256,7 +256,7 @@ avatar round trip incl. guest visibility, clear→GC-eligible (backdate +
 sweep proves the pointer-clear lifecycle), emoji name rules/409/soft
 delete/list, reaction with custom emoji name renders in aggregates.
 
-### P-07 `blob: S3 driver and signed download URLs.` — M
+### P-07 `blob: S3 driver and signed download URLs.` — M — **[x] shipped #61**
 **Design (decided):**
 - S3 driver implements the existing `blob.Store` verbatim (Put/Open/
   Delete) using the AWS SDK v2 (`aws-sdk-go-v2` — the ONE new dependency;
