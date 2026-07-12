@@ -186,6 +186,12 @@ func (s *Service) DeleteMessage(ctx context.Context, actor auth.Identity, msgID 
 			WHERE id = $1`, msgID); err != nil {
 			return apperr.Internal("scrub", err)
 		}
+		// Drop any channel pins for this message in the SAME tx (P-02b): a
+		// deleted message is already filtered from the pin list, and clearing
+		// the row keeps the per-channel cap honest.
+		if _, err := tx.Exec(ctx, `DELETE FROM pin WHERE message_id = $1`, msgID); err != nil {
+			return apperr.Internal("clear pins", err)
+		}
 		if _, err := tx.Exec(ctx, `
 			UPDATE thread SET message_count = GREATEST(message_count - 1, 0)
 			WHERE id = $1 AND kind = 1`, m.threadID); err != nil {
