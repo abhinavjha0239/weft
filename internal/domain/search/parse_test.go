@@ -47,6 +47,58 @@ func TestParseFallthroughAndPhrases(t *testing.T) {
 	}
 }
 
+func TestParseMoreOperators(t *testing.T) {
+	q := Parse(`report has:attachment has:image is:dm from:42`)
+	if q.Text != "report" {
+		t.Fatalf("text = %q", q.Text)
+	}
+	if !q.HasAttachment {
+		t.Fatal("has:attachment not set")
+	}
+	if !q.HasImage {
+		t.Fatal("has:image not set")
+	}
+	if !q.IsDM {
+		t.Fatal("is:dm not set")
+	}
+	if q.FromID != 42 || q.From != "" {
+		t.Fatalf("from:42 should set FromID=42 not From: FromID=%d From=%q", q.FromID, q.From)
+	}
+
+	// A non-numeric from: value stays name/email resolution, never an id.
+	nq := Parse("from:bob@x.test")
+	if nq.From != "bob@x.test" || nq.FromID != 0 {
+		t.Fatalf("from:bob@x.test wrong: From=%q FromID=%d", nq.From, nq.FromID)
+	}
+
+	// A digit string that overflows int64 is not a real id: fall back to
+	// name/email resolution (which will simply match nothing) rather than
+	// silently coercing it to a bogus id.
+	oq := Parse("from:99999999999999999999999999")
+	if oq.FromID != 0 || oq.From != "99999999999999999999999999" {
+		t.Fatalf("overflow from: wrong: From=%q FromID=%d", oq.From, oq.FromID)
+	}
+
+	// A filters-only query with just has:image is a valid (non-empty) search.
+	if Parse("has:image").Empty() {
+		t.Fatal("has:image alone should not be Empty")
+	}
+	if Parse("from:7").Empty() {
+		t.Fatal("from:<id> alone should not be Empty")
+	}
+
+	// Unknown has:/is: values are literal text, never operators (no error path).
+	fq := Parse("has:frobnicate is:wibble")
+	if fq.HasLink || fq.HasAttachment || fq.HasImage || fq.IsDM || fq.Resolved != nil {
+		t.Fatalf("unknown has:/is: values must set no filter: %+v", fq)
+	}
+	for _, want := range []string{"has:frobnicate", "is:wibble"} {
+		if !strings.Contains(fq.Text, want) {
+			t.Fatalf("text %q missing literal %q", fq.Text, want)
+		}
+	}
+}
+
 func TestParseUnresolvedAndEmpty(t *testing.T) {
 	if r := Parse("is:unresolved").Resolved; r == nil || *r {
 		t.Fatal("is:unresolved should set Resolved=false")

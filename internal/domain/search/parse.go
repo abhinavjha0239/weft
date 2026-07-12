@@ -7,6 +7,7 @@
 package search
 
 import (
+	"strconv"
 	"strings"
 	"time"
 )
@@ -16,19 +17,24 @@ import (
 // text, so `foo:bar` a user didn't intend as an operator still searches
 // literally rather than erroring.
 type Query struct {
-	Text      string // free text (quotes preserved for phrase search)
-	From      string // from: author full-name or email
-	InChannel string // in: channel name
-	HasLink   bool   // has:link
-	Resolved  *bool  // is:resolved / is:unresolved
-	After     *time.Time
-	Before    *time.Time
+	Text          string // free text (quotes preserved for phrase search)
+	From          string // from: author full-name or email
+	FromID        int64  // from: bare author id (mutually exclusive with From)
+	InChannel     string // in: channel name
+	HasLink       bool   // has:link
+	HasAttachment bool   // has:attachment
+	HasImage      bool   // has:image
+	IsDM          bool   // is:dm
+	Resolved      *bool  // is:resolved / is:unresolved
+	After         *time.Time
+	Before        *time.Time
 }
 
 // Empty reports whether the query has no criteria at all.
 func (q Query) Empty() bool {
-	return q.Text == "" && q.From == "" && q.InChannel == "" &&
-		!q.HasLink && q.Resolved == nil && q.After == nil && q.Before == nil
+	return q.Text == "" && q.From == "" && q.FromID == 0 && q.InChannel == "" &&
+		!q.HasLink && !q.HasAttachment && !q.HasImage && !q.IsDM &&
+		q.Resolved == nil && q.After == nil && q.Before == nil
 }
 
 var knownOps = map[string]bool{
@@ -52,8 +58,12 @@ func Parse(raw string) Query {
 		v := stripQuotes(val)
 		switch key {
 		case "from":
+			// A bare all-digits value is an author id; anything else is a
+			// name/email (no @**Name** mention syntax in this subset).
 			if v == "" {
 				keep(tok)
+			} else if id, ok := parseID(v); ok {
+				q.FromID = id
 			} else {
 				q.From = v
 			}
@@ -64,9 +74,14 @@ func Parse(raw string) Query {
 				q.InChannel = strings.TrimPrefix(v, "#")
 			}
 		case "has":
-			if v == "link" {
+			switch v {
+			case "link":
 				q.HasLink = true
-			} else {
+			case "attachment":
+				q.HasAttachment = true
+			case "image":
+				q.HasImage = true
+			default:
 				keep(tok)
 			}
 		case "is":
@@ -77,6 +92,8 @@ func Parse(raw string) Query {
 			case "unresolved":
 				f := false
 				q.Resolved = &f
+			case "dm":
+				q.IsDM = true
 			default:
 				keep(tok)
 			}
@@ -137,6 +154,25 @@ func splitOp(tok string) (key, val string, ok bool) {
 		return "", "", false
 	}
 	return strings.ToLower(key), tok[i+1:], true
+}
+
+// parseID reports whether s is a bare, non-negative decimal integer (an
+// author id) that fits in int64. A leading sign, non-digits, or overflow all
+// mean "not an id" — the caller then treats the value as a name/email.
+func parseID(s string) (int64, bool) {
+	if s == "" {
+		return 0, false
+	}
+	for _, r := range s {
+		if r < '0' || r > '9' {
+			return 0, false
+		}
+	}
+	id, err := strconv.ParseInt(s, 10, 64)
+	if err != nil {
+		return 0, false
+	}
+	return id, true
 }
 
 func stripQuotes(s string) string {

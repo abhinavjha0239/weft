@@ -42,7 +42,7 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	}
 	q := Parse(raw)
 	if q.Empty() {
-		return nil, apperr.Invalid("empty search: provide text or a filter (from:, in:, has:link, is:resolved, before:, after:)")
+		return nil, apperr.Invalid("empty search: provide text or a filter (from:, in:, has:link, has:attachment, has:image, is:resolved, is:dm, before:, after:)")
 	}
 
 	var args []any
@@ -91,6 +91,9 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	if hasText {
 		sb.WriteString("AND m.search_tsv @@ qq ")
 	}
+	if q.FromID != 0 {
+		sb.WriteString("AND m.author_id = " + add(q.FromID) + " ")
+	}
 	if q.From != "" {
 		fromP := add(q.From)
 		sb.WriteString("AND m.author_id IN (SELECT id FROM user_account WHERE org_id = " + orgP +
@@ -102,6 +105,19 @@ func (s *Service) Search(ctx context.Context, actor auth.Identity, raw string, l
 	}
 	if q.HasLink {
 		sb.WriteString("AND m.has_link ")
+	}
+	if q.HasAttachment {
+		sb.WriteString("AND m.has_attachment ")
+	}
+	if q.HasImage {
+		sb.WriteString("AND m.has_image ")
+	}
+	// is:dm is ANDed onto the read ACL above, never replacing it: for a DM
+	// message (channel_id NULL) the visibility OR reduces to the
+	// dm_participant EXISTS check, so a caller only sees DM hits from their
+	// own conversations.
+	if q.IsDM {
+		sb.WriteString("AND m.dm_space_id IS NOT NULL ")
 	}
 	if q.Resolved != nil {
 		if *q.Resolved {
