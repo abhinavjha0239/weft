@@ -17,6 +17,12 @@ type Config struct {
 	// any mounted volume; s3/gcs/azure are drop-in Store implementations.
 	BlobDriver string
 	BlobDir    string
+	// S3 driver (P-07, when BlobDriver=s3). Credentials come from the AWS SDK
+	// default chain, never these keys. Endpoint/Prefix are optional (MinIO/R2).
+	S3Bucket   string
+	S3Region   string
+	S3Endpoint string
+	S3Prefix   string
 	// GC windows (days). Unclaimed: never-referenced uploads (Zulip ships
 	// 5 weeks — drafts hold uploads silently). DeadRef: files whose last
 	// referencing message was deleted (Zulip's 30-day vacuum delay).
@@ -28,6 +34,9 @@ type Config struct {
 	SMTPFrom   string
 	SMTPUser   string
 	SMTPPass   string
+	// SigningSecret keys signed download links (P-07). Empty = link minting
+	// refuses with a clear config error; the feature is opt-in per operator.
+	SigningSecret string
 }
 
 func Load() (Config, error) {
@@ -40,8 +49,13 @@ func Load() (Config, error) {
 	if c.BlobDir == "" {
 		c.BlobDir = "./data/blobs"
 	}
+	c.S3Bucket = os.Getenv(brand.EnvPrefix + "S3_BUCKET")
+	c.S3Region = os.Getenv(brand.EnvPrefix + "S3_REGION")
+	c.S3Endpoint = os.Getenv(brand.EnvPrefix + "S3_ENDPOINT")
+	c.S3Prefix = os.Getenv(brand.EnvPrefix + "S3_PREFIX")
 	c.GCUnclaimedDays = envDays("GC_UNCLAIMED_DAYS", 35)
 	c.GCDeadRefDays = envDays("GC_DEAD_REF_DAYS", 30)
+	c.SigningSecret = os.Getenv(brand.EnvPrefix + "SIGNING_SECRET")
 	c.MailDriver = os.Getenv(brand.EnvPrefix + "MAIL_DRIVER")
 	c.SMTPAddr = os.Getenv(brand.EnvPrefix + "SMTP_ADDR")
 	c.SMTPFrom = os.Getenv(brand.EnvPrefix + "SMTP_FROM")
