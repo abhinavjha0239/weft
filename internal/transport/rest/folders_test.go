@@ -15,6 +15,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
 
@@ -230,4 +231,150 @@ func channelFolderID(t *testing.T, baseURL, token string, channelID int64) *int6
 	}
 	t.Fatalf("channel %d not in list", channelID)
 	return nil
+}
+
+// TestDefaultChannelsOnInvite proves P-09's consumer: bootstrap seeds #general
+// as a default channel, a new MEMBER auto-joins the workspace's default
+// channels (deduped against the invite's explicit list) on accept, and a GUEST
+// gets ONLY the invite's explicit channels — never the defaults (P-5).
+func TestDefaultChannelsOnInvite(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "cons", "email": "alice@c.test", "password": "password123",
+		"full_name": "Alice Admin",
+	}, &boot)
+
+	// Bootstrap seeds #general as the workspace's default channel.
+	defURL := ts.URL + "/api/v1/default-channels"
+	var dc struct {
+		ChannelIDs []int64 `json:"channel_ids"`
+	}
+	getJSON(t, defURL, boot.Token, &dc)
+	if len(dc.ChannelIDs) != 1 || dc.ChannelIDs[0] != boot.ChannelID {
+		t.Fatalf("bootstrap default channels = %+v, want [#general %d]", dc.ChannelIDs, boot.ChannelID)
+	}
+
+	// Two more public channels; make {#general, eng} the defaults.
+	var eng, random struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "eng"}, &eng)
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "random"}, &random)
+	if code := putJSON(t, defURL, boot.Token,
+		map[string]any{"channel_ids": []int64{boot.ChannelID, eng.ChannelID}}); code != http.StatusOK {
+		t.Fatalf("set defaults = %d, want 200", code)
+	}
+
+	// A member invite whose explicit channels OVERLAP the defaults (eng) and
+	// add a non-default (random). Accept lands in the union, deduped.
+	var inv identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+		"channel_ids": []int64{eng.ChannelID, random.ChannelID}}, &inv)
+	var carol identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": inv.Token, "email": "carol@c.test", "password": "password123",
+		"full_name": "Carol Member"}, &carol)
+	// The result payload surfaces only the invite's explicit channels.
+	if len(carol.ChannelIDs) != 2 {
+		t.Fatalf("member result channels = %+v, want the 2 explicit", carol.ChannelIDs)
+	}
+	// Actual membership is the union {#general, eng, random}: #general came from
+	// the defaults (not in the invite), random from the invite (not a default),
+	// eng from both.
+	got := memberChannels(t, ctx, pool, carol.UserID)
+	want := map[int64]bool{boot.ChannelID: true, eng.ChannelID: true, random.ChannelID: true}
+	if !sameInt64Set(got, want) {
+		t.Fatalf("member channels = %v, want {general, eng, random} %v", got, want)
+	}
+	// Dedup: eng (explicit AND default) produced exactly one member.joined.
+	if n := memberJoinedCount(t, ctx, pool, carol.UserID, eng.ChannelID); n != 1 {
+		t.Fatalf("member.joined for the overlapping channel = %d, want exactly 1 (deduped)", n)
+	}
+
+	// A guest invite (guests must enumerate channels) gets ONLY its explicit
+	// channel — never the defaults (P-5).
+	var ginv identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+		"role": 50, "channel_ids": []int64{random.ChannelID}}, &ginv)
+	var gina identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": ginv.Token, "email": "gina@c.test", "password": "password123",
+		"full_name": "Gina Guest"}, &gina)
+	if g := memberChannels(t, ctx, pool, gina.UserID); !sameInt64Set(g, map[int64]bool{random.ChannelID: true}) {
+		t.Fatalf("guest channels = %v, want {random} only (no defaults)", g)
+	}
+}
+
+func memberChannels(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID int64) map[int64]bool {
+	t.Helper()
+	rows, err := pool.Query(ctx,
+		`SELECT channel_id FROM channel_member WHERE user_id = $1 AND unsubscribed_at IS NULL`, userID)
+	if err != nil {
+		t.Fatalf("member channels: %v", err)
+	}
+	defer rows.Close()
+	out := map[int64]bool{}
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan channel: %v", err)
+		}
+		out[id] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("rows: %v", err)
+	}
+	return out
+}
+
+func memberJoinedCount(t *testing.T, ctx context.Context, pool *pgxpool.Pool, userID, channelID int64) int {
+	t.Helper()
+	var n int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM event_log
+		WHERE verb = 'member.joined' AND actor_id = $1
+		  AND entity_type = $2 AND entity_id = $3`,
+		userID, int16(enum.EntityChannel), channelID).Scan(&n); err != nil {
+		t.Fatalf("event count: %v", err)
+	}
+	return n
+}
+
+func sameInt64Set(a, b map[int64]bool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k := range a {
+		if !b[k] {
+			return false
+		}
+	}
+	return true
 }
