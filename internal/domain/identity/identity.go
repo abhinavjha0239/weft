@@ -161,6 +161,9 @@ type Profile struct {
 	// when unset or lapsed. A LEFT JOIN with the expiry filter supplies it.
 	StatusEmoji string `json:"emoji,omitempty"`
 	StatusText  string `json:"status_text,omitempty"`
+	// AvatarFileID is non-null when the user has an avatar (P-06); clients
+	// build the URL /api/v1/users/{id}/avatar from its presence.
+	AvatarFileID *int64 `json:"avatar_file_id,omitempty"`
 }
 
 type MyProfile struct {
@@ -210,7 +213,8 @@ func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT u.id, u.full_name, u.kind, u.deactivated_at IS NOT NULL,
-		       COALESCE(st.emoji, ''), COALESCE(st.status_text, '')
+		       COALESCE(st.emoji, ''), COALESCE(st.status_text, ''),
+		       u.avatar_file_id
 		FROM user_account u
 		LEFT JOIN user_status st ON st.user_id = u.id
 		  AND (st.expires_at IS NULL OR st.expires_at > now())
@@ -225,7 +229,7 @@ func (s *Service) Profiles(ctx context.Context, actor auth.Identity, ids []int64
 	for rows.Next() {
 		var p Profile
 		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated,
-			&p.StatusEmoji, &p.StatusText); err != nil {
+			&p.StatusEmoji, &p.StatusText, &p.AvatarFileID); err != nil {
 			return nil, apperr.Internal("scan profile", err)
 		}
 		out = append(out, p)
@@ -242,7 +246,8 @@ func (s *Service) Directory(ctx context.Context, actor auth.Identity, limit int)
 	}
 	rows, err := s.pool.Query(ctx, `
 		SELECT u.id, u.full_name, u.kind, false,
-		       COALESCE(st.emoji, ''), COALESCE(st.status_text, '')
+		       COALESCE(st.emoji, ''), COALESCE(st.status_text, ''),
+		       u.avatar_file_id
 		FROM user_account u
 		LEFT JOIN user_status st ON st.user_id = u.id
 		  AND (st.expires_at IS NULL OR st.expires_at > now())
@@ -258,7 +263,7 @@ func (s *Service) Directory(ctx context.Context, actor auth.Identity, limit int)
 	for rows.Next() {
 		var p Profile
 		if err := rows.Scan(&p.ID, &p.FullName, &p.Kind, &p.Deactivated,
-			&p.StatusEmoji, &p.StatusText); err != nil {
+			&p.StatusEmoji, &p.StatusText, &p.AvatarFileID); err != nil {
 			return nil, apperr.Internal("scan directory", err)
 		}
 		out = append(out, p)
