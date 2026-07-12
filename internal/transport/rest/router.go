@@ -128,7 +128,10 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PUT /api/v1/status", a.withAuth(a.handleSetStatus))
 	mux.HandleFunc("DELETE /api/v1/status", a.withAuth(a.handleClearStatus))
 	mux.HandleFunc("POST /api/v1/files", a.withAuth(a.handleUploadFile))
-	mux.HandleFunc("GET /api/v1/files/{id}", a.withAuth(a.handleDownloadFile))
+	// Download is NOT withAuth-wrapped: it self-authenticates the bearer path
+	// and leaves the signed-link path (?sig=) unauthenticated (P-07).
+	mux.HandleFunc("GET /api/v1/files/{id}", a.handleDownloadFile)
+	mux.HandleFunc("POST /api/v1/files/{id}/link", a.withAuth(a.handleSignLink))
 	mux.HandleFunc("PUT /api/v1/me/avatar", a.withAuth(a.handleSetAvatar))
 	mux.HandleFunc("DELETE /api/v1/me/avatar", a.withAuth(a.handleClearAvatar))
 	mux.HandleFunc("GET /api/v1/users/{id}/avatar", a.withAuth(a.handleGetAvatar))

@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"mime"
@@ -43,13 +44,39 @@ func (a *api) handleUploadFile(w http.ResponseWriter, r *http.Request, id auth.I
 	writeError(w, http.StatusBadRequest, `multipart part "file" required`)
 }
 
-// handleDownloadFile streams the blob. Always an attachment with nosniff:
-// serving user uploads inline is a stored-XSS vector (HTML/SVG); inline
-// rendering arrives with an allowlist later.
-func (a *api) handleDownloadFile(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+// handleDownloadFile streams a file by EITHER a bearer token (the F-12 union
+// ACL) OR a valid signed link (?sig=&exp=&org=) — the latter is what lets an
+// <img src> load without an Authorization header (P-07). This route is NOT
+// wrapped in withAuth: the handler authenticates the bearer path itself and
+// leaves the signed path unauthenticated (the signature IS the capability).
+// Always attachment + nosniff — serving arbitrary uploads inline is a
+// stored-XSS vector (avatars use a separate magic-validated inline path).
+func (a *api) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	fileID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, "bad file id")
+		return
+	}
+	if sig := r.URL.Query().Get("sig"); sig != "" {
+		orgID, _ := strconv.ParseInt(r.URL.Query().Get("org"), 10, 64)
+		meta, rc, err := a.Files.OpenSigned(r.Context(), fileID, orgID, sig, r.URL.Query().Get("exp"))
+		if err != nil {
+			writeDomainError(w, a.Log, r, err)
+			return
+		}
+		defer rc.Close()
+		a.streamFile(w, meta, rc)
+		return
+	}
+	// Bearer path (the pre-signed-link behavior): authenticate, apply the
+	// per-user limit, and enforce the union ACL.
+	id, err := auth.FromToken(r.Context(), a.Pool, auth.BearerToken(r))
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid or missing token")
+		return
+	}
+	if !a.apiLimit.Allow("u:" + itoa(id.UserID)) {
+		writeError(w, http.StatusTooManyRequests, "rate limit exceeded")
 		return
 	}
 	meta, rc, err := a.Files.OpenDownload(r.Context(), id, fileID)
@@ -58,6 +85,33 @@ func (a *api) handleDownloadFile(w http.ResponseWriter, r *http.Request, id auth
 		return
 	}
 	defer rc.Close()
+	a.streamFile(w, meta, rc)
+}
+
+// handleSignLink mints a signed capability URL for a file (POST
+// /files/{id}/link), running the SAME download ACL as a fetch. A server with
+// no signing secret configured is a clear 500 (operator misconfiguration, not
+// a sensitive detail).
+func (a *api) handleSignLink(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	fileID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad file id")
+		return
+	}
+	res, err := a.Files.SignedLink(r.Context(), id, fileID)
+	if errors.Is(err, files.ErrNoSigningSecret) {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
+}
+
+// streamFile writes the download response shared by both access paths.
+func (a *api) streamFile(w http.ResponseWriter, meta files.Meta, rc io.ReadCloser) {
 	w.Header().Set("Content-Type", meta.Mime)
 	w.Header().Set("Content-Length", fmt.Sprint(meta.Size))
 	w.Header().Set("X-Content-Type-Options", "nosniff")

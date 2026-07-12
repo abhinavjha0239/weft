@@ -33,6 +33,9 @@ const MaxUploadBytes = 25 << 20 // 25 MiB
 type Service struct {
 	pool  *pgxpool.Pool
 	store blob.Store
+	// signingSecret keys the HMAC for signed download links (P-07); empty
+	// until wired from config, in which case link minting refuses.
+	signingSecret string
 }
 
 func New(pool *pgxpool.Pool, store blob.Store) *Service {

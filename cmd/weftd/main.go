@@ -149,6 +149,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go automation.NewRunner(pool, msgSvc, log).Run(ctx)
 	go msgSvc.RunScheduledLoop(ctx, log)
 	filesSvc := files.New(pool, store)
+	filesSvc.SetSigningSecret(cfg.SigningSecret)
 	msgSvc.SetFiles(filesSvc)
 	complianceSvc := compliance.New(pool, permsSvc)
 	complianceSvc.SetLogger(log)
