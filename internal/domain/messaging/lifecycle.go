@@ -26,10 +26,14 @@ type UpdateChannelParams struct {
 	Name        *string
 	Description *string
 	Archived    *bool
+	// FolderIDSet distinguishes an absent folder_id (leave as-is) from an
+	// explicit one; when set, a nil FolderID clears the assignment (P-09).
+	FolderIDSet bool
+	FolderID    *int64
 }
 
 func (s *Service) UpdateChannel(ctx context.Context, actor auth.Identity, channelID int64, p UpdateChannelParams) error {
-	if p.Name == nil && p.Description == nil && p.Archived == nil {
+	if p.Name == nil && p.Description == nil && p.Archived == nil && !p.FolderIDSet {
 		return apperr.Invalid("nothing to update")
 	}
 	if p.Name != nil {
@@ -131,6 +135,39 @@ func (s *Service) UpdateChannel(ctx context.Context, actor auth.Identity, channe
 				}); err != nil {
 					return apperr.Internal("append event", err)
 				}
+			}
+		}
+
+		if p.FolderIDSet {
+			if p.FolderID != nil {
+				// The folder must be a live folder in the same (resolved)
+				// workspace — a foreign or cross-workspace folder is rejected.
+				resolvedWS, err := s.resolveWorkspace(ctx, tx, actor.OrgID)
+				if err != nil {
+					return err
+				}
+				var ok bool
+				if err := tx.QueryRow(ctx, `
+					SELECT EXISTS (SELECT 1 FROM channel_folder
+					 WHERE id = $1 AND org_id = $2 AND workspace_id = $3)`,
+					*p.FolderID, actor.OrgID, resolvedWS).Scan(&ok); err != nil {
+					return apperr.Internal("folder check", err)
+				}
+				if !ok {
+					return apperr.Invalid("folder not found in this workspace")
+				}
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE channel SET folder_id = $1 WHERE id = $2`,
+				p.FolderID, channelID); err != nil {
+				return apperr.Internal("assign folder", err)
+			}
+			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+				OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
+				EntityType: enum.EntityChannel, EntityID: channelID, Verb: "channel.updated",
+				Payload: eventlog.MustPayload(map[string]any{"channel_id": channelID}),
+			}); err != nil {
+				return apperr.Internal("append event", err)
 			}
 		}
 		return nil

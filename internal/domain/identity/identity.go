@@ -121,6 +121,13 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 			out.ChannelID, out.UserID); err != nil {
 			return apperr.Internal("join channel", err)
 		}
+		// P-09: #general is the workspace's default channel (the always-bundle),
+		// so every new member auto-joins it on invite accept.
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO default_channel (workspace_id, channel_id) VALUES ($1, $2)`,
+			out.WorkspaceID, out.ChannelID); err != nil {
+			return apperr.Internal("seed default channel", err)
+		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: out.OrgID, WorkspaceID: &out.WorkspaceID,
 			ActorKind: enum.ActorHuman, ActorID: &out.UserID,

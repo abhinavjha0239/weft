@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 
@@ -80,14 +81,30 @@ func (a *api) handleUpdateChannel(w http.ResponseWriter, r *http.Request, id aut
 		Name        *string `json:"name"`
 		Description *string `json:"description"`
 		Archived    *bool   `json:"archived"`
+		// FolderID is tri-state: absent = leave as-is, null = clear the
+		// assignment, a number = assign (P-09). json.RawMessage lets us tell
+		// "absent" from "null", which a plain *int64 cannot.
+		FolderID json.RawMessage `json:"folder_id"`
 	}
 	in, ok := decode[req](w, r)
 	if !ok {
 		return
 	}
-	if err := a.Messaging.UpdateChannel(r.Context(), id, channelID, messaging.UpdateChannelParams{
+	params := messaging.UpdateChannelParams{
 		Name: in.Name, Description: in.Description, Archived: in.Archived,
-	}); err != nil {
+	}
+	if in.FolderID != nil {
+		params.FolderIDSet = true
+		if string(in.FolderID) != "null" {
+			var fid int64
+			if err := json.Unmarshal(in.FolderID, &fid); err != nil {
+				writeError(w, http.StatusBadRequest, "bad folder_id")
+				return
+			}
+			params.FolderID = &fid
+		}
+	}
+	if err := a.Messaging.UpdateChannel(r.Context(), id, channelID, params); err != nil {
 		writeDomainError(w, a.Log, r, err)
 		return
 	}

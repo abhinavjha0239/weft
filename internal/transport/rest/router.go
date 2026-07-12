@@ -89,6 +89,13 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/channels/{id}", a.withAuth(a.handleUpdateChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/join", a.withAuth(a.handleJoinChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/leave", a.withAuth(a.handleLeaveChannel))
+	// P-09 channel folders + default channels (manage_org, workspace-implicit).
+	mux.HandleFunc("POST /api/v1/channel-folders", a.withAuth(a.handleCreateFolder))
+	mux.HandleFunc("GET /api/v1/channel-folders", a.withAuth(a.handleListFolders))
+	mux.HandleFunc("PATCH /api/v1/channel-folders/{id}", a.withAuth(a.handleUpdateFolder))
+	mux.HandleFunc("DELETE /api/v1/channel-folders/{id}", a.withAuth(a.handleDeleteFolder))
+	mux.HandleFunc("PUT /api/v1/default-channels", a.withAuth(a.handleSetDefaultChannels))
+	mux.HandleFunc("GET /api/v1/default-channels", a.withAuth(a.handleListDefaultChannels))
 	mux.HandleFunc("POST /api/v1/channels/{id}/messages", a.withAuth(a.handleSendMessage))
 	mux.HandleFunc("GET /api/v1/messages/{id}", a.withAuth(a.handleGetMessage))
 	mux.HandleFunc("PATCH /api/v1/messages/{id}", a.withAuth(a.handleEditMessage))

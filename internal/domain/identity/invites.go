@@ -220,6 +220,26 @@ type AcceptInviteResult struct {
 	Token      string  `json:"token"` // session
 }
 
+// joinChannelOnAccept adds a newly-provisioned user to a channel and emits the
+// member.joined event — the shared shape for both invite-explicit joins and
+// P-09 default-channel auto-joins.
+func joinChannelOnAccept(ctx context.Context, tx pgx.Tx, orgID, userID, channelID int64) error {
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO channel_member (channel_id, user_id)
+		VALUES ($1, $2) ON CONFLICT DO NOTHING`, channelID, userID); err != nil {
+		return apperr.Internal("join channel", err)
+	}
+	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+		OrgID: orgID, ActorKind: enum.ActorHuman, ActorID: &userID,
+		EntityType: enum.EntityChannel, EntityID: channelID, Verb: "member.joined",
+		Payload: eventlog.MustPayload(map[string]any{
+			"channel_id": channelID, "user_id": userID}),
+	}); err != nil {
+		return apperr.Internal("append event", err)
+	}
+	return nil
+}
+
 // AcceptInvite redeems a token into a new account + session. The token IS
 // the authorization: pre-join channels (private included) come from the
 // invite, and the new principal lands in role:members or, for guests,
@@ -297,19 +317,47 @@ func (s *Service) AcceptInvite(ctx context.Context, p AcceptInviteParams) (Accep
 		}
 		// Pre-join the invite's channels — the invite IS the authorization
 		// (private channels included, that's the point of inviting).
+		explicit := make(map[int64]bool, len(channelIDs))
 		for _, chID := range channelIDs {
-			if _, err := tx.Exec(ctx, `
-				INSERT INTO channel_member (channel_id, user_id)
-				VALUES ($1, $2) ON CONFLICT DO NOTHING`, chID, out.UserID); err != nil {
-				return apperr.Internal("join channel", err)
+			explicit[chID] = true
+			if err := joinChannelOnAccept(ctx, tx, orgID, out.UserID, chID); err != nil {
+				return err
 			}
-			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
-				OrgID: orgID, ActorKind: enum.ActorHuman, ActorID: &out.UserID,
-				EntityType: enum.EntityChannel, EntityID: chID, Verb: "member.joined",
-				Payload: eventlog.MustPayload(map[string]any{
-					"channel_id": chID, "user_id": out.UserID}),
-			}); err != nil {
-				return apperr.Internal("append event", err)
+		}
+		// P-09: a new MEMBER also auto-joins the workspace's default channels
+		// (the always-bundle, bundle IS NULL), deduped against the explicit
+		// list. A GUEST gets ONLY the invite's explicit channels (P-5). The
+		// workspace is the org's bootstrap workspace — the documented v1
+		// reduction shared with the messaging folder/default surface.
+		if role != RoleGuest {
+			drows, err := tx.Query(ctx, `
+				SELECT channel_id FROM default_channel
+				WHERE bundle IS NULL AND workspace_id = (
+					SELECT id FROM workspace WHERE org_id = $1 ORDER BY id LIMIT 1)
+				ORDER BY channel_id`, orgID)
+			if err != nil {
+				return apperr.Internal("default channels", err)
+			}
+			var defaults []int64
+			for drows.Next() {
+				var cid int64
+				if err := drows.Scan(&cid); err != nil {
+					drows.Close()
+					return apperr.Internal("scan default channel", err)
+				}
+				defaults = append(defaults, cid)
+			}
+			drows.Close()
+			if err := drows.Err(); err != nil {
+				return apperr.Internal("default channels", err)
+			}
+			for _, cid := range defaults {
+				if explicit[cid] {
+					continue
+				}
+				if err := joinChannelOnAccept(ctx, tx, orgID, out.UserID, cid); err != nil {
+					return err
+				}
 			}
 		}
 		if _, err := tx.Exec(ctx,
