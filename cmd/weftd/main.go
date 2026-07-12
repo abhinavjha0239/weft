@@ -78,6 +78,21 @@ func run(fn func(context.Context, config.Config) error) {
 }
 
 // importZulip: weftd import-zulip -org <slug> -dir <unpacked-export> [-dry-run]
+// openBlob picks the storage driver from config (P-07): s3 needs its own
+// multi-arg constructor (bucket/region/endpoint/prefix), everything else is
+// blob.Open's single data-directory dsn. Operators swap backends by env alone.
+func openBlob(ctx context.Context, cfg config.Config) (blob.Store, error) {
+	if cfg.BlobDriver == "s3" {
+		return blob.NewS3(ctx, blob.S3Config{
+			Bucket:   cfg.S3Bucket,
+			Region:   cfg.S3Region,
+			Endpoint: cfg.S3Endpoint,
+			Prefix:   cfg.S3Prefix,
+		})
+	}
+	return blob.Open(cfg.BlobDriver, cfg.BlobDir)
+}
+
 func importZulip(ctx context.Context, cfg config.Config) error {
 	fs := flag.NewFlagSet("import-zulip", flag.ExitOnError)
 	orgSlug := fs.String("org", "", "target org slug (must exist)")
@@ -95,7 +110,7 @@ func importZulip(ctx context.Context, cfg config.Config) error {
 	if err := db.Migrate(ctx, pool, migrations.FS); err != nil {
 		return err
 	}
-	store, err := blob.Open(cfg.BlobDriver, cfg.BlobDir)
+	store, err := openBlob(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -124,7 +139,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		return err
 	}
 
-	store, err := blob.Open(cfg.BlobDriver, cfg.BlobDir)
+	store, err := openBlob(ctx, cfg)
 	if err != nil {
 		return err
 	}

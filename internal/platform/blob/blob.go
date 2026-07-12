@@ -26,10 +26,13 @@ type Store interface {
 	Delete(ctx context.Context, key string) error
 }
 
-// Open constructs the configured driver.
+// Open constructs a single-argument driver from a dsn.
 //
 //	driver "fs": dsn is the data directory (bare metal / any mounted volume).
-//	driver "s3"|"gcs"|"azure": reserved — implement Store, add a case here.
+//	driver "s3": constructed via NewS3 instead — it needs bucket/region/etc.,
+//	             which the composition root passes from config (P-07).
+//	driver "gcs"|"azure": reserved — implement Store, add a case here or a
+//	             config-driven constructor like NewS3.
 func Open(driver, dsn string) (Store, error) {
 	switch driver {
 	case "", "fs":
@@ -37,6 +40,8 @@ func Open(driver, dsn string) (Store, error) {
 			return nil, fmt.Errorf("blob: fs driver needs a data directory")
 		}
 		return NewFS(dsn)
+	case "s3":
+		return nil, fmt.Errorf("blob: s3 driver is built via NewS3 (needs bucket and region)")
 	default:
 		return nil, fmt.Errorf("blob: unknown driver %q (implement blob.Store and register it here)", driver)
 	}
