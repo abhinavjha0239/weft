@@ -119,6 +119,17 @@ func (s *Service) Open(ctx context.Context, actor auth.Identity, userIDs []int64
 				out.ID).Scan(&out.RootThreadID); err != nil {
 				return apperr.Internal("resolve dm thread", err)
 			}
+			// Rejoin: re-add the actor if they had left this conversation (a
+			// hard-deleted dm_participant row). ONLY the actor is ensured — the
+			// id set always includes them, so this never re-adds anyone else —
+			// and it is a harmless no-op for someone still present. Because the
+			// dm_key (and thus this space) is preserved on leave, the returning
+			// participant lands back on the full history.
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO dm_participant (dm_space_id, user_id) VALUES ($1, $2)
+				 ON CONFLICT DO NOTHING`, out.ID, actor.UserID); err != nil {
+				return apperr.Internal("rejoin dm", err)
+			}
 			return nil
 		}
 		if err != nil {
@@ -153,6 +164,54 @@ func (s *Service) Open(ctx context.Context, actor auth.Identity, userIDs []int64
 		return Summary{}, err
 	}
 	return out, nil
+}
+
+// Leave removes the actor from a GROUP DM (kind 2). It is a HARD DELETE of
+// the actor's own dm_participant row: the many read/fan-out ACL sites all
+// gate on `EXISTS (dm_participant ...)`, so a leaver is excluded everywhere
+// automatically with no predicate changes. The dm_key is intentionally
+// preserved (it stays the original participant set), so a later Open with the
+// same ids resolves THIS conversation and re-adds the actor with full history
+// — rejoin, not a fresh space. One-to-one (kind 1) and self (kind 3) DMs
+// cannot be left; there is no admin/remove-other surface.
+func (s *Service) Leave(ctx context.Context, actor auth.Identity, dmSpaceID int64) error {
+	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		// Resolve the space in the actor's org AND confirm current
+		// participation in one query. A non-participant — or a foreign or
+		// nonexistent space — is oracle-free NotFound, never a 403 that would
+		// confirm the conversation exists.
+		var kind int16
+		err := tx.QueryRow(ctx, `
+			SELECT ds.kind FROM dm_space ds
+			JOIN dm_participant dp ON dp.dm_space_id = ds.id AND dp.user_id = $3
+			WHERE ds.id = $1 AND ds.org_id = $2`,
+			dmSpaceID, actor.OrgID, actor.UserID).Scan(&kind)
+		if err == pgx.ErrNoRows {
+			return apperr.NotFound("conversation not found")
+		}
+		if err != nil {
+			return apperr.Internal("load dm", err)
+		}
+		if kind != 2 {
+			return apperr.Invalid("cannot leave a direct conversation")
+		}
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM dm_participant WHERE dm_space_id = $1 AND user_id = $2`,
+			dmSpaceID, actor.UserID); err != nil {
+			return apperr.Internal("leave dm", err)
+		}
+		// participants_changed carries the leaver in user_ids so the gateway
+		// refreshes their DM view (the conversation just vanished for them).
+		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
+			EntityType: enum.EntityDM, EntityID: dmSpaceID, Verb: "dm.participants_changed",
+			Payload: eventlog.MustPayload(map[string]any{
+				"dm_space_id": dmSpaceID, "user_ids": []int64{actor.UserID}}),
+		}); err != nil {
+			return apperr.Internal("append event", err)
+		}
+		return nil
+	})
 }
 
 // List returns the actor's DM spaces, most recently active first.
