@@ -286,7 +286,9 @@ a leaked link cannot cross orgs.
 → 401; tampered → 401; foreign-org sig → 404), config-missing error,
 fs-suite regression green.
 
-### P-08 `dm: Group-DM leave.` — M — RE-DESIGNED 2026-07-12 (audit)
+### P-08 `dm: Group-DM leave.` — M — **[x] shipped #66** (hard-leave, not soft-leave)
+**Shipped as HARD-LEAVE** (superseding the soft-leave/left_at sketch below): deleting the leaver's own dm_participant row makes all ~16 EXISTS-based DM ACL sites exclude them automatically — zero predicate edits, no migration. Rejoin = ensure-actor on the existing create-or-get; dm_key preserved. Contract note: thread read/send return 403 for a non-participant while single-message Get is oracle-free 404 (pre-existing inconsistency; normalizing it is a separate messaging-ACL slice). Original audit note below.
+
 **Audit correction:** dm_key = join(sorted ids, ":") is the canonical
 MEMBERSHIP IDENTITY, shared verbatim by dm.Open create-or-get AND the
 importer's huddle path. So "add a participant to an existing group keeping
@@ -314,7 +316,7 @@ untouched; participation-is-permission unchanged for remaining members.
 participants still see it; fan-out skips the leaver; rejoin clears left_at;
 1:1 leave 400; dm_key row unchanged after leave.
 
-### P-09 `messaging: Channel folders and default channels.` — M — RE-DESIGNED 2026-07-12 (audit)
+### P-09 `messaging: Channel folders and default channels.` — M — **[x] shipped #65**
 **Audit correction:** the schema is WORKSPACE-scoped, not org-flat:
 channel_folder(org_id, workspace_id nullable, name, position) and
 default_channel PK(workspace_id, channel_id) + `bundle` (C-3
