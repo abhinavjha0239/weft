@@ -163,6 +163,8 @@ func serve(ctx context.Context, cfg config.Config) error {
 	notifSvc.SetFanout(hub)
 	notifSvc.SetUnsubscribe(cfg.SigningSecret)
 	permsSvc := perms.New(pool)
+	identitySvc := identity.New(pool, permsSvc)
+	identitySvc.SetMailer(sender) // P-35 password-reset mail via the mail seam
 	msgSvc := messaging.New(pool, permsSvc)
 	go automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log).Run(ctx)
 	go msgSvc.RunScheduledLoop(ctx, log)
@@ -175,7 +177,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go complianceSvc.RunExportLoop(ctx)
 	apiHandler := rest.Handler(ctx, rest.Deps{
 		Pool: pool, Hub: hub, Log: log,
-		Identity:      identity.New(pool, permsSvc),
+		Identity:      identitySvc,
 		Messaging:     msgSvc,
 		Worktrack:     worktrack.New(pool, permsSvc, msgSvc),
 		DM:            dm.New(pool),

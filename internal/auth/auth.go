@@ -141,6 +141,10 @@ func BearerToken(r *http.Request) string {
 // bcrypt silently truncates beyond 72 bytes, so accepting more would mint a
 // password whose tail is ignored. Bootstrap does not enforce the 72-byte cap;
 // it is enforced here only (recorded).
+//
+// The same tx also deletes the user's password_reset rows (P-35): a chosen new
+// password voids any in-flight reset mail, so a token minted before the change
+// can no longer be redeemed.
 func ChangePassword(ctx context.Context, pool *pgxpool.Pool, userID int64, currentHash, currentPassword, newPassword string) (int64, error) {
 	if len(newPassword) < 8 {
 		return 0, apperr.Invalid("new password must be at least 8 characters")
@@ -180,6 +184,10 @@ func ChangePassword(ctx context.Context, pool *pgxpool.Pool, userID int64, curre
 			return apperr.Internal("revoke other sessions", err)
 		}
 		revoked = ct.RowsAffected()
+		if _, err := tx.Exec(ctx,
+			`DELETE FROM password_reset WHERE user_id = $1`, userID); err != nil {
+			return apperr.Internal("clear password resets", err)
+		}
 		return nil
 	})
 	if err != nil {
