@@ -37,6 +37,7 @@ func (a *api) handleBootstrap(w http.ResponseWriter, r *http.Request) {
 	out, err := a.Identity.Bootstrap(r.Context(), identity.BootstrapParams{
 		OrgName: in.OrgName, OrgSlug: in.OrgSlug, Email: in.Email,
 		Password: in.Password, FullName: in.FullName,
+		IP: clientIP(r), UserAgent: requestUserAgent(r),
 	})
 	if err != nil {
 		writeDomainError(w, a.Log, r, err)
@@ -55,7 +56,8 @@ func (a *api) handleLogin(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	token, err := a.Identity.Login(r.Context(), in.OrgSlug, in.Email, in.Password)
+	token, err := a.Identity.Login(r.Context(), in.OrgSlug, in.Email, in.Password,
+		clientIP(r), requestUserAgent(r))
 	if err != nil {
 		writeDomainError(w, a.Log, r, err)
 		return

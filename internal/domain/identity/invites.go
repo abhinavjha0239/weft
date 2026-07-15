@@ -210,6 +210,10 @@ type AcceptInviteParams struct {
 	Email    string
 	Password string
 	FullName string
+	// IP and UserAgent are recorded on the minted session (P-29 metadata);
+	// empty values are allowed.
+	IP        string
+	UserAgent string
 }
 
 type AcceptInviteResult struct {
@@ -385,7 +389,7 @@ func (s *Service) AcceptInvite(ctx context.Context, p AcceptInviteParams) (Accep
 		}); err != nil {
 			return apperr.Internal("append event", err)
 		}
-		token, err := auth.CreateSession(ctx, tx, out.UserID)
+		token, err := auth.CreateSession(ctx, tx, out.UserID, p.IP, p.UserAgent)
 		if err != nil {
 			return apperr.Internal("create session", err)
 		}

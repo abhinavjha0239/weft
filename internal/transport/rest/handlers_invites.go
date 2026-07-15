@@ -69,6 +69,7 @@ func (a *api) handleAcceptInvite(w http.ResponseWriter, r *http.Request) {
 	}
 	out, err := a.Identity.AcceptInvite(r.Context(), identity.AcceptInviteParams{
 		Token: in.Token, Email: in.Email, Password: in.Password, FullName: in.FullName,
+		IP: clientIP(r), UserAgent: requestUserAgent(r),
 	})
 	if err != nil {
 		writeDomainError(w, a.Log, r, err)

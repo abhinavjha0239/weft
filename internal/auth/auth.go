@@ -36,10 +36,13 @@ func hashToken(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// CreateSession mints a bearer token; only its hash is stored.
+// CreateSession mints a bearer token; only its hash is stored. ip and
+// userAgent are session METADATA for the owner's own device list (P-29) —
+// display only, never consulted for authorization; empty values are allowed
+// (stored as NULL, read back as "").
 func CreateSession(ctx context.Context, q interface {
 	QueryRow(context.Context, string, ...any) pgx.Row
-}, userID int64) (string, error) {
+}, userID int64, ip, userAgent string) (string, error) {
 	raw := make([]byte, 32)
 	if _, err := rand.Read(raw); err != nil {
 		return "", err
@@ -47,9 +50,9 @@ func CreateSession(ctx context.Context, q interface {
 	token := hex.EncodeToString(raw)
 	var id int64
 	err := q.QueryRow(ctx, `
-		INSERT INTO auth_session (user_id, token_hash, expires_at)
-		VALUES ($1, $2, $3) RETURNING id`,
-		userID, hashToken(token), time.Now().Add(sessionTTL)).Scan(&id)
+		INSERT INTO auth_session (user_id, token_hash, ip, user_agent, expires_at)
+		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5) RETURNING id`,
+		userID, hashToken(token), ip, userAgent, time.Now().Add(sessionTTL)).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("auth: create session: %w", err)
 	}
@@ -73,8 +76,9 @@ const GuestRole int16 = 50
 // IsGuest reports whether the identity is visibility-restricted (P-5).
 func (id Identity) IsGuest() bool { return id.Role >= GuestRole }
 
-// Login verifies email+password and mints a session.
-func Login(ctx context.Context, pool *pgxpool.Pool, orgSlug, email, password string) (string, error) {
+// Login verifies email+password and mints a session, recording the client's
+// ip and user agent as session metadata.
+func Login(ctx context.Context, pool *pgxpool.Pool, orgSlug, email, password, ip, userAgent string) (string, error) {
 	var userID int64
 	var hash string
 	err := pool.QueryRow(ctx, `
@@ -88,7 +92,7 @@ func Login(ctx context.Context, pool *pgxpool.Pool, orgSlug, email, password str
 	if err != nil || !verifyPassword(hash, password) {
 		return "", ErrUnauthorized
 	}
-	return CreateSession(ctx, pool, userID)
+	return CreateSession(ctx, pool, userID, ip, userAgent)
 }
 
 // FromToken resolves a bearer token to an identity.

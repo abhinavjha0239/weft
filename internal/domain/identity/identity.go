@@ -34,6 +34,10 @@ type BootstrapParams struct {
 	Email    string
 	Password string
 	FullName string
+	// IP and UserAgent are recorded on the minted session (P-29 metadata);
+	// empty values are allowed.
+	IP        string
+	UserAgent string
 }
 
 type BootstrapResult struct {
@@ -137,7 +141,7 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 		}); err != nil {
 			return apperr.Internal("append event", err)
 		}
-		token, err := auth.CreateSession(ctx, tx, out.UserID)
+		token, err := auth.CreateSession(ctx, tx, out.UserID, p.IP, p.UserAgent)
 		if err != nil {
 			return apperr.Internal("create session", err)
 		}
@@ -150,9 +154,10 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 	return out, nil
 }
 
-// Login verifies credentials and mints a session.
-func (s *Service) Login(ctx context.Context, orgSlug, email, password string) (string, error) {
-	token, err := auth.Login(ctx, s.pool, orgSlug, email, password)
+// Login verifies credentials and mints a session, recording the client's ip
+// and user agent as session metadata.
+func (s *Service) Login(ctx context.Context, orgSlug, email, password, ip, userAgent string) (string, error) {
+	token, err := auth.Login(ctx, s.pool, orgSlug, email, password, ip, userAgent)
 	if err != nil {
 		return "", apperr.Unauthorized("invalid credentials")
 	}
