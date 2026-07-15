@@ -52,8 +52,12 @@ type api struct {
 	search *search.Service
 	// authLimit: pre-auth endpoints, per IP (brute-force protection).
 	// apiLimit: authenticated endpoints, per user.
-	authLimit *ratelimit.Limiter
-	apiLimit  *ratelimit.Limiter
+	// publicLimit: the anonymous web-public read allowlist, per IP (P-16) —
+	// its own bucket so page views never share a knob with login
+	// brute-force protection.
+	authLimit   *ratelimit.Limiter
+	apiLimit    *ratelimit.Limiter
+	publicLimit *ratelimit.Limiter
 }
 
 // Handler builds the routed, middleware-wrapped HTTP handler. Limiter
@@ -71,16 +75,25 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 		d.Hub.SetMarkReader(markReadAdapter{svc: d.Messaging})
 	}
 	a := &api{
-		Deps:      d,
-		search:    search.New(d.Pool),
-		authLimit: ratelimit.New(0.5, 10), // ~30/min burst 10 per IP
-		apiLimit:  ratelimit.New(50, 100), // 50 rps burst 100 per user
+		Deps:        d,
+		search:      search.New(d.Pool),
+		authLimit:   ratelimit.New(0.5, 10), // ~30/min burst 10 per IP
+		apiLimit:    ratelimit.New(50, 100), // 50 rps burst 100 per user
+		publicLimit: ratelimit.New(5, 20),   // 5 rps burst 20 per IP
 	}
 	go a.authLimit.Janitor(ctx, time.Minute)
 	go a.apiLimit.Janitor(ctx, time.Minute)
+	go a.publicLimit.Janitor(ctx, time.Minute)
 
 	mux := http.NewServeMux()
 	preAuth := withIPLimit(a.authLimit)
+	// P-16: the anonymous web-public read allowlist. NO identity is resolved
+	// and no token is read; the Public* domain methods pin visibility=3 in
+	// SQL. Add routes here only with that projection discipline.
+	public := withIPLimit(a.publicLimit)
+	mux.Handle("GET /api/v1/public/channels/{id}", public(http.HandlerFunc(a.handlePublicChannel)))
+	mux.Handle("GET /api/v1/public/channels/{id}/threads", public(http.HandlerFunc(a.handlePublicChannelThreads)))
+	mux.Handle("GET /api/v1/public/threads/{id}/messages", public(http.HandlerFunc(a.handlePublicThreadMessages)))
 	mux.Handle("POST /api/v1/orgs/bootstrap", preAuth(http.HandlerFunc(a.handleBootstrap)))
 	mux.Handle("POST /api/v1/auth/login", preAuth(http.HandlerFunc(a.handleLogin)))
 	mux.Handle("POST /api/v1/invites/accept", preAuth(http.HandlerFunc(a.handleAcceptInvite)))

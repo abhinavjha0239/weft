@@ -3,10 +3,13 @@ package rest
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -227,5 +230,190 @@ func TestWebPublicChannels(t *testing.T) {
 		WHERE org_id = $1 AND verb = 'channel.created' AND entity_id = $2`,
 		boot.OrgID, vault.ChannelID).Scan(&pVis, &pPriv); err != nil || pVis != "private" || !pPriv {
 		t.Fatalf("vault payload visibility=%q private=%v (%v)", pVis, pPriv, err)
+	}
+}
+
+// getRawNoAuth GETs with no Authorization header at all — the anonymous
+// caller's exact view — returning status and raw body (for the oracle-free
+// body comparisons).
+func getRawNoAuth(t *testing.T, url string) (int, string) {
+	t.Helper()
+	resp, err := http.Get(url)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
+}
+
+// TestPublicChannelAnon: P-16 (anonymous surface). The /api/v1/public
+// allowlist serves a web-public channel's metadata, threads, messages,
+// bounded author names, and link previews to callers with no token; private
+// and plain-public channels are oracle-free 404s (byte-identical bodies);
+// reactions never appear in the projection; deleted messages never appear;
+// and everything outside the allowlist stays closed without a token.
+func TestPublicChannelAnon(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		UserID    int64  `json:"user_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "anonwp", "email": "own@anon.test", "password": "password123",
+		"full_name": "Pat Owner",
+	}, &boot)
+
+	var town, vault struct {
+		ChannelID    int64 `json:"channel_id"`
+		RootThreadID int64 `json:"root_thread_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "town-square", "description": "open to the world",
+			"visibility": "web_public"}, &town)
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "vault", "visibility": "private"}, &vault)
+	var welcome struct {
+		ThreadID      int64 `json:"thread_id"`
+		RootMessageID int64 `json:"root_message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, town.ChannelID),
+		boot.Token, map[string]any{"title": "welcome", "content": "hello world"}, &welcome)
+
+	// A reaction exists on the message; the anonymous projection must not
+	// carry it (ReactionAgg names org members). The link preview is seeded
+	// directly — the unfurl pipeline itself is P-15-tested.
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/messages/%d/reactions/%s",
+		ts.URL, welcome.RootMessageID, url.PathEscape("👍")), boot.Token, nil); code != http.StatusOK {
+		t.Fatalf("seed reaction = %d", code)
+	}
+	var previewID int64
+	if err := pool.QueryRow(ctx, `
+		INSERT INTO link_preview (url_hash, url, title, status, expires_at)
+		VALUES ('anonhash', 'https://example.com/x', 'Example', 1, now() + interval '1 day')
+		RETURNING id`).Scan(&previewID); err != nil {
+		t.Fatalf("seed preview: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO message_link_preview (message_id, preview_id, position)
+		VALUES ($1, $2, 0)`, welcome.RootMessageID, previewID); err != nil {
+		t.Fatalf("seed association: %v", err)
+	}
+
+	// Metadata, threads, messages — all with NO token.
+	pubBase := ts.URL + "/api/v1/public"
+	var meta messaging.PublicChannel
+	if code := getJSON(t, fmt.Sprintf("%s/channels/%d", pubBase, town.ChannelID), "", &meta); code != http.StatusOK ||
+		meta.Name != "town-square" || meta.Description != "open to the world" || meta.RootThreadID == 0 {
+		t.Fatalf("anon metadata = %d %+v", code, meta)
+	}
+	var tpage struct {
+		Threads []struct {
+			ID    int64  `json:"id"`
+			Title string `json:"title"`
+		} `json:"threads"`
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/channels/%d/threads", pubBase, town.ChannelID), "", &tpage); code != http.StatusOK ||
+		len(tpage.Threads) != 1 || tpage.Threads[0].Title != "welcome" {
+		t.Fatalf("anon threads = %d %+v", code, tpage)
+	}
+	msgURL := fmt.Sprintf("%s/threads/%d/messages", pubBase, welcome.ThreadID)
+	code, rawBody := getRawNoAuth(t, msgURL)
+	if code != http.StatusOK {
+		t.Fatalf("anon messages = %d", code)
+	}
+	if strings.Contains(rawBody, "reactions") {
+		t.Fatalf("anonymous projection leaked reactions: %s", rawBody)
+	}
+	var mpage messaging.PublicMessagePage
+	if code := getJSON(t, msgURL, "", &mpage); code != http.StatusOK || len(mpage.Messages) != 1 {
+		t.Fatalf("anon messages decode = %d (%d msgs)", code, len(mpage.Messages))
+	}
+	m := mpage.Messages[0]
+	if m.ID != welcome.RootMessageID || m.Rendered == "" || m.CreatedAt.IsZero() {
+		t.Fatalf("anon message projection = %+v", m)
+	}
+	if len(m.LinkPreviews) != 1 || m.LinkPreviews[0].Title != "Example" {
+		t.Fatalf("anon link previews = %+v, want the seeded one", m.LinkPreviews)
+	}
+	if a, ok := mpage.Authors[m.AuthorID]; !ok || a.FullName != "Pat Owner" {
+		t.Fatalf("anon authors = %+v, want bounded author names", mpage.Authors)
+	}
+
+	// Oracle-free 404s: private, plain public (NOT web-public), and absent
+	// channels answer byte-identically; same for their threads.
+	c1, b1 := getRawNoAuth(t, fmt.Sprintf("%s/channels/%d", pubBase, vault.ChannelID))
+	c2, b2 := getRawNoAuth(t, fmt.Sprintf("%s/channels/%d", pubBase, boot.ChannelID))
+	c3, b3 := getRawNoAuth(t, fmt.Sprintf("%s/channels/%d", pubBase, int64(99999999)))
+	if c1 != http.StatusNotFound || c2 != http.StatusNotFound || c3 != http.StatusNotFound {
+		t.Fatalf("anon probe codes = %d/%d/%d, want 404s", c1, c2, c3)
+	}
+	if b1 != b2 || b2 != b3 {
+		t.Fatalf("404 oracle: bodies differ:\n%s\n%s\n%s", b1, b2, b3)
+	}
+	c4, b4 := getRawNoAuth(t, fmt.Sprintf("%s/threads/%d/messages", pubBase, vault.RootThreadID))
+	c5, b5 := getRawNoAuth(t, fmt.Sprintf("%s/threads/%d/messages", pubBase, int64(99999999)))
+	if c4 != http.StatusNotFound || c5 != http.StatusNotFound || b4 != b5 {
+		t.Fatalf("thread 404 oracle = %d/%d bodies equal=%v", c4, c5, b4 == b5)
+	}
+
+	// Deleted messages never appear on the anonymous path.
+	var extra struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, welcome.ThreadID),
+		boot.Token, map[string]any{"content": "soon gone"}, &extra)
+	req, _ := http.NewRequest("DELETE", fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, extra.MessageID), nil)
+	req.Header.Set("Authorization", "Bearer "+boot.Token)
+	if resp, err := http.DefaultClient.Do(req); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("delete extra: %v", err)
+	} else {
+		resp.Body.Close()
+	}
+	if code := getJSON(t, msgURL, "", &mpage); code != http.StatusOK || len(mpage.Messages) != 1 {
+		t.Fatalf("anon after delete = %d (%d msgs), want the survivor only", code, len(mpage.Messages))
+	}
+
+	// Everything outside the allowlist stays closed to anonymous callers:
+	// no POST verbs exist under /public, and the authed API 401s.
+	if code := postJSONStatus(t, msgURL, "", map[string]any{"content": "anon spam"}); code != http.StatusMethodNotAllowed {
+		t.Fatalf("anon POST on public namespace = %d, want 405", code)
+	}
+	if code := getJSON(t, ts.URL+"/api/v1/channels", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("anon channel list = %d, want 401", code)
+	}
+	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/channels/%d/join", ts.URL, town.ChannelID),
+		"", map[string]any{}); code != http.StatusUnauthorized {
+		t.Fatalf("anon join = %d, want 401", code)
+	}
+	if code := getJSON(t, ts.URL+"/api/v1/search?q=hello", "", nil); code != http.StatusUnauthorized {
+		t.Fatalf("anon search = %d, want 401", code)
+	}
+	if code, _ := getRawNoAuth(t, ts.URL+"/api/v1/gateway"); code == http.StatusOK {
+		t.Fatal("anon gateway must not be 200")
 	}
 }

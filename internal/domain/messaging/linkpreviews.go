@@ -27,10 +27,26 @@ func attachLinkPreviews(ctx context.Context, q querier, msgs []Message) error {
 		return nil
 	}
 	ids := make([]int64, len(msgs))
-	byID := make(map[int64]*Message, len(msgs))
 	for i := range msgs {
 		ids[i] = msgs[i].ID
-		byID[msgs[i].ID] = &msgs[i]
+	}
+	previews, err := loadLinkPreviews(ctx, q, ids)
+	if err != nil {
+		return err
+	}
+	for i := range msgs {
+		msgs[i].LinkPreviews = previews[msgs[i].ID]
+	}
+	return nil
+}
+
+// loadLinkPreviews returns the renderable (status 1) previews for a message
+// id set, document-ordered within each message — shared by the authed
+// aggregate and the anonymous web-public projection (P-16).
+func loadLinkPreviews(ctx context.Context, q querier, ids []int64) (map[int64][]LinkPreview, error) {
+	out := make(map[int64][]LinkPreview)
+	if len(ids) == 0 {
+		return out, nil
 	}
 	rows, err := q.Query(ctx, `
 		SELECT mlp.message_id, lp.url, lp.title, lp.description, lp.image_url, lp.site_name
@@ -39,18 +55,19 @@ func attachLinkPreviews(ctx context.Context, q querier, msgs []Message) error {
 		WHERE mlp.message_id = ANY($1)
 		ORDER BY mlp.message_id, mlp.position`, ids)
 	if err != nil {
-		return apperr.Internal("load link previews", err)
+		return nil, apperr.Internal("load link previews", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var msgID int64
 		var p LinkPreview
 		if err := rows.Scan(&msgID, &p.URL, &p.Title, &p.Description, &p.ImageURL, &p.SiteName); err != nil {
-			return apperr.Internal("scan link preview", err)
+			return nil, apperr.Internal("scan link preview", err)
 		}
-		if m := byID[msgID]; m != nil {
-			m.LinkPreviews = append(m.LinkPreviews, p)
-		}
+		out[msgID] = append(out[msgID], p)
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internal("load link previews", err)
+	}
+	return out, nil
 }
