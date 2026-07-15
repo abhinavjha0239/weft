@@ -1019,7 +1019,7 @@ caching prevents refetch storms.
 edit; per-message/user opt-out; charset sniffing beyond UTF-8;
 oEmbed providers; P-24 shares the egress guard when it lands.
 
-### P-16 `channels: Web-public channels + history_from enforcement.` — L — **[ ] queued — STRONGEST-MODEL EXECUTION (not dispatched)**
+### P-16 `channels: Web-public channels + history_from enforcement.` — L — **[x] shipped #87** (strongest-model execution; all 3 security assertions red/green-proven)
 Security-critical: it opens a NEW exposure surface (an anonymous,
 unauthenticated read path) and enforces a membership-history boundary
 that has never been enforced. ZERO migrations — `channel.visibility`
