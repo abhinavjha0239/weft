@@ -297,7 +297,7 @@ func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, 
 		return err
 	}
 	if ct.RowsAffected() > 0 && r.fan != nil {
-		suppressed, err := r.dndSuppressed(ctx, userID, author)
+		suppressed, err := dndSuppressed(ctx, r.pool, userID, author)
 		if err != nil {
 			return err
 		}
@@ -319,9 +319,14 @@ func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, 
 // row already landed (N-4: the badge accrues even when delivery is
 // suppressed). Runs only when a fan would otherwise happen, one indexed
 // lookup on the recipient's PK row.
-func (r *Runner) dndSuppressed(ctx context.Context, userID, author int64) (bool, error) {
+//
+// Package-level (not a Runner method) so both the materializer's insert and
+// the Service's PingNotification gate on it. An author of 0 (system/automation
+// alerts) matches no priority_contact, so a snoozed recipient is always
+// suppressed — there is no VIP pierce for a system actor.
+func dndSuppressed(ctx context.Context, pool *pgxpool.Pool, userID, author int64) (bool, error) {
 	var suppressed bool
-	if err := r.pool.QueryRow(ctx, `
+	if err := pool.QueryRow(ctx, `
 		SELECT EXISTS (
 		    SELECT 1 FROM dnd_setting d
 		    WHERE d.user_id = $1 AND d.snoozed_until > now()

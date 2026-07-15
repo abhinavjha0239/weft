@@ -25,6 +25,10 @@ const (
 	KindFollowedThread  = 3
 	KindKeyword         = 4 // alert words (N-1 kind 4)
 	KindChannelActivity = 5
+	// KindAutomationFailure is a system-generated alert to a scope's admins
+	// when one of their automation runs fails (P-25). Email default OFF —
+	// in-app only; admins opt in via the prefs API.
+	KindAutomationFailure = 6
 )
 
 type Service struct {

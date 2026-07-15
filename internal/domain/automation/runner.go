@@ -13,6 +13,8 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/notification"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 )
@@ -30,10 +32,11 @@ const (
 
 // Run statuses (automation_run.status, 0006 schema).
 const (
-	statusRunning   int16 = 1
-	statusSuccess   int16 = 2
-	statusFailed    int16 = 5
-	statusThrottled int16 = 6
+	statusRunning      int16 = 1
+	statusSuccess      int16 = 2
+	statusPartialError int16 = 4
+	statusFailed       int16 = 5
+	statusThrottled    int16 = 6
 )
 
 // Runner is the execution engine: a named, cursor-tracked, txid-gated
@@ -51,14 +54,18 @@ type Runner struct {
 	pool     *pgxpool.Pool
 	consumer *eventlog.Consumer
 	msg      *messaging.Service
+	perms    *perms.Service
+	notif    *notification.Service
 	log      *slog.Logger
 }
 
-func NewRunner(pool *pgxpool.Pool, msg *messaging.Service, log *slog.Logger) *Runner {
+func NewRunner(pool *pgxpool.Pool, msg *messaging.Service, p *perms.Service, notif *notification.Service, log *slog.Logger) *Runner {
 	return &Runner{
 		pool:     pool,
 		consumer: eventlog.NewConsumer(pool, consumerName, batchSize),
 		msg:      msg,
+		perms:    p,
+		notif:    notif,
 		log:      log,
 	}
 }
@@ -259,8 +266,9 @@ type stepTrace struct {
 // A failing step rolls back to its savepoint so the failure trace commits
 // without the step's partial writes.
 func (r *Runner) execute(ctx context.Context, orgID int64, rl rule, ev eventlog.Row) error {
-	return db.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
-		var runID int64
+	var runID int64
+	var toPing []int64
+	err := db.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
 		err := tx.QueryRow(ctx, `
 			INSERT INTO automation_run (org_id, automation_id, trigger_event_id, status)
 			VALUES ($1, $2, $3, $4)
@@ -315,8 +323,75 @@ func (r *Runner) execute(ctx context.Context, orgID int64, rl rule, ev eventlog.
 			}
 			traces = append(traces, stepTrace{Kind: st.Kind, Status: "ok", MessageID: msgID})
 		}
-		return finishRun(ctx, tx, runID, status, traces)
+		if err := finishRun(ctx, tx, runID, status, traces); err != nil {
+			return err
+		}
+		// P-25: a run that ENTERS the failing state alerts whoever administers
+		// the rule (the write-gate holders), recorded in this same tx; the
+		// live pings fire only after the commit succeeds.
+		if status == statusFailed || status == statusPartialError {
+			ids, err := r.notifyFailure(ctx, tx, orgID, rl, runID)
+			if err != nil {
+				return err
+			}
+			toPing = ids
+		}
+		return nil
 	})
+	if err != nil {
+		return err
+	}
+	for _, uid := range toPing {
+		r.notif.PingNotification(ctx, orgID, uid,
+			notification.KindAutomationFailure, int16(enum.EntityAutomationRun), runID)
+	}
+	return nil
+}
+
+// notifyFailure records a kind-6 notification for whoever may administer the
+// failed rule — but only on ENTRY into the failing state, throttled to at most
+// once an hour while it keeps failing (any success re-arms). Recipients mirror
+// the WRITE gate (requireScopeAdmin): org rules → manage_org holders, channel
+// rules → administer_channel holders. Returns the users a live ping should
+// reach (the ones actually inserted). Runs inside the finish transaction.
+func (r *Runner) notifyFailure(ctx context.Context, tx pgx.Tx, orgID int64, rl rule, runID int64) ([]int64, error) {
+	// Alert on entry only: inspect the most recent OTHER terminal run for this
+	// rule; if it was already failing within the last hour, stay quiet. Rides
+	// automation_run_list_idx (automation_id, id DESC).
+	var recentlyFailing bool
+	if err := tx.QueryRow(ctx, `
+		SELECT COALESCE((
+		    SELECT status IN (4, 5) AND finished_at > now() - interval '1 hour'
+		    FROM automation_run
+		    WHERE automation_id = $1 AND id <> $2 AND status <> 1
+		    ORDER BY id DESC LIMIT 1), false)`,
+		rl.ID, runID).Scan(&recentlyFailing); err != nil {
+		return nil, fmt.Errorf("automation: failure throttle probe: %w", err)
+	}
+	if recentlyFailing {
+		return nil, nil
+	}
+	var recips []int64
+	var err error
+	switch rl.ScopeType {
+	case ScopeOrg:
+		recips, err = r.perms.HoldersAt(ctx, tx, orgID, perms.VerbManageOrg, perms.OrgScope(orgID))
+	case ScopeChannel:
+		chain, cerr := r.perms.ChannelScope(ctx, tx, orgID, rl.ScopeID)
+		if cerr != nil {
+			return nil, cerr
+		}
+		recips, err = r.perms.HoldersAt(ctx, tx, orgID, perms.VerbAdministerChannel, chain)
+	default:
+		return nil, nil // no admin verb for this scope yet — nobody to notify
+	}
+	if err != nil {
+		return nil, err
+	}
+	if len(recips) == 0 {
+		return nil, nil
+	}
+	return r.notif.RecordAutomationFailure(ctx, tx, orgID, runID, recips)
 }
 
 func finishRun(ctx context.Context, tx pgx.Tx, runID int64, status int16, traces []stepTrace) error {

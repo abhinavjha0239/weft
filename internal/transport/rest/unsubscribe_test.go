@@ -163,8 +163,8 @@ func TestUnsubscribe(t *testing.T) {
 		t.Fatalf("POST = %d, want 200", code)
 	}
 	after := emailEnabled(t, ts.URL, bobTok)
-	if len(after) != 5 {
-		t.Fatalf("expected all 5 kinds, got %+v", after)
+	if len(after) != 6 {
+		t.Fatalf("expected all 6 kinds, got %+v", after)
 	}
 	for k, enabled := range after {
 		if enabled {

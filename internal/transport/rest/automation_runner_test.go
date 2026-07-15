@@ -16,6 +16,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/automation"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
@@ -54,7 +55,7 @@ func TestAutomationRunner(t *testing.T) {
 		Automations: automation.New(pool, permsSvc),
 	}))
 	defer ts.Close()
-	runner := automation.NewRunner(pool, msgSvc, slog.Default())
+	runner := automation.NewRunner(pool, msgSvc, permsSvc, notification.New(pool), slog.Default())
 
 	var boot struct {
 		OrgID     int64  `json:"org_id"`

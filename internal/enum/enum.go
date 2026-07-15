@@ -36,6 +36,7 @@ const (
 	EntityScheduled     EntityType = 15
 	EntityEmoji         EntityType = 16
 	EntityChannelFolder EntityType = 17
+	EntityAutomationRun EntityType = 18
 )
 
 // UserKind is user_account.kind (CC-5: agent covers all non-human principals).
