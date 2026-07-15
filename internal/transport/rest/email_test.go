@@ -213,3 +213,74 @@ func TestNotificationEmails(t *testing.T) {
 		t.Fatalf("in-app medium = %d, want 400", code)
 	}
 }
+
+// TestEmailKeywordDefault pins the zero-rows email default for keyword
+// notifications (kind 4). The prefs API reports keyword email ON by default
+// (defaultEmailEnabled includes KindKeyword — setting an alert word IS the
+// opt-in), but the worker's SQL fallback long omitted it, so a keyword
+// notification with NO stored pref row was never emailed. Red/green: revert
+// the RunOnce SQL to `n.kind IN (1, 2)` and this fails (the sweep sends 0).
+func TestEmailKeywordDefault(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:      identity.New(pool, permsSvc),
+		Messaging:     messaging.New(pool, permsSvc),
+		DM:            dm.New(pool),
+		Notifications: notification.New(pool),
+	}))
+	defer ts.Close()
+	runner := notification.NewRunner(pool, hub, slog.Default())
+	capture := &captureSender{}
+	worker := notification.NewEmailWorker(pool, capture, slog.Default())
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "kwd", "email": "a@kwd.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@kwd.test", "Bob Ray", "bobkwdtok")
+
+	// Bob sets an alert word but NEVER touches his email prefs — the flip
+	// under test rides the zero-rows default alone.
+	if code := putJSON(t, ts.URL+"/api/v1/alert-words", bobTok,
+		map[string]any{"words": []string{"deploy"}}); code != http.StatusOK {
+		t.Fatalf("set alert word = %d", code)
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
+		boot.Token, map[string]any{"content": "we deploy today"}, nil)
+	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+
+	// The keyword notification is due and email-enabled by default → one email.
+	if n, err := worker.RunOnce(ctx, time.Now().Add(time.Minute)); err != nil || n != 1 {
+		t.Fatalf("keyword sweep = %d (%v), want 1 email (kind-4 default is ON)", n, err)
+	}
+	mails := capture.take()
+	if len(mails) != 1 || mails[0].to != "bob@kwd.test" ||
+		!strings.Contains(mails[0].subject, "1 unread") ||
+		!strings.Contains(mails[0].body, "used one of your alert words in #general") {
+		t.Fatalf("keyword email = %+v", mails)
+	}
+}

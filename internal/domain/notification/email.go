@@ -84,9 +84,12 @@ func (w *EmailWorker) RunOnce(ctx context.Context, olderThan time.Time) (int, er
 				WHERE n.seen_at IS NULL AND n.emailed_at IS NULL
 				  AND n.created_at < $1
 				  AND u.email IS NOT NULL AND u.deactivated_at IS NULL
+				  -- The zero-rows default must match defaultEmailEnabled
+				  -- (dm/mention/keyword): setting an alert word IS the opt-in,
+				  -- so a keyword row with no stored pref earns an email too.
 				  AND COALESCE((SELECT p.enabled FROM notification_medium_pref p
 				        WHERE p.user_id = n.user_id AND p.kind = n.kind AND p.medium = $2),
-				      n.kind IN (1, 2))
+				      n.kind IN (1, 2, 4))
 				  -- N-2 DND: skip rows for a recipient who is snoozed right now,
 				  -- unless the row's actor is one of their VIPs. Left UNMARKED
 				  -- (emailed_at stays NULL), so once the snooze lapses the next
