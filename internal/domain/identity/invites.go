@@ -224,10 +224,23 @@ type AcceptInviteResult struct {
 // member.joined event — the shared shape for both invite-explicit joins and
 // P-09 default-channel auto-joins.
 func joinChannelOnAccept(ctx context.Context, tx pgx.Tx, orgID, userID, channelID int64) error {
-	if _, err := tx.Exec(ctx, `
+	// Guarded join: only a LIVE channel in this org takes the new member.
+	// Channels were validated when the invite (or default set) was created,
+	// but archiving can happen in between — an archived channel is read-only
+	// and must not gain members, and a stale default_channel row must not
+	// act. Skipping silently is deliberate: account provisioning must not
+	// fail over a channel that archived since; the join just doesn't happen
+	// (and no member.joined is emitted for it).
+	ct, err := tx.Exec(ctx, `
 		INSERT INTO channel_member (channel_id, user_id)
-		VALUES ($1, $2) ON CONFLICT DO NOTHING`, channelID, userID); err != nil {
+		SELECT c.id, $2 FROM channel c
+		WHERE c.id = $1 AND c.org_id = $3 AND c.archived_at IS NULL
+		ON CONFLICT DO NOTHING`, channelID, userID, orgID)
+	if err != nil {
 		return apperr.Internal("join channel", err)
+	}
+	if ct.RowsAffected() == 0 {
+		return nil
 	}
 	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 		OrgID: orgID, ActorKind: enum.ActorHuman, ActorID: &userID,

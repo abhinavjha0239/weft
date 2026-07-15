@@ -378,3 +378,122 @@ func sameInt64Set(a, b map[int64]bool) bool {
 	}
 	return true
 }
+
+// TestArchivedChannelsSkippedOnAccept: the review-batch hardening — a channel
+// archived AFTER being listed (as an org default OR on an invite's explicit
+// list) must not gain members at accept time. The join is guarded at the one
+// shared site (joinChannelOnAccept: INSERT … SELECT WHERE archived_at IS
+// NULL, org-pinned), so a stale default_channel row or a stale invite cannot
+// put anyone into a read-only channel; account provisioning itself still
+// succeeds (a since-archived channel silently doesn't join — signup must not
+// fail over it), and no member.joined is emitted for the skipped channel.
+func TestArchivedChannelsSkippedOnAccept(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "arc", "email": "alice@arc.test", "password": "password123",
+		"full_name": "Alice Admin",
+	}, &boot)
+
+	memberOf := func(email string, channelID int64) bool {
+		t.Helper()
+		var ok bool
+		if err := pool.QueryRow(ctx, `
+			SELECT EXISTS (
+			  SELECT 1 FROM channel_member cm
+			  JOIN user_account u ON u.id = cm.user_id
+			  WHERE u.email = $1 AND cm.channel_id = $2
+			    AND cm.unsubscribed_at IS NULL)`, email, channelID).Scan(&ok); err != nil {
+			t.Fatalf("memberOf: %v", err)
+		}
+		return ok
+	}
+
+	// Defaults path: {#general, doomed} are the defaults; doomed archives
+	// AFTER being set (the stale default_channel row stays behind).
+	var doomed struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "doomed"}, &doomed)
+	if code := putJSON(t, ts.URL+"/api/v1/default-channels", boot.Token,
+		map[string]any{"channel_ids": []int64{boot.ChannelID, doomed.ChannelID}}); code != http.StatusOK {
+		t.Fatalf("set defaults = %d", code)
+	}
+	if code := patchJSON(t, fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, doomed.ChannelID),
+		boot.Token, map[string]any{"archived": true}); code != http.StatusOK {
+		t.Fatalf("archive doomed = %d", code)
+	}
+
+	var inv identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{}, &inv)
+	var carol identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": inv.Token, "email": "carol@arc.test", "password": "password123",
+		"full_name": "Carol"}, &carol)
+	if carol.UserID == 0 {
+		t.Fatal("accept must still provision the account")
+	}
+	if !memberOf("carol@arc.test", boot.ChannelID) {
+		t.Fatal("carol must join the live default #general")
+	}
+	if memberOf("carol@arc.test", doomed.ChannelID) {
+		t.Fatal("carol must NOT join the archived default")
+	}
+	var doomedJoins int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM event_log
+		WHERE org_id = $1 AND verb = 'member.joined'
+		  AND entity_id = $2 AND actor_id = $3`,
+		boot.OrgID, doomed.ChannelID, carol.UserID).Scan(&doomedJoins); err != nil || doomedJoins != 0 {
+		t.Fatalf("member.joined for archived channel = %d (%v), want 0", doomedJoins, err)
+	}
+
+	// Explicit path: an invite names a channel that archives before accept.
+	var doomed2 struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "doomed2"}, &doomed2)
+	var inv2 identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token,
+		map[string]any{"channel_ids": []int64{doomed2.ChannelID}}, &inv2)
+	if code := patchJSON(t, fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, doomed2.ChannelID),
+		boot.Token, map[string]any{"archived": true}); code != http.StatusOK {
+		t.Fatalf("archive doomed2 = %d", code)
+	}
+	var dave identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": inv2.Token, "email": "dave@arc.test", "password": "password123",
+		"full_name": "Dave"}, &dave)
+	if dave.UserID == 0 {
+		t.Fatal("accept must still provision dave")
+	}
+	if memberOf("dave@arc.test", doomed2.ChannelID) {
+		t.Fatal("dave must NOT join the channel archived after his invite was minted")
+	}
+}
