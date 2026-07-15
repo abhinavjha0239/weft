@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -25,9 +26,11 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/domain/unfurl"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
+	"github.com/abhinavjha0239/weft/internal/platform/egress"
 	"github.com/abhinavjha0239/weft/internal/platform/mail"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
@@ -176,6 +179,16 @@ func serve(ctx context.Context, cfg config.Config) error {
 	complianceSvc.SetLogger(log)
 	complianceSvc.SetFiles(filesSvc)
 	go complianceSvc.RunExportLoop(ctx)
+	// P-15: link previews fetch through the SSRF-guarded egress client —
+	// the ONLY path attacker-chosen URLs may ride. No test options here.
+	unfurlSvc := unfurl.New(pool, egress.New(egress.Options{
+		UserAgent: brand.Name + "Bot/1.0 (+link-preview)",
+	}))
+	unfurlSvc.SetPerms(permsSvc)
+	if u, err := url.Parse(cfg.BaseURL); err == nil {
+		unfurlSvc.SetBaseHost(u.Host)
+	}
+	go unfurl.NewRunner(pool, unfurlSvc, log).Run(ctx)
 	apiHandler := rest.Handler(ctx, rest.Deps{
 		Pool: pool, Hub: hub, Log: log,
 		Identity:      identitySvc,
@@ -186,6 +199,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Files:         filesSvc,
 		Compliance:    complianceSvc,
 		Automations:   automation.New(pool, permsSvc),
+		Unfurl:        unfurlSvc,
 	})
 	ui, err := webui.Handler()
 	if err != nil {

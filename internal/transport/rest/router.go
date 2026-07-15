@@ -21,6 +21,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/search"
+	"github.com/abhinavjha0239/weft/internal/domain/unfurl"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
@@ -42,6 +43,8 @@ type Deps struct {
 	Compliance *compliance.Service
 	// Automations is optional in tests that never hit the endpoints.
 	Automations *automation.Service
+	// Unfurl is optional in tests that never hit the admin toggle.
+	Unfurl *unfurl.Service
 }
 
 type api struct {
@@ -193,6 +196,9 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	// P-19: manage_org-gated org storage quota (get usage + set cap).
 	mux.HandleFunc("GET /api/v1/admin/storage-quota", a.withAuth(a.handleGetStorageQuota))
 	mux.HandleFunc("PUT /api/v1/admin/storage-quota", a.withAuth(a.handleSetStorageQuota))
+	// P-15: org link-preview toggle (manage_org in the domain).
+	mux.HandleFunc("GET /api/v1/admin/link-previews", a.withAuth(a.handleGetLinkPreviews))
+	mux.HandleFunc("PUT /api/v1/admin/link-previews", a.withAuth(a.handleSetLinkPreviews))
 	mux.HandleFunc("POST /api/v1/automations", a.withAuth(a.handleCreateAutomation))
 	mux.HandleFunc("GET /api/v1/automations", a.withAuth(a.handleListAutomations))
 	mux.HandleFunc("PATCH /api/v1/automations/{id}", a.withAuth(a.handleUpdateAutomation))
