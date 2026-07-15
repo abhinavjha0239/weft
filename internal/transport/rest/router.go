@@ -194,6 +194,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/spaces/{id}/items", a.withAuth(a.handleListItems))
 	mux.HandleFunc("GET /api/v1/spaces/{id}/statuses", a.withAuth(a.handleSpaceStatuses))
 	mux.HandleFunc("PATCH /api/v1/items/{id}", a.withAuth(a.handleUpdateItem))
+	mux.HandleFunc("POST /api/v1/items/{id}/move", a.withAuth(a.handleMoveItem))
 	mux.HandleFunc("POST /api/v1/threads/{id}/promote", a.withAuth(a.handlePromoteThread))
 	mux.HandleFunc("POST /api/v1/threads/{id}/messages", a.withAuth(a.handleSendToThread))
 	// P-11 sprints: a sprint is a column on work_item (one per item). All

@@ -122,6 +122,27 @@ func (a *api) handleUpdateItem(w http.ResponseWriter, r *http.Request, id auth.I
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
+func (a *api) handleMoveItem(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	itemID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad item id")
+		return
+	}
+	type req struct {
+		AfterItemID  *int64 `json:"after_item_id"`
+		BeforeItemID *int64 `json:"before_item_id"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Worktrack.MoveItem(r.Context(), id, itemID, in.AfterItemID, in.BeforeItemID); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (a *api) handlePromoteThread(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	threadID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
