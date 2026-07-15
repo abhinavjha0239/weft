@@ -330,6 +330,29 @@ func (s *Service) OpenDownload(ctx context.Context, actor auth.Identity, fileID 
 	return m, rc, nil
 }
 
+// OpenForBundle opens a file's bytes for a compliance export bundle (P-32). It
+// is NOT the F-12 union ACL — the export is already compliance_officer-
+// authorized and the file set is the job's own EntityExportJob pins — but it
+// stays org-scoped. It deliberately does NOT filter deleted_at: a pinned file
+// whose source messages have since died still bundles as evidence (the pin
+// keeps its blob alive against GC). Any error — a missing row or an unreadable
+// blob — is the caller's signal to record the id under manifest `missing`,
+// never to fail the whole bundle.
+func (s *Service) OpenForBundle(ctx context.Context, orgID, fileID int64) (io.ReadCloser, error) {
+	var key string
+	if err := s.pool.QueryRow(ctx, `
+		SELECT storage_key FROM file
+		WHERE id = $1 AND org_id = $2 AND kind = 1`,
+		fileID, orgID).Scan(&key); err != nil {
+		return nil, apperr.NotFound("file not found")
+	}
+	rc, err := s.store.Open(ctx, key)
+	if err != nil {
+		return nil, apperr.Internal("open bundle blob", err)
+	}
+	return rc, nil
+}
+
 // AttachMessageReferences records file_reference rows for the given file
 // ids on a message — called in the message-write transaction.
 func (s *Service) AttachMessageReferences(ctx context.Context, tx pgx.Tx, actor auth.Identity, messageID int64, fileIDs []int64) (int, error) {
