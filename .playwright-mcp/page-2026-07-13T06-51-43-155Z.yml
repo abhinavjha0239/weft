@@ -1,0 +1,168 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e2]:
+    - banner [ref=e3]:
+      - navigation "Main navigation" [ref=e5]:
+        - link "Neo" [ref=e6] [cursor=pointer]:
+          - /url: /
+        - link "Home" [ref=e16] [cursor=pointer]:
+          - /url: /
+        - link "Tasket" [ref=e17] [cursor=pointer]:
+          - /url: /tasket
+        - link "Friday" [ref=e18] [cursor=pointer]:
+          - /url: /friday
+        - link "Studio" [ref=e19] [cursor=pointer]:
+          - /url: /studio
+        - link "Drive" [ref=e20] [cursor=pointer]:
+          - /url: /drive
+        - link "Manifesto" [ref=e21] [cursor=pointer]:
+          - /url: /manifesto
+        - link "Team" [ref=e22] [cursor=pointer]:
+          - /url: /team
+        - link "Careers" [ref=e23] [cursor=pointer]:
+          - /url: /careers
+        - button "Sign up" [ref=e24] [cursor=pointer]
+    - main [ref=e25]:
+      - generic [ref=e30]:
+        - generic [ref=e31]:
+          - heading "The work platform where AI does the work" [level=1] [ref=e32]:
+            - generic [ref=e33]: The work platform
+            - generic [ref=e34]: where AI does the work
+          - paragraph [ref=e35]: Make AI a first-class participant in work, not a tab beside it.
+        - generic [ref=e39]:
+          - generic [ref=e40]:
+            - text: Company (leave this field empty)
+            - textbox
+            - generic [ref=e41]:
+              - generic [ref=e42] [cursor=pointer]: Your work email
+              - textbox "Your work email" [ref=e43]
+              - button "Sign up" [ref=e44] [cursor=pointer]
+          - paragraph [ref=e46]
+      - region "Products introduction" [ref=e47]:
+        - paragraph [ref=e50]:
+          - text: Neo is an integrated AI work platform that
+          - generic [ref=e51]: centralizes context, captures knowledge and weaves AI into every workflow.
+          - generic [ref=e52]: The Neo Suite comprises the below products.
+      - generic [ref=e53]:
+        - generic [ref=e56]:
+          - generic [ref=e58]:
+            - heading "Tasket" [level=2] [ref=e59]
+            - paragraph [ref=e60]: AI-native work management platform for all functions.
+          - generic [ref=e63]:
+            - generic [ref=e64]:
+              - generic [ref=e66]:
+                - button "Previous feature" [ref=e67] [cursor=pointer]
+                - button "Next feature" [ref=e70] [cursor=pointer]
+              - navigation "Features" [ref=e73]:
+                - list [ref=e74]:
+                  - listitem [ref=e75]:
+                    - button "Create Teams" [ref=e76] [cursor=pointer]
+                  - listitem [ref=e78]:
+                    - button "Invite Guests" [ref=e79] [cursor=pointer]
+                  - listitem [ref=e81]:
+                    - button "Create Projects" [ref=e82] [cursor=pointer]
+                  - listitem [ref=e84]:
+                    - button "Organize Tasks" [ref=e85] [cursor=pointer]
+                  - listitem [ref=e87]:
+                    - button "Add Comments" [ref=e88] [cursor=pointer]
+                  - listitem [ref=e90]:
+                    - button "Add Documents" [ref=e91] [cursor=pointer]
+                  - listitem [ref=e93]:
+                    - button "Add AI Chats" [ref=e94] [cursor=pointer]
+                  - listitem [ref=e96]:
+                    - button "Work Tab" [ref=e97] [cursor=pointer]
+                  - listitem [ref=e99]:
+                    - button "Updates Tab" [ref=e100] [cursor=pointer]
+                  - listitem [ref=e102]:
+                    - button "Silence Score" [ref=e103] [cursor=pointer]
+                  - listitem [ref=e105]:
+                    - button "Configurable Projects" [ref=e106] [cursor=pointer]
+                  - listitem [ref=e108]:
+                    - button "Tracks" [ref=e109] [cursor=pointer]
+                  - listitem [ref=e111]:
+                    - button "Plan Sprints" [ref=e112] [cursor=pointer]
+                  - listitem [ref=e114]:
+                    - button "Accept Intakes" [ref=e115] [cursor=pointer]
+                  - listitem [ref=e117]:
+                    - button "Configure Custom Fields" [ref=e118] [cursor=pointer]
+            - figure [ref=e122]:
+              - paragraph [ref=e124]: Teams can comprise people from within your org as well as unlimited free guests from outside.
+              - img "Create Teams screenshot" [ref=e127]
+        - separator [ref=e128]
+        - generic [ref=e132]:
+          - generic [ref=e134]:
+            - heading "Friday" [level=2] [ref=e135]
+            - paragraph [ref=e136]: AI Assistant, Co-work and agents, pre-integrated into Tasket, Studio, Drive and 1000+ SaaS platforms.
+          - generic [ref=e139]:
+            - generic [ref=e140]:
+              - generic [ref=e142]:
+                - button "Previous feature" [ref=e143] [cursor=pointer]
+                - button "Next feature" [ref=e146] [cursor=pointer]
+              - navigation "Features" [ref=e149]:
+                - list [ref=e150]:
+                  - listitem [ref=e151]:
+                    - button "1000+ Integrations" [ref=e152] [cursor=pointer]
+                  - listitem [ref=e154]:
+                    - button "Co-Author documents" [ref=e155] [cursor=pointer]
+                  - listitem [ref=e157]:
+                    - button "Skill Repository" [ref=e158] [cursor=pointer]
+            - figure [ref=e162]:
+              - paragraph [ref=e164]: Connect with Email, Calendars, CRM, HRMS, ATS, ERP systems.
+        - separator [ref=e167]
+        - generic [ref=e171]:
+          - generic [ref=e173]:
+            - heading "Studio" [level=2] [ref=e174]
+            - paragraph [ref=e175]: AI-native docs, spreadsheets and diagrams.
+          - generic [ref=e178]:
+            - generic [ref=e179]:
+              - generic [ref=e181]:
+                - button "Previous feature" [ref=e182] [cursor=pointer]
+                - button "Next feature" [ref=e185] [cursor=pointer]
+              - navigation "Features" [ref=e188]:
+                - list [ref=e189]:
+                  - listitem [ref=e190]:
+                    - button "Documents" [ref=e191] [cursor=pointer]
+                  - listitem [ref=e193]:
+                    - button "Sharing" [ref=e194] [cursor=pointer]
+                  - listitem [ref=e196]:
+                    - button "AI-native" [ref=e197] [cursor=pointer]
+                  - listitem [ref=e199]:
+                    - button "Collaborative Editing" [ref=e200] [cursor=pointer]
+            - figure [ref=e204]:
+              - paragraph [ref=e206]: Collaborate on docs within teams, projects, tasks or personal spaces.
+        - separator [ref=e209]
+        - generic [ref=e213]:
+          - generic [ref=e215]:
+            - heading "Drive" [level=2] [ref=e216]
+            - paragraph [ref=e217]: A modern file repository, where humans and agents can co-work.
+          - generic [ref=e220]:
+            - generic [ref=e221]:
+              - generic [ref=e223]:
+                - button "Previous feature" [ref=e224] [cursor=pointer]
+                - button "Next feature" [ref=e227] [cursor=pointer]
+              - navigation "Features" [ref=e230]:
+                - list [ref=e231]:
+                  - listitem [ref=e232]:
+                    - button "Drive" [ref=e233] [cursor=pointer]
+                  - listitem [ref=e235]:
+                    - button "Sharing" [ref=e236] [cursor=pointer]
+                  - listitem [ref=e238]:
+                    - button "Synced to your PC" [ref=e239] [cursor=pointer]
+            - figure [ref=e243]:
+              - paragraph [ref=e245]: Collaborate on files within teams, projects, tasks or personal spaces.
+      - generic [ref=e252]:
+        - heading "Sign up for early access to Neo" [level=1] [ref=e254]
+        - generic [ref=e258]:
+          - generic [ref=e259]:
+            - text: Company (leave this field empty)
+            - textbox
+            - generic [ref=e260]:
+              - generic [ref=e261] [cursor=pointer]: Your work email
+              - textbox "Your work email" [ref=e262]
+              - button "Sign up" [ref=e263] [cursor=pointer]
+          - paragraph [ref=e265]
+        - generic [ref=e267]:
+          - link "Neo on LinkedIn" [ref=e268] [cursor=pointer]:
+            - /url: https://www.linkedin.com/company/neoworkos
+          - link "Neo on X" [ref=e271] [cursor=pointer]:
+            - /url: https://x.com/neoworkos
+  - alert [ref=e282]
