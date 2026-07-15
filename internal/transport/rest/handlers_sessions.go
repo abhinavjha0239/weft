@@ -47,3 +47,24 @@ func (a *api) handleRevokeOtherSessions(w http.ResponseWriter, r *http.Request, 
 	}
 	writeJSON(w, http.StatusOK, map[string]int64{"revoked": n})
 }
+
+// handleChangePassword: POST /api/v1/me/password — verify the current
+// password, set the new one, and revoke every OTHER live session in the same
+// transaction (the presenting session survives).
+func (a *api) handleChangePassword(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	type req struct {
+		CurrentPassword string `json:"current_password"`
+		NewPassword     string `json:"new_password"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	n, err := auth.ChangePassword(r.Context(), a.Pool, id.UserID,
+		auth.TokenHash(auth.BearerToken(r)), in.CurrentPassword, in.NewPassword)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"revoked_sessions": n})
+}

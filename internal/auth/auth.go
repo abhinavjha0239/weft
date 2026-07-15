@@ -16,6 +16,9 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"golang.org/x/crypto/bcrypt"
+
+	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
 const sessionTTL = 30 * 24 * time.Hour
@@ -121,4 +124,66 @@ func BearerToken(r *http.Request) string {
 		return strings.TrimPrefix(h, "Bearer ")
 	}
 	return r.URL.Query().Get("token")
+}
+
+// ChangePassword verifies the caller's current password and replaces it,
+// revoking every OTHER live session in the SAME transaction (currentHash —
+// the presenting session's token hash — survives; a stolen old session dies
+// with the old password). Returns how many sessions were revoked.
+//
+// A wrong current password — or a missing credential row, indistinguishable —
+// is Forbidden, not Unauthorized: the caller's token IS valid, they just
+// cannot prove the current password. The credential row is locked FOR UPDATE
+// before verification, so concurrent changes serialize and the loser's
+// "current" is checked against the winner's new hash and fails.
+//
+// New-password rules: Bootstrap's minimum (8 bytes) plus a 72-byte maximum —
+// bcrypt silently truncates beyond 72 bytes, so accepting more would mint a
+// password whose tail is ignored. Bootstrap does not enforce the 72-byte cap;
+// it is enforced here only (recorded).
+func ChangePassword(ctx context.Context, pool *pgxpool.Pool, userID int64, currentHash, currentPassword, newPassword string) (int64, error) {
+	if len(newPassword) < 8 {
+		return 0, apperr.Invalid("new password must be at least 8 characters")
+	}
+	if len(newPassword) > 72 {
+		return 0, apperr.Invalid("new password must be at most 72 bytes")
+	}
+	newHash, err := HashPassword(newPassword)
+	if err != nil {
+		return 0, apperr.Internal("hash password", err)
+	}
+	var revoked int64
+	err = db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		var hash string
+		err := tx.QueryRow(ctx,
+			`SELECT password_hash FROM user_credential WHERE user_id = $1 FOR UPDATE`,
+			userID).Scan(&hash)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return apperr.Forbidden("current password is incorrect")
+		}
+		if err != nil {
+			return apperr.Internal("load credential", err)
+		}
+		if !verifyPassword(hash, currentPassword) {
+			return apperr.Forbidden("current password is incorrect")
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE user_credential SET password_hash = $2, updated_at = now()
+			WHERE user_id = $1`, userID, newHash); err != nil {
+			return apperr.Internal("update credential", err)
+		}
+		ct, err := tx.Exec(ctx, `
+			UPDATE auth_session SET revoked_at = now()
+			WHERE user_id = $1 AND revoked_at IS NULL AND expires_at > now()
+			  AND token_hash <> $2`, userID, currentHash)
+		if err != nil {
+			return apperr.Internal("revoke other sessions", err)
+		}
+		revoked = ct.RowsAffected()
+		return nil
+	})
+	if err != nil {
+		return 0, err
+	}
+	return revoked, nil
 }

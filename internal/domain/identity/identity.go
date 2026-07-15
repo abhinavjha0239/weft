@@ -6,6 +6,9 @@ package identity
 import (
 	"context"
 	"errors"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -199,6 +202,36 @@ func (s *Service) Me(ctx context.Context, actor auth.Identity) (MyProfile, error
 		return MyProfile{}, apperr.Internal("me", err)
 	}
 	return p, nil
+}
+
+const maxFullNameRunes = 100
+
+// UpdateMe renames the actor's own account (P-29). Validation: trimmed,
+// non-empty (an explicit PATCH with an empty name is user error — Bootstrap's
+// empty→email defaulting is a bootstrap-only convenience, not a precedent),
+// at most 100 runes, and control-character free (the status.go precedent;
+// interior whitespace is fine — names contain spaces). NOT event-logged
+// (the avatar/status precedent for personal profile data): clients see the
+// new name on their next profile fetch.
+func (s *Service) UpdateMe(ctx context.Context, actor auth.Identity, fullName string) (MyProfile, error) {
+	name := strings.TrimSpace(fullName)
+	if name == "" {
+		return MyProfile{}, apperr.Invalid("full_name is required")
+	}
+	if utf8.RuneCountInString(name) > maxFullNameRunes {
+		return MyProfile{}, apperr.Invalid("full_name must be at most 100 characters")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return MyProfile{}, apperr.Invalid("full_name must not contain control characters")
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE user_account SET full_name = $1 WHERE id = $2 AND org_id = $3`,
+		name, actor.UserID, actor.OrgID); err != nil {
+		return MyProfile{}, apperr.Internal("update full_name", err)
+	}
+	return s.Me(ctx, actor)
 }
 
 // guestVisibleClause is the P-5 boundary on people-read surfaces: guests
