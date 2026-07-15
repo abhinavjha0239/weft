@@ -19,6 +19,12 @@ const (
 	KindInvalid
 	KindConflict
 	KindRateLimited
+	// KindTooLarge → 413: the request is well-formed but exceeds a size or
+	// quota limit (P-19 storage quota).
+	KindTooLarge
+	// KindUnprocessable → 422: the request is well-formed and authorized but
+	// the server refuses to act on the content (P-19 malware-scan rejection).
+	KindUnprocessable
 )
 
 type Error struct {
@@ -42,6 +48,10 @@ func Unauthorized(msg string) error { return &Error{Kind: KindUnauthorized, Msg:
 func Invalid(msg string) error      { return &Error{Kind: KindInvalid, Msg: msg} }
 func Conflict(msg string) error     { return &Error{Kind: KindConflict, Msg: msg} }
 func RateLimited(msg string) error  { return &Error{Kind: KindRateLimited, Msg: msg} }
+func TooLarge(msg string) error     { return &Error{Kind: KindTooLarge, Msg: msg} }
+func Unprocessable(msg string) error {
+	return &Error{Kind: KindUnprocessable, Msg: msg}
+}
 func Internal(op string, err error) error {
 	return &Error{Kind: KindInternal, Msg: op, err: err}
 }
@@ -78,6 +88,10 @@ func HTTPStatus(k Kind) int {
 		return http.StatusConflict
 	case KindRateLimited:
 		return http.StatusTooManyRequests
+	case KindTooLarge:
+		return http.StatusRequestEntityTooLarge
+	case KindUnprocessable:
+		return http.StatusUnprocessableEntity
 	default:
 		return http.StatusInternalServerError
 	}
