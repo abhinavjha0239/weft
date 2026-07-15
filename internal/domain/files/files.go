@@ -164,40 +164,63 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	return out, nil
 }
 
-// StoreDocument records a system-produced artifact (compliance exports)
-// as a first-class file: content-addressed like any upload, uploader = the
-// requesting officer, but WITHOUT the HTTP upload cap — export size is
-// bounded by the export lane, not the request path.
-func (s *Service) StoreDocument(ctx context.Context, actor auth.Identity, name, mime string, data []byte) (File, error) {
+// StoreDocumentStream records a system-produced artifact (compliance exports,
+// export bundles) as a first-class file, streaming from r: content-addressed
+// like any upload (spool + hash so the content hash is the storage key), but
+// WITHOUT the 25 MiB HTTP cap — a system artifact's size is bounded by the
+// lane that produces it (the export worker), not the request path. Uploader is
+// the requesting officer, so the result is downloadable via the normal union
+// ACL (uploader-always).
+func (s *Service) StoreDocumentStream(ctx context.Context, actor auth.Identity, name, mime string, r io.Reader) (File, error) {
 	name = sanitizeName(name)
-	if name == "" || len(data) == 0 {
-		return File{}, apperr.Invalid("document name and content required")
+	if name == "" {
+		return File{}, apperr.Invalid("document name required")
+	}
+	if mime == "" {
+		mime = "application/octet-stream"
+	}
+	spool, err := os.CreateTemp("", "weft-doc-*")
+	if err != nil {
+		return File{}, apperr.Internal("spool", err)
+	}
+	defer func() { spool.Close(); os.Remove(spool.Name()) }()
+	h := sha256.New()
+	size, err := io.Copy(io.MultiWriter(spool, h), r)
+	if err != nil {
+		return File{}, apperr.Internal("read document", err)
+	}
+	if size == 0 {
+		return File{}, apperr.Invalid("empty document")
 	}
 	// Compliance-export artifacts are an org's own storage usage, so they are
-	// quota-enforced too (P-19).
-	if err := s.checkQuota(ctx, actor.OrgID, int64(len(data))); err != nil {
+	// quota-enforced too (P-19) — checked here, once the size is known, so the
+	// []byte wrapper and the streaming path share one gate.
+	if err := s.checkQuota(ctx, actor.OrgID, size); err != nil {
 		return File{}, err
 	}
-	sum := sha256.Sum256(data)
-	shaHex := hex.EncodeToString(sum[:])
+	sum := h.Sum(nil)
+	shaHex := hex.EncodeToString(sum)
 	key := StorageKey(actor.OrgID, shaHex)
-	if err := s.store.Put(ctx, key, bytes.NewReader(data)); err != nil {
+	if _, err := spool.Seek(0, io.SeekStart); err != nil {
+		return File{}, apperr.Internal("rewind spool", err)
+	}
+	if err := s.store.Put(ctx, key, spool); err != nil {
 		return File{}, apperr.Internal("store blob", err)
 	}
 	var out File
-	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO file (org_id, kind, name, mime, size_bytes, sha256,
 				storage_key, uploader_id)
 			VALUES ($1, 1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-			actor.OrgID, name, mime, len(data), sum[:], key, actor.UserID).Scan(&out.ID); err != nil {
+			actor.OrgID, name, mime, size, sum, key, actor.UserID).Scan(&out.ID); err != nil {
 			return apperr.Internal("record file", err)
 		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 			EntityType: enum.EntityFile, EntityID: out.ID, Verb: "file.uploaded",
 			Payload: eventlog.MustPayload(map[string]any{
-				"file_id": out.ID, "name": name, "size_bytes": len(data)}),
+				"file_id": out.ID, "name": name, "size_bytes": size}),
 		}); err != nil {
 			return apperr.Internal("append event", err)
 		}
@@ -206,9 +229,19 @@ func (s *Service) StoreDocument(ctx context.Context, actor auth.Identity, name, 
 	if err != nil {
 		return File{}, err
 	}
-	out.Name, out.Mime, out.Size, out.SHA = name, mime, int64(len(data)), shaHex
+	out.Name, out.Mime, out.Size, out.SHA = name, mime, size, shaHex
 	out.URL = fmt.Sprintf("/api/v1/files/%d", out.ID)
 	return out, nil
+}
+
+// StoreDocument is the bytes convenience over StoreDocumentStream; its result
+// is byte-identical to the pre-stream implementation (same content-addressed
+// key, row, and event).
+func (s *Service) StoreDocument(ctx context.Context, actor auth.Identity, name, mime string, data []byte) (File, error) {
+	if sanitizeName(name) == "" || len(data) == 0 {
+		return File{}, apperr.Invalid("document name and content required")
+	}
+	return s.StoreDocumentStream(ctx, actor, name, mime, bytes.NewReader(data))
 }
 
 // PinForExport records export-job references on files, freezing their
