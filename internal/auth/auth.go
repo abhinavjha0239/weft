@@ -31,7 +31,10 @@ func verifyPassword(hash, pw string) bool {
 	return bcrypt.CompareHashAndPassword([]byte(hash), []byte(pw)) == nil
 }
 
-func hashToken(token string) string {
+// TokenHash is the storage form of a bearer token (auth_session.token_hash):
+// hex(sha256(token)). Exported so the session-management surface can match
+// "the session this request rode in on" without ever storing the raw token.
+func TokenHash(token string) string {
 	sum := sha256.Sum256([]byte(token))
 	return hex.EncodeToString(sum[:])
 }
@@ -52,7 +55,7 @@ func CreateSession(ctx context.Context, q interface {
 	err := q.QueryRow(ctx, `
 		INSERT INTO auth_session (user_id, token_hash, ip, user_agent, expires_at)
 		VALUES ($1, $2, NULLIF($3, ''), NULLIF($4, ''), $5) RETURNING id`,
-		userID, hashToken(token), ip, userAgent, time.Now().Add(sessionTTL)).Scan(&id)
+		userID, TokenHash(token), ip, userAgent, time.Now().Add(sessionTTL)).Scan(&id)
 	if err != nil {
 		return "", fmt.Errorf("auth: create session: %w", err)
 	}
@@ -104,7 +107,7 @@ func FromToken(ctx context.Context, pool *pgxpool.Pool, token string) (Identity,
 		JOIN user_account u ON u.id = s.user_id
 		WHERE s.token_hash = $1 AND s.revoked_at IS NULL
 		  AND s.expires_at > now() AND u.deactivated_at IS NULL`,
-		hashToken(token)).Scan(&id.UserID, &id.OrgID, &id.Kind, &id.Role)
+		TokenHash(token)).Scan(&id.UserID, &id.OrgID, &id.Kind, &id.Role)
 	if err != nil {
 		return Identity{}, ErrUnauthorized
 	}

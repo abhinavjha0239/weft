@@ -131,6 +131,10 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/dms/{id}/participants/me", a.withAuth(a.handleLeaveDM))
 	mux.HandleFunc("GET /api/v1/search", a.withAuth(a.handleSearch))
 	mux.HandleFunc("GET /api/v1/me", a.withAuth(a.handleMe))
+	// P-29 session management: list + revoke-one + revoke-others.
+	mux.HandleFunc("GET /api/v1/me/sessions", a.withAuth(a.handleListSessions))
+	mux.HandleFunc("DELETE /api/v1/me/sessions/{id}", a.withAuth(a.handleRevokeSession))
+	mux.HandleFunc("DELETE /api/v1/me/sessions", a.withAuth(a.handleRevokeOtherSessions))
 	mux.HandleFunc("GET /api/v1/users", a.withAuth(a.handleListUsers))
 	mux.HandleFunc("GET /api/v1/presence", a.withAuth(a.handlePresence))
 	mux.HandleFunc("PUT /api/v1/status", a.withAuth(a.handleSetStatus))
