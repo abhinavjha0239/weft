@@ -1130,7 +1130,7 @@ settable at creation (a PATCH to flip history_mode is a later slice).
 
 ---
 
-### P-17 `compliance: Message retention vacuum.` — L — **[ ] queued — STRONGEST-MODEL EXECUTION (spec ready)**
+### P-17 `compliance: Message retention vacuum.` — L — **[x] shipped #90** (strongest-model execution; hold guard + restore-window bound both red/green-proven; the security/compliance trio is complete)
 Completes AD-3: `retention_policy.duration_days` has had full CRUD +
 validation + `TestRetentionPolicy` since #62, but NOTHING consumes it —
 no lane removes messages by age. This slice is the enforcement lane.
@@ -1223,20 +1223,211 @@ path).
 
 ---
 
+### P-11 `worktrack: Sprints.` — M — **[ ] SPEC-READY (Opus dispatch; branch `feat/worktrack-sprints`)**
+ZERO migrations: the `sprint` table (state 1 future · 2 active · 3
+closed, `starts_at/ends_at/completed_at`, `sprint_space_idx`) and
+`work_item.sprint_id` (FK + partial index) have existed since 0005 with
+no writers — the Tier-2 OPEN "field vs join table" was answered by the
+schema (a COLUMN: one sprint per item, Jira's active-sprint model).
+Read `internal/domain/worktrack/worktrack.go` (CreateSpace/CreateItem/
+UpdateItem patterns, loadSpace, org-scoped `perms.VerbEditItems`) and
+`migrations/0005_work_tracking.sql` lines 154–172 first.
+**Design (decided):**
+- Service methods in a NEW `internal/domain/worktrack/sprints.go`; REST
+  in `handlers_worktrack.go` + router entries. All gates
+  `perms.VerbEditItems` at org scope (the existing item-edit gate; a
+  per-space admin verb is a recorded gap for the whole module).
+- `POST /api/v1/spaces/{id}/sprints` {name, goal, starts_at, ends_at}
+  → a `state=1` (future) sprint. name required, trimmed, 1..100 runes;
+  goal ≤2000; when both dates present, ends_at > starts_at (400).
+  Space must be org-local + live (oracle-free 404 otherwise — the
+  loadSpace shape). Event `sprint.created` (EntityType: new
+  `enum.EntitySprint` — add the next free constant; payload sprint_id,
+  space_id, name).
+- `GET /api/v1/spaces/{id}/sprints` → all the space's sprints ordered
+  state ASC, id DESC, each with {id, name, goal, state, starts_at,
+  ends_at, completed_at, item_count} — item_count from ONE grouped
+  `count(*) FILTER (WHERE trashed_at IS NULL)` join, no N+1.
+- `POST /api/v1/sprints/{id}/start` {starts_at?, ends_at?} → 1→2 only
+  (starting an active/closed sprint 400). Stamps starts_at (body value
+  or now), ends_at if given. ONE ACTIVE SPRINT PER SPACE (Jira parity):
+  if another state=2 sprint exists in the space → 409. Event
+  `sprint.started`.
+- `POST /api/v1/sprints/{id}/close` {move_to_sprint_id?} → 2→3 only
+  (400 otherwise); stamps completed_at. CARRY-OVER (the Tier-2 OPEN,
+  decided): UNFINISHED items (`resolved_at IS NULL AND trashed_at IS
+  NULL AND sprint_id = this`) move to `move_to_sprint_id` — which must
+  be same-space and state ≠ 3 (400) — or to the backlog
+  (`sprint_id = NULL`) when absent. FINISHED items keep their sprint_id
+  (sprint history is the report). One UPDATE, count returned in the
+  `sprint.closed` event payload {sprint_id, moved, moved_to}.
+- `UpdateItemParams` gains `SprintID *int64` (0 clears — the AssigneeID
+  precedent). Validation in the SAME loadItem tx: the sprint exists,
+  belongs to the item's space, and state ≠ 3 (assigning into a closed
+  sprint 400; clearing always allowed). Covered by the existing
+  `workitem.updated` event (add "sprint_id" to its changed-fields
+  payload the way the current fields are reported).
+**Edge cases:** two spaces each with an active sprint — fine (the rule
+is per-space); starting a second sprint in the same space 409; closing
+with move target = the sprint being closed 400; a trashed item never
+carries over; a foreign-org sprint/space is an oracle-free 404
+everywhere; items in OTHER sprints are untouched by close.
+**Tests (`TestSprints`, real Postgres, e2e REST):** lifecycle
+create→start→close with date stamps + events; the one-active 409;
+carry-over — unfinished move to the named target, finished stay, a
+second close moving to backlog (NULL); assign/clear sprint on items
+incl. closed-sprint 400 and cross-space 400; foreign-org 404s.
+RED/GREEN (pin in a comment): drop `resolved_at IS NULL` from the
+carry-over UPDATE → finished items move too and the "finished stay"
+assertion fails.
+**Gaps to record:** per-space admin verb (sprint CRUD rides
+edit_items org-wide); sprint reports/velocity; auto-create-next on
+close; workitem.sprint_changed as a first-class automation trigger.
+
+---
+
+### P-12 `worktrack: Board ordering (LexoRank) and saved views.` — M — **[ ] SPEC-READY (Opus dispatch; branch `feat/worktrack-board-order`)**
+ZERO migrations: `work_item.rank TEXT COLLATE "C"` +
+`rank_context_id` + `work_item_rank_idx` and the whole `view_def`
+table (layout 1 list · 2 kanban · 3 timeline · 4 saved-search, query
+JSONB, owner_id) have existed since 0005; REALITY records "rank is
+static v1". Every space already owns a rank_context (seeded at
+CreateSpace). Read worktrack.go (ListItems ordering, loadSpace),
+0005 lines 67–72 + 239–254 first.
+**Design (decided):**
+- **Rank alphabet**: lowercase `a`–`z` only, byte order (COLLATE "C"
+  makes it authoritative). Helper `rankBetween(lo, hi string) (string,
+  ok)` in a new `rank.go` with unit tests: midpoint of two strings
+  ("" lo = start sentinel, "" hi = end sentinel); appends when needed
+  (between "ab" and "ac" → "abm"...); returns !ok only when lo and hi
+  are equal or adjacent with no midpoint (caller rebalances).
+- `POST /api/v1/items/{id}/move` {after_item_id?, before_item_id?} —
+  at least one (400 if neither); both items must be live, org-local,
+  and share the moved item's rank_context (else 400/404 — cross-space
+  moves are NOT this slice). Gate `VerbEditItems`. In ONE tx: lock the
+  context's items `FOR UPDATE` ordered by rank; **NULL-rank backfill**
+  — if any item in the context has NULL rank (pre-P-12 rows), assign
+  evenly spaced ranks in id order first; compute the neighbor pair
+  from after/before, `rankBetween`; on !ok REBALANCE the whole context
+  (evenly respaced, ~3-char strings) and retry once. Update the moved
+  item's rank; event `workitem.reordered` {item_id, after, before}.
+- `ListItems` ORDER BY changes to `rank NULLS LAST, id` — the board
+  order surfaces everywhere items list.
+- **Saved views** (`views.go` + handlers): personal in v1 (owner_id =
+  creator; sharing is a recorded gap).
+  `POST /api/v1/views` {name 1..100, layout 1..4, space_id, query,
+  config?} — query shape v1: `{"filters":[{"field":F,"op":O,"value":V}]}`
+  with F ∈ {status_id, type_id, assignee_id, sprint_id, label,
+  flagged}, O ∈ {eq, in} (in = array value); anything else 400 AT
+  WRITE. space_id must be org-local (404). Stored with space_id inside
+  query JSON (the column set has no space_id — keep the validated
+  space in the query object).
+  `GET /api/v1/views` → caller's own views. `PATCH /api/v1/views/{id}`
+  (name/layout/query/config, re-validated) and `DELETE` — owner-only,
+  a foreign or other-owner view is an oracle-free 404.
+  `GET /api/v1/views/{id}` → one view (owner-only, oracle-free 404).
+  ListItems is NOT auto-filtered by a view — a view is a saved query
+  the client applies; server-side view execution is a recorded gap.
+**Edge cases:** move with neither neighbor 400; neighbors in a
+different rank_context 400; a context whose items are all NULL-rank
+backfills before the move; rebalance-then-retry once when the midpoint
+is exhausted; an unknown filter field/op 400 at both POST and PATCH;
+another owner's view is an oracle-free 404 on GET/PATCH/DELETE.
+**Tests (`TestBoardOrder` + `TestSavedViews`, real Postgres):**
+`rankBetween` unit table (start/end sentinels, appends, adjacent
+!ok); reorder via after/before with a live re-query proving the new
+order; NULL-rank backfill; a forced rebalance (seed adjacent ranks)
+and the single retry; cross-context 400. Views: CRUD, query-validation
+400s, owner-isolation 404s. RED/GREEN (pin in a comment): make
+`rankBetween` return the `lo` bound → two items collide on rank and
+the order assertion fails.
+**Gaps to record:** server-side view execution (filter → ListItems);
+shared/team views; cross-space/cross-context moves; timeline/kanban
+server support beyond storage.
+
+---
+
+### P-13 `worktrack: Custom fields and item links.` — L — **[ ] SPEC-READY (Opus dispatch; branch `feat/worktrack-fields-links`)**
+ZERO migrations: `field_def` (typed taxonomy, `applies_to` item-type
+ids, `required`, `options` JSONB, `UNIQUE(space_id,key)`),
+`work_item.fields` JSONB (GIN-indexed values), and `link_type` +
+`work_item_link` (keyed by internal ids so links survive moves,
+`UNIQUE(from,to,type)`) all exist since 0005. Read worktrack.go
+(CreateItem/UpdateItem, loadSpace, how status_set/item_type are
+seeded) and 0005 lines 45–63 + 124–145 first.
+**Design (decided):**
+- **Field type set v1** — a Go registry constant, a subset of the
+  schema taxonomy: `text_short`, `text_long`, `number`, `date`,
+  `checkbox`, `select`, `multi_select`. Any other type 400s until its
+  validator lands (recorded gap). One `fieldValidate(def, value)` in a
+  new `fields.go`, unit-tested per type.
+- **Field defs** (`fields.go` + handlers), gate `VerbEditItems` org
+  scope: `POST /api/v1/spaces/{id}/field-defs` {key, name, field_type,
+  applies_to?, required?, options?} — key matches the schema CHECK
+  `^[a-z][a-z0-9_]{0,62}$`, unique per space (pre-check the index like
+  CreateChannel → 409 on dup); select/multi_select require
+  `options.choices` (non-empty string array) else 400; applies_to ids
+  must be the space's item types (400). Event `field_def.created`
+  (new `enum.EntityFieldDef`). `GET` → the space's defs ordered
+  position, id. `PATCH`/`DELETE` — name/required/options/position
+  mutable; key + field_type IMMUTABLE (a type change would strand
+  stored values). DELETE removes the def only; existing values in
+  `work_item.fields` are left as inert orphans (a strip-sweep is a
+  recorded gap) — no mass UPDATE, so it stays O(1) at scale.
+- **Value validation** woven into CreateItem/UpdateItem: a new
+  `Fields map[string]any` on both param structs. On write, load the
+  space's field_defs ONCE, validate each supplied key against its def
+  (unknown key 400; v1 validates SUPPLIED values and does not force
+  required-field presence — recorded gap), then store into
+  `work_item.fields`. UpdateItem merges (absent key = leave, explicit
+  null = clear); the `workitem.updated` payload lists the changed
+  field KEYS only (never values — the mention-id precedent).
+- **Item links** (`links.go` + handlers), gate `VerbEditItems`:
+  `POST /api/v1/items/{id}/links` {to_item_id, link_type_id} — both
+  items org-local + live; link_type org-local; no self-link (400);
+  `UNIQUE(from,to,type)` → 409 on dup; the inverse is IMPLICIT (ONE
+  row, rendered both ways via link_type inward/outward — never two
+  rows). Event `workitem.linked`. `GET /api/v1/items/{id}/links` →
+  links in both directions with the resolved phrase and the other
+  item's {id, key, title, status}. `DELETE .../links/{link_id}` from
+  either endpoint (event `workitem.unlinked`). System link types
+  (blocks / is blocked by; relates to) seeded per org — mirror EXACTLY
+  how status_set/item_type seeding works (read it; do not invent a
+  second seeding path).
+- **F-5 consent polish**: a cross-space link is allowed only when the
+  actor can edit both spaces — `VerbEditItems` is org-wide in v1 so
+  this holds today; the per-space consent ceremony is a recorded gap,
+  stated not faked.
+**Edge cases:** unknown field key 400; wrong-type value 400 (string
+into number, non-choice into select, non-array into multi_select);
+clear via explicit null; def delete leaves inert orphan values;
+self-link 400; duplicate link 409; foreign-org item/link 404; unlink
+from either endpoint; a link survives a status/rank change on either
+item (keyed by id, asserted).
+**Tests (`TestCustomFields` + `TestItemLinks`, real Postgres):**
+`fieldValidate` unit table per type; def CRUD incl. dup-key 409 and
+options validation; value set/merge/clear with the GIN round-trip;
+def delete leaving orphans. Links: both-direction render, self 400,
+dup 409, unlink, cross-org 404, link survives an item change.
+RED/GREEN (pin in a comment): drop the type check in `fieldValidate`
+→ a string lands in a number field and the type assertion fails.
+**Gaps to record:** required-field presence enforcement; the remaining
+field types (user/version/cascading/…); per-space admin verb (the
+whole module rides `edit_items` org-wide); orphan-value strip sweep;
+link graph / blocked-by rollups; cross-space consent ceremony.
+
+---
+
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
 (Each needs a final-spec pass by the strongest model; the bullets below
 record the scope and the known design questions so nothing is lost.)
 
-- **P-11 `worktrack: Sprints.`** M — sprint entity per space, start/
-  close, item assignment, `sprint.started/closed` events (automation
-  triggers). OPEN: carry-over semantics for unfinished items; whether
-  sprint is a field or a join table (schema check first).
-- **P-12 `worktrack: Board ordering (LexoRank) and saved views.`** M —
-  OPEN: rank column collision/rebalance policy; view = stored query
-  (ADR-008 View) minimal shape.
-- **P-13 `worktrack: Custom fields and item links.`** L — typed field
-  defs per space + values + F-5 relationship consent ceremony polish.
-  OPEN: field type set v1; validation model.
+- **P-11** — **promoted to Tier 1** (full spec above; zero migrations —
+  the sprint table + work_item.sprint_id exist since 0005).
+- **P-12** — **promoted to Tier 1** (full spec above; zero migrations —
+  rank/rank_context + view_def exist since 0005).
+- **P-13** — **promoted to Tier 1** (full spec above; zero migrations —
+  field_def + work_item.fields + the link tables exist since 0005).
 - **P-14** — **promoted to Tier 1** (full spec above; re-scoped to
   waking the dormant pinned/color columns — named sections need
   schema and stay here).
