@@ -350,7 +350,13 @@ func (s *Service) requireMember(ctx context.Context, tx pgx.Tx, channelID, userI
 }
 
 // requireParticipant is the DM visibility gate: participation IS the
-// permission (no verb chain — a DM has no admin surface in v1).
+// permission (no verb chain — a DM has no admin surface in v1). A miss is an
+// oracle-free NotFound, never a Forbidden: for a DM, participation IS
+// visibility, so a non-participant must not be able to distinguish a
+// conversation that is absent from one they are merely denied — the same
+// contract single-message Get already honors (P-33). This one return covers
+// every caller (ListMessages, the InsertThreadMessage send path, and the
+// read-state mark-read), which all just propagate the error.
 func (s *Service) requireParticipant(ctx context.Context, tx pgx.Tx, dmSpaceID, userID int64) error {
 	var in bool
 	if err := tx.QueryRow(ctx, `
@@ -360,7 +366,7 @@ func (s *Service) requireParticipant(ctx context.Context, tx pgx.Tx, dmSpaceID, 
 		return apperr.Internal("participant check", err)
 	}
 	if !in {
-		return apperr.Forbidden("not a participant of this conversation")
+		return apperr.NotFound("conversation not found")
 	}
 	return nil
 }
