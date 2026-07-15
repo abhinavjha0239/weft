@@ -30,15 +30,20 @@ type Janitor struct {
 	// last referencing message (Zulip's 30-day archive vacuum delay).
 	UnclaimedGrace time.Duration
 	DeadRefWindow  time.Duration
-	Interval       time.Duration
+	// VacuumRestoreWindow: how long a retention-vacuumed message stays
+	// recoverable (soft-tombstoned) before the purge lane permanently
+	// removes it (P-17). Mirrors DeadRefWindow's role for files.
+	VacuumRestoreWindow time.Duration
+	Interval            time.Duration
 }
 
 func NewJanitor(pool *pgxpool.Pool, store blob.Store, log *slog.Logger) *Janitor {
 	return &Janitor{
 		pool: pool, store: store, log: log,
-		UnclaimedGrace: 35 * 24 * time.Hour,
-		DeadRefWindow:  30 * 24 * time.Hour,
-		Interval:       time.Hour,
+		UnclaimedGrace:      35 * 24 * time.Hour,
+		DeadRefWindow:       30 * 24 * time.Hour,
+		VacuumRestoreWindow: 30 * 24 * time.Hour,
+		Interval:            time.Hour,
 	}
 }
 
@@ -49,6 +54,7 @@ type Report struct {
 	BlobsDeleted      int `json:"blobs_deleted"`
 	RevisionsScrubbed int `json:"revisions_scrubbed"`
 	MessagesVacuumed  int `json:"messages_vacuumed"`
+	MessagesPurged    int `json:"messages_purged"`
 }
 
 // Run sweeps on a ticker until ctx ends.
@@ -69,7 +75,8 @@ func (j *Janitor) Run(ctx context.Context) {
 				j.log.Info("janitor: swept",
 					"unclaimed", rep.UnclaimedPurged, "dead_ref", rep.DeadRefPurged,
 					"blobs", rep.BlobsDeleted, "revisions", rep.RevisionsScrubbed,
-					"messages_vacuumed", rep.MessagesVacuumed)
+					"messages_vacuumed", rep.MessagesVacuumed,
+					"messages_purged", rep.MessagesPurged)
 			}
 		}
 	}
@@ -171,8 +178,26 @@ func (j *Janitor) SweepOnce(ctx context.Context, now time.Time) (Report, error) 
 	if err := j.vacuumMessages(ctx, now, &rep.MessagesVacuumed); err != nil {
 		return rep, err
 	}
+	if err := j.purgeVacuumedMessages(ctx, now.Add(-j.VacuumRestoreWindow),
+		&rep.MessagesPurged); err != nil {
+		return rep, err
+	}
 	return rep, nil
 }
+
+// purgeVacuumedPredicate selects retention-vacuumed messages whose restore
+// window has elapsed and that are NOT under an active legal hold — a hold
+// placed after the vacuum freezes permanent removal, so a held message stays
+// tombstoned and recoverable. $1 = message id (NULL in the scan), $2 = the
+// window cutoff (now - VacuumRestoreWindow).
+const purgeVacuumedPredicate = `
+	m.retention_vacuumed_at IS NOT NULL AND ($1::bigint IS NULL OR m.id = $1)
+	  AND m.retention_vacuumed_at < $2::timestamptz
+	  AND NOT EXISTS (
+	      SELECT 1 FROM legal_hold h
+	      WHERE h.org_id = m.org_id AND h.released_at IS NULL
+	        AND (h.custodian_user_id = m.author_id
+	          OR h.channel_id = m.channel_id))`
 
 const sweepBatch = 200
 
@@ -384,6 +409,104 @@ func (j *Janitor) vacuumMessage(ctx context.Context, msgID int64, now time.Time,
 			return fmt.Errorf("janitor: vacuum event: %w", err)
 		}
 		*vacuumed++
+		return nil
+	})
+}
+
+// purgeVacuumedMessages permanently removes messages whose restore window
+// has elapsed (P-17 commit 2). The batch scan / per-row lock + recheck
+// mirrors the other lanes.
+func (j *Janitor) purgeVacuumedMessages(ctx context.Context, cutoff time.Time, purged *int) error {
+	for {
+		rows, err := j.pool.Query(ctx, `
+			SELECT m.id FROM message m WHERE `+purgeVacuumedPredicate+`
+			ORDER BY m.id LIMIT `+fmt.Sprint(sweepBatch),
+			nil, cutoff)
+		if err != nil {
+			return fmt.Errorf("janitor: purge scan: %w", err)
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("janitor: purge scan: %w", err)
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("janitor: purge scan: %w", err)
+		}
+		for _, id := range ids {
+			if err := j.purgeVacuumedMessage(ctx, id, cutoff, purged); err != nil {
+				return err
+			}
+		}
+		if len(ids) < sweepBatch {
+			return nil
+		}
+	}
+}
+
+// purgeVacuumedMessage permanently removes one message and everything that
+// references it, in a transaction after re-checking eligibility under a row
+// lock. Child rows are deleted (reactions, pins, saved items, user flags,
+// reports, link previews, revisions, reminders, and the scheduled_message
+// send record — cleared outright rather than NULLed, which would re-arm the
+// due index) and the no-FK back-references are nulled (thread.root_message_id,
+// forwarded_from_message_id on any forward copy). The event_log has no FK to
+// message, so the audit trail — including this message's own created/vacuumed
+// entries — survives; a retention.message_purged entry is appended.
+func (j *Janitor) purgeVacuumedMessage(ctx context.Context, msgID int64, cutoff time.Time, purged *int) error {
+	return db.WithTx(ctx, j.pool, func(tx pgx.Tx) error {
+		var orgID int64
+		err := tx.QueryRow(ctx,
+			`SELECT org_id FROM message WHERE id = $1 AND retention_vacuumed_at IS NOT NULL FOR UPDATE`,
+			msgID).Scan(&orgID)
+		if err == pgx.ErrNoRows {
+			return nil // purged or restored by a concurrent actor
+		}
+		if err != nil {
+			return fmt.Errorf("janitor: purge lock: %w", err)
+		}
+		var eligible bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM message m WHERE `+purgeVacuumedPredicate+`)`,
+			msgID, cutoff).Scan(&eligible); err != nil {
+			return fmt.Errorf("janitor: purge recheck: %w", err)
+		}
+		if !eligible {
+			return nil
+		}
+		for _, stmt := range []string{
+			`DELETE FROM reaction WHERE message_id = $1`,
+			`DELETE FROM pin WHERE message_id = $1`,
+			`DELETE FROM saved_item WHERE message_id = $1`,
+			`DELETE FROM message_user_flag WHERE message_id = $1`,
+			`DELETE FROM message_report WHERE message_id = $1`,
+			`DELETE FROM message_link_preview WHERE message_id = $1`,
+			`DELETE FROM message_revision WHERE message_id = $1`,
+			`DELETE FROM reminder WHERE message_id = $1`,
+			`DELETE FROM scheduled_message WHERE sent_message_id = $1`,
+			`UPDATE thread SET root_message_id = NULL WHERE root_message_id = $1`,
+			`UPDATE message SET forwarded_from_message_id = NULL WHERE forwarded_from_message_id = $1`,
+		} {
+			if _, err := tx.Exec(ctx, stmt, msgID); err != nil {
+				return fmt.Errorf("janitor: purge cleanup: %w", err)
+			}
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM message WHERE id = $1`, msgID); err != nil {
+			return fmt.Errorf("janitor: purge: %w", err)
+		}
+		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+			OrgID: orgID, ActorKind: enum.ActorSystem,
+			EntityType: enum.EntityMessage, EntityID: msgID, Verb: "retention.message_purged",
+			Payload: eventlog.MustPayload(map[string]any{"message_id": msgID}),
+		}); err != nil {
+			return fmt.Errorf("janitor: purge event: %w", err)
+		}
+		*purged++
 		return nil
 	})
 }

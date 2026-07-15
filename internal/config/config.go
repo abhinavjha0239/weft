@@ -29,6 +29,9 @@ type Config struct {
 	// referencing message was deleted (Zulip's 30-day vacuum delay).
 	GCUnclaimedDays int
 	GCDeadRefDays   int
+	// VacuumRestoreDays: how long a retention-vacuumed message stays
+	// recoverable (soft-tombstoned) before the purge lane removes it (P-17).
+	GCVacuumRestoreDays int
 	// Outbound mail seam: "log" (default, never sends) or "smtp".
 	MailDriver string
 	SMTPAddr   string
@@ -60,6 +63,7 @@ func Load() (Config, error) {
 	c.S3Prefix = os.Getenv(brand.EnvPrefix + "S3_PREFIX")
 	c.GCUnclaimedDays = envDays("GC_UNCLAIMED_DAYS", 35)
 	c.GCDeadRefDays = envDays("GC_DEAD_REF_DAYS", 30)
+	c.GCVacuumRestoreDays = envDays("GC_VACUUM_RESTORE_DAYS", 30)
 	c.SigningSecret = os.Getenv(brand.EnvPrefix + "SIGNING_SECRET")
 	c.BaseURL = strings.TrimRight(os.Getenv(brand.EnvPrefix+"BASE_URL"), "/")
 	if c.BaseURL == "" {

@@ -160,6 +160,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	janitor := compliance.NewJanitor(pool, store, log)
 	janitor.UnclaimedGrace = time.Duration(cfg.GCUnclaimedDays) * 24 * time.Hour
 	janitor.DeadRefWindow = time.Duration(cfg.GCDeadRefDays) * 24 * time.Hour
+	janitor.VacuumRestoreWindow = time.Duration(cfg.GCVacuumRestoreDays) * 24 * time.Hour
 	go janitor.Run(ctx)
 
 	notifSvc := notification.New(pool)

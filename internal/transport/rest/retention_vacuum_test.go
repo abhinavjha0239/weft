@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"testing"
 	"time"
@@ -125,8 +126,30 @@ func TestRetentionVacuum(t *testing.T) {
 		}
 		return
 	}
+	rowExists := func(msgID int64) bool {
+		t.Helper()
+		var exists bool
+		if err := pool.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM message WHERE id = $1)`, msgID).Scan(&exists); err != nil {
+			t.Fatalf("row exists %d: %v", msgID, err)
+		}
+		return exists
+	}
 
 	gMsg := send(boot.ChannelID, "general note")
+	// Give gMsg associations so the purge lane's FK cleanup is exercised.
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/messages/%d/reactions/%s",
+		ts.URL, gMsg, url.PathEscape("👍")), boot.Token, nil); code != http.StatusOK {
+		t.Fatalf("react gMsg = %d", code)
+	}
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/messages/%d/save", ts.URL, gMsg),
+		boot.Token, nil); code != http.StatusOK {
+		t.Fatalf("save gMsg = %d", code)
+	}
+	if code := patchJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, gMsg),
+		boot.Token, map[string]any{"content": "general note v2"}); code != http.StatusOK {
+		t.Fatalf("edit gMsg = %d", code)
+	}
 	hotMsg := send(hot, "ephemeral")
 	coldMsg := send(cold, "archival")
 	keptMsg := send(kept, "permanent")
@@ -226,6 +249,72 @@ func TestRetentionVacuum(t *testing.T) {
 	}
 	if visible(heldMsg) {
 		t.Fatal("released-then-aged message must vacuum")
+	}
+
+	// By now four messages are vacuumed (hotMsg, gMsg, dmMsg, heldMsg), all
+	// stamped at `future`. Phase F — a sweep still inside the 30-day restore
+	// window purges none of them.
+	withinWindow := future.Add(29 * 24 * time.Hour)
+	if rep, err := janitor.SweepOnce(ctx, withinWindow); err != nil || rep.MessagesPurged != 0 {
+		t.Fatalf("within-window sweep = %+v (%v), want zero purged", rep, err)
+	}
+	if !rowExists(gMsg) {
+		t.Fatal("a vacuumed message inside its restore window must still exist")
+	}
+
+	// A legal hold placed during the window freezes permanent removal. Hold
+	// #hot (covers hotMsg + heldMsg), then sweep past the window: the unheld
+	// #general and DM messages purge; the held #hot ones stay.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO legal_hold (org_id, name, channel_id, created_by)
+		VALUES ($1, 'freeze hot', $2, $3)`, boot.OrgID, hot, boot.UserID); err != nil {
+		t.Fatalf("insert channel hold: %v", err)
+	}
+	pastWindow := future.Add(31 * 24 * time.Hour)
+	if rep, err := janitor.SweepOnce(ctx, pastWindow); err != nil || rep.MessagesPurged != 2 {
+		t.Fatalf("past-window sweep = %+v (%v), want 2 purged (general + dm)", rep, err)
+	}
+	if rowExists(gMsg) || rowExists(dmSent.MessageID) {
+		t.Fatal("past-window unheld messages must be permanently removed")
+	}
+	if !rowExists(hotMsg) || !rowExists(heldMsg) {
+		t.Fatal("held vacuumed messages must NOT be purged")
+	}
+
+	// gMsg's child rows are gone; its audit trail survives (event_log has no
+	// FK to message, so created + vacuumed + purged all remain).
+	for _, tbl := range []string{"reaction", "saved_item", "message_revision", "message_link_preview"} {
+		var n int
+		if err := pool.QueryRow(ctx,
+			fmt.Sprintf(`SELECT count(*) FROM %s WHERE message_id = $1`, tbl), gMsg).Scan(&n); err != nil {
+			t.Fatalf("count %s: %v", tbl, err)
+		}
+		if n != 0 {
+			t.Fatalf("%s rows for purged gMsg = %d, want 0", tbl, n)
+		}
+	}
+	var vac, purg, created int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FILTER (WHERE verb = 'retention.message_vacuumed'),
+		       count(*) FILTER (WHERE verb = 'retention.message_purged'),
+		       count(*) FILTER (WHERE verb = 'message.created')
+		FROM event_log WHERE entity_type = 1 AND entity_id = $1`, gMsg).Scan(&vac, &purg, &created); err != nil {
+		t.Fatalf("audit trail query: %v", err)
+	}
+	if vac != 1 || purg != 1 || created != 1 {
+		t.Fatalf("gMsg audit trail vac=%d purg=%d created=%d, want 1/1/1 (spine survives purge)", vac, purg, created)
+	}
+
+	// Phase G — release the hold; the next past-window sweep takes the rest.
+	if _, err := pool.Exec(ctx,
+		`UPDATE legal_hold SET released_at = now() WHERE name = 'freeze hot'`); err != nil {
+		t.Fatalf("release channel hold: %v", err)
+	}
+	if rep, err := janitor.SweepOnce(ctx, pastWindow); err != nil || rep.MessagesPurged != 2 {
+		t.Fatalf("post-release purge = %+v (%v), want hotMsg + heldMsg", rep, err)
+	}
+	if rowExists(hotMsg) || rowExists(heldMsg) {
+		t.Fatal("released vacuumed messages must purge")
 	}
 }
 
