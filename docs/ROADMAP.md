@@ -1130,6 +1130,99 @@ settable at creation (a PATCH to flip history_mode is a later slice).
 
 ---
 
+### P-17 `compliance: Message retention vacuum.` — L — **[ ] queued — STRONGEST-MODEL EXECUTION (spec ready)**
+Completes AD-3: `retention_policy.duration_days` has had full CRUD +
+validation + `TestRetentionPolicy` since #62, but NOTHING consumes it —
+no lane removes messages by age. This slice is the enforcement lane.
+Read `compliance/janitor.go` (the host — its file/scrub lanes are the
+pattern), `messaging/edit.go` `DeleteMessage` (the tombstone shape to
+reuse), and the `retention_policy`/`legal_hold` DDL first.
+**AUDIT FINDINGS (drive the design):**
+- `duration_days` is fully wired end-to-end EXCEPT enforcement; `-1`
+  means keep forever (the common case — must be excluded from the
+  sweep).
+- `DeleteMessage` already defines the tombstone: capture content into a
+  kind-4 `message_revision` row, blank the live row (`source=''`,
+  `ast='{}'`, `rendered=''`, flags off, `deleted_at=now()`), drop pins,
+  decrement the thread count, emit an event. The vacuum reuses this
+  shape, writing the same tables directly from the compliance package
+  exactly as `scrubRevisions` already does.
+- `event_log.entity_id` is a plain BIGINT with NO FK to `message` — the
+  audit spine survives removal; the lane logs its own verbs.
+- FKs INTO `message(id)` that a hard purge must clear first (NOT NULL
+  unless noted): `message_revision`, `reaction`, `pin`, `saved_item`,
+  `message_user_flag`, `message_report`; nullable back-refs to NULL:
+  `scheduled_message.sent_message_id`, `reminder.message_id`,
+  `thread.root_message_id`; `message_link_preview` has no FK (P-15) but
+  is cleared to avoid orphans.
+- The scope ladder is `scrubRevisions`' nearest-wins channel(3)→org(1);
+  workspace/space/dm rungs are a recorded gap there and stay one here
+  for consistency.
+**Design (decided): archive-shape = in-place tombstone** (reuses the
+delete machinery, stays in-package, one nullable marker column, cheapest
+to migrate away from later; the dedicated-archive-table variant is a
+scale optimization deferred until volume calls for it).
+- **Commit 1 — `compliance: Vacuum messages past their retention age.`**
+  Migration adds `message.retention_vacuumed_at TIMESTAMPTZ` (nullable;
+  distinguishes a retention tombstone from a user delete). New janitor
+  lane `vacuumMessages`: candidate scan for `deleted_at IS NULL` rows
+  whose `created_at < now() - (effective duration_days)` where the
+  effective policy is not forever (-1), NOT under an active
+  `legal_hold` (custodian = author OR held channel = message channel —
+  the scrub lane's guard), batched with the same per-row lock +
+  in-tx recheck the file lane uses. Each eligible row is tombstoned
+  (kind-4 revision capture + live-row blanking + pin drop + thread-count
+  decrement) and logged `retention.message_vacuumed` (system actor).
+  Invisible everywhere immediately — every read filters `deleted_at IS
+  NULL`, incl. the P-16 authed + anonymous paths.
+- **Commit 2 — `compliance: Purge vacuumed messages after the restore window.`**
+  New janitor field `VacuumRestoreWindow` (default 30d, mirrors the file
+  `DeadRefWindow`). New lane `purgeVacuumedMessages`: rows with
+  `retention_vacuumed_at < now() - window` AND still not legal-held are
+  permanently removed — clear the eight child rows / null the three
+  back-refs above inside one tx per message (the lock+recheck pattern),
+  then `DELETE` the row, log `retention.message_purged`. The window is
+  the safety net against a misconfigured short policy. A re-held message
+  (hold added during the window) is skipped and stays tombstoned.
+**Edge cases:** a `-1` (forever) effective policy never vacuums; a hold
+placed AFTER a soft-vacuum freezes the purge (message stays recoverable);
+a message already user-deleted is skipped by the vacuum (`deleted_at`
+set) but its own `deleted_at`-based file/revision reclaim is unaffected;
+purging a thread's root message nulls `thread.root_message_id` (the
+thread row and its summary survive); a forwarded message whose original
+is purged keeps its own copied content (forwards copy, never reference —
+P-03). Cross-org impossible: every query is org-scoped via the message's
+`org_id` and the policy's `org_id`.
+**Performance:** both lanes are batched (200/sweep) keyset scans over
+`message` filtered by `deleted_at`/`retention_vacuumed_at` + a correlated
+policy lookup; no new index in v1 (the sweep is a low-frequency
+background lane, hourly like the file janitor) — a partial index on
+`(retention_vacuumed_at)` is a noted follow-up if sweep latency shows up.
+**Tests (`TestRetentionVacuum`, real Postgres):**
+- age boundary: a message older than a 1-day channel policy is
+  vacuumed; a fresh one is not; a `-1` org scope never vacuums.
+- ladder: a channel policy overrides a stricter/looser org default.
+- **legal-hold guard, RED/GREEN**: a message under a custodian/channel
+  hold is NOT vacuumed; neutering the hold predicate vacuums it and the
+  assertion fails. Same red/green for the purge lane (a hold added
+  during the window blocks permanent removal).
+- tombstone correctness: content moved to a kind-4 revision, live row
+  blanked, pins dropped, thread count decremented, invisible on the
+  P-16 authed + anonymous read paths, `retention.message_vacuumed`
+  logged, `event_log` intact.
+- purge correctness: after the window every listed child row is gone /
+  back-ref nulled, the message row is removed, `retention.message_purged`
+  logged; a not-yet-elapsed tombstone is left intact (RED/GREEN on the
+  window boundary).
+**Gaps to record:** first-class restore API (needs content re-render,
+which lives in messaging — recovery is DB-level within the window for
+now); workspace/space/dm policy rungs; per-partial-index tuning;
+attachment blob reclaim still flows through the existing file dead-ref
+lane once the message tombstone lands (documented linkage, not a new
+path).
+
+---
+
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
 (Each needs a final-spec pass by the strongest model; the bullets below
 record the scope and the known design questions so nothing is lost.)
@@ -1150,9 +1243,9 @@ record the scope and the known design questions so nothing is lost.)
 - **P-15** — **promoted to Tier 1** (full spec above; STRONGEST-MODEL
   EXECUTION — the egress guard is the reusable core P-24 inherits).
 - **P-16** — **promoted to Tier 1** (full spec above; STRONGEST-MODEL EXECUTION; zero migrations — the columns exist since 0003).
-- **P-17 `compliance: Message retention vacuum.`** L — archive-then-
-  vacuum with restore window (AD-3 completion). OPEN: archive storage
-  shape (rows vs export-file), restore API. Strongest-model execution.
+- **P-17** — **promoted to Tier 1** (full spec above; strongest-model
+  execution; archive shape decided = in-place tombstone; restore API
+  deferred as a recorded gap).
 - **P-18 `files: Image thumbnails + inline rendering allowlist.`** M —
   OPEN: image processing dependency choice (pure-Go vs libvips),
   thumbnail storage keys, srcset shape.
