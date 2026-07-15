@@ -668,6 +668,237 @@ body does NOT echo the dm_space_id); participant flows unchanged;
 single-message Get still 404 (regression pin).
 **Gaps to record:** P-34 channel existence masking (NEEDS-DESIGN).
 
+### P-35 `identity: Password reset via email.` — M — **[ ] queued**
+Migration **0013_password_reset.sql** (the number is PINNED — P-19 in
+this batch takes 0014; db.Migrate is filename-keyed and gap-tolerant,
+verified). Read `auth/auth.go` (ChangePassword, session pattern),
+`platform/mail/mail.go` (Message), and the router's preAuth limiter
+first.
+**Design (decided):**
+- Migration 0013: `password_reset(id identity PK, user_id BIGINT NOT
+  NULL REFERENCES user_account, token_hash TEXT NOT NULL UNIQUE,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at
+  TIMESTAMPTZ NOT NULL, used_at TIMESTAMPTZ)` + index on (user_id).
+  DB rows, not a stateless MAC: single-use and revoke-on-change
+  REQUIRE server state.
+- `identity.SetMailer(sender mail.Sender)` wired in weftd (the
+  SetSigningSecret composition pattern). No mailer configured → the
+  request endpoint still returns 200 and sends nothing (log once).
+- `POST /api/v1/password-reset/request` {org_slug, email} — ALWAYS
+  200 `{"ok": true}` regardless of outcome (user enumeration is the
+  threat model). Behind the SAME preAuth withIPLimit as login. When
+  the (org, email) resolves to a LIVE kind-1 user WITH a credential
+  row: mint 32 random bytes hex, store sha256 hash (auth.TokenHash),
+  TTL 1 hour; send a TEXT mail.Message: subject "[<brand>] Password
+  reset", body carries the org slug, the TOKEN itself, the 1-hour
+  expiry, and "ignore if you didn't request this" (API-first: no web
+  page exists yet — the client-era link format is a recorded gap).
+  Per-user throttle: if the user already has 3 unused unexpired
+  tokens, return 200 and send NOTHING (silent — no oracle).
+  Placeholder (kind 3) and credential-less accounts get the silent
+  200 (claiming imported placeholders is its own future slice).
+- `POST /api/v1/password-reset/confirm` {token, new_password} — also
+  behind preAuth. Look up by token hash where used_at IS NULL AND
+  expires_at > now() AND the user is live; every failure mode
+  (unknown/expired/used token, deactivated user) is the SAME 401
+  "invalid or expired token" (oracle-free). New password: min 8, max
+  72 bytes (the ChangePassword rules). In ONE tx: verify+claim the
+  token (UPDATE ... SET used_at = now() WHERE ... AND used_at IS NULL
+  — the row claim IS the race guard), upsert the credential hash,
+  revoke ALL live sessions (no exception — mailbox control resets
+  everything), and DELETE the user's other outstanding reset rows.
+  200 `{"ok": true}`.
+- `auth.ChangePassword` (P-29) additionally DELETEs the user's
+  password_reset rows in its tx — a changed password voids any
+  in-flight reset mail.
+**Edge cases:** double-confirm of the same token → second gets 401
+(the claim UPDATE affected 0 rows); confirm then login works
+immediately; a reset for a user with zero sessions still works;
+email lookup is lower(email) org-scoped (the Login pattern);
+concurrent confirms of the same token → exactly one wins.
+**Performance:** all single-row indexed ops; the throttle count is
+one indexed probe.
+**Tests (TestPasswordReset):** full loop (request → capture the mail
+via a recording Sender → extract token → confirm → old password 401s
+at login, new works, EVERY prior session token 401s, second confirm
+of the same token 401s); unknown email → 200 AND nothing sent
+(assert zero captures — the oracle test); expired token 401
+(backdate expires_at via SQL); 4th request in an hour sends nothing
+(3 captured total); deactivated user silent; me/password change
+voids an outstanding token (request → change via P-29 → confirm 401);
+red/green: neuter the used_at claim (drop `AND used_at IS NULL`) →
+the double-confirm test goes green-when-it-should-fail — prove red.
+**Gaps to record:** client link format + reset web page (client
+era); placeholder claiming; org-configurable TTL.
+
+### P-14 `messaging: Sidebar pins and colors.` — S — **[ ] queued**
+Zero migrations — `channel_member.pinned` (BOOLEAN, default false)
+and `channel_member.color` (TEXT, nullable) have been dormant since
+0003 (the C-4 quartet). This slice WAKES them; named custom sections
+stay dormant (they need new schema — recorded gap). Read the
+channel_member DDL and the existing `PUT /channels/{id}/notification`
+handler/domain path first.
+**Design (decided):**
+- `PUT /api/v1/channels/{id}/sidebar` {pinned: bool, color: string} —
+  a SEPARATE endpoint from /notification (different concern: sidebar
+  presentation vs delivery), same gate shape: the caller must have a
+  LIVE membership row (unsubscribed_at IS NULL) in an org-scoped
+  channel → else oracle-free 404. Updates ONLY the caller's own row.
+- color: "" clears (NULL); otherwise must match `^#[0-9a-f]{6}$`
+  case-insensitively, stored lowercase → else 400 "color must be
+  #rrggbb". pinned is a plain bool. Both fields REQUIRED in the body
+  (PUT replaces the pair — no PATCH semantics; clients send current
+  values).
+- ListChannels surfaces `pinned` and `color` ("" for NULL) on each
+  row. Ordering is UNCHANGED (clients sort pinned-first; backend-first
+  honesty — recorded).
+- NOT event-logged (personal presentation, the read-state precedent);
+  no gateway work.
+**Edge cases:** non-member and foreign-org channel → 404 (assert the
+same body); unsubscribed member → 404; idempotent re-PUT; pin+color
+survive channel rename/archive (archived channels still list for
+members — flags ride along); guests may pin their own channels.
+**Performance:** one UPDATE on the (channel_id, user_id) PK row.
+**Tests (TestSidebarPrefs):** set pin+color → ListChannels reflects
+both; clear color with "" → ""; bad colors 400 (`red`, `#12345`,
+`#gggggg`); non-member 404 oracle-free (red/green: drop the
+membership predicate from the UPDATE's WHERE → the non-member case
+writes and the test catches it); second user's flags are independent
+(personal, not shared); guest can pin their own channel.
+**Gaps to record:** named sections (schema), pinned-first server
+ordering, folder/section client interaction (client era).
+
+### P-19 `files: Upload scan seam + org storage quota.` — M — **[ ] queued**
+Migration **0014_file_org_live_index.sql** (PINNED; see P-35 note).
+`file.scan_status` (0 pending · 1 clean · 2 quarantined) has been
+dormant since 0006 (F-7). Read `files.go` Upload (the spool+hash
+shape), `handlers_files.go`/`signed.go`/avatar+emoji read paths, and
+`identity/admin.go` for the manage_org gate pattern first.
+**Design (decided):**
+- Migration 0014: `CREATE INDEX file_org_live_idx ON file (org_id)
+  INCLUDE (size_bytes) WHERE deleted_at IS NULL;` — the quota SUM
+  rides it.
+- Scan seam: `files.Scanner` interface —
+  `Scan(ctx, name, mime string, r io.Reader) (Verdict, error)` with
+  `Verdict` = Clean | Quarantined. `files.SetScanner(s)` at
+  composition (nil = no scanning, status STAYS 0 pending — we never
+  fake "clean" without a scanner; the honest-rungs rule). Upload
+  calls it AFTER the spool is fully read and size-checked (re-seek
+  the spool; bounded by the 25 MiB cap), BEFORE store.Put. Clean →
+  status 1; Quarantined → the file row is STILL created (status 2,
+  the bytes stored — compliance/holds may need the evidence) but the
+  response is 422 "file rejected by malware scan" and NO reference
+  can ever form (see below). Scanner ERROR → fail CLOSED:
+  apperr.Internal, no row, no blob.
+- Quarantine gate at EVERY byte-read path: OpenDownload /
+  authorizeDownload (bearer + signed link), OpenAvatar, and the emoji
+  read all treat scan_status = 2 as an oracle-free 404 (same shape as
+  deleted). The reference hook (message-link attach) skips
+  quarantined files exactly like deleted ones — a quarantined file id
+  in a message body creates NO reference.
+- weftd config: NO driver registry yet (no real scanner exists —
+  recorded honest rung). The seam ships with a test double only;
+  clamav/ICAP is a later one-file driver.
+- Quota: org.settings JSONB key `"storage_quota_bytes"` (int64; 0 or
+  absent = unlimited). `PUT /api/v1/admin/storage-quota`
+  {max_bytes >= 0} — manage_org-gated (org-scope Require), writes the
+  settings key (jsonb_set), event-logged `org.quota_changed` (entity
+  org, admin act — the admin.go precedent). `GET
+  /api/v1/admin/storage-quota` → {max_bytes, used_bytes} (the SUM,
+  manage_org). Enforcement in Upload AND StoreDocument: after size
+  is known, `SELECT COALESCE(SUM(size_bytes),0) FROM file WHERE
+  org_id=$1 AND deleted_at IS NULL` + incoming size > cap → 413
+  "storage quota exceeded" (apperr taxonomy: add/reuse a 413-mapping
+  error — if the taxonomy lacks one, use Invalid with the message and
+  RECORD the 400-vs-413 reduction in the PR). Dedup note: an upload
+  whose bytes already exist (same sha) still counts its row's
+  size_bytes — quota is row-accounting, not blob-accounting
+  (documented; blob-level accounting would undercharge the org that
+  deletes its first copy).
+- StoreDocument (compliance exports) IS quota-enforced (an org's
+  export storage is its own usage) — record the operator note.
+**Edge cases:** quota exactly at the boundary (== cap passes, +1
+fails); GC purge frees quota (deleted_at set → SUM drops — assert
+after a purge); quarantined files COUNT toward quota until GC'd
+(rows exist); a 0-byte quota blocks all uploads; setting max_bytes
+below current usage is allowed (blocks new uploads only).
+**Performance:** one indexed SUM per upload (partial index, INCLUDE
+column → index-only scan); self-host scale fine, per-org counter
+table is the queued mitigation if uploads go hot.
+**Tests (TestUploadScan / TestStorageQuota):** stub scanner: clean
+upload → status 1, downloadable; quarantined → 422, row status 2,
+bearer download 404, signed-link mint on it 404 (authorizeDownload),
+avatar/emoji set with it impossible (upload path rejects first),
+message link creates NO reference, GC treats it normally; scanner
+error → 500 and NO row/blob; nil scanner → status stays 0 and
+downloads work (today's behavior pinned). Quota: set cap → upload
+under passes, over 413 (red/green: drop the SUM check → the over
+case succeeds and the test catches it); == boundary passes; GET
+shows used_bytes moving; purge frees; non-admin PUT quota 403;
+quota event logged.
+**Gaps to record:** no real scanner driver (seam only); async
+re-scan lane; per-user quotas; blob-level dedup accounting; 413 vs
+400 taxonomy if reduced.
+
+### P-32 `compliance: Export byte-bundles (zip).` — M — **[ ] queued**
+Zero migrations (`export_job.scope` JSONB carries the new flag). Read
+`compliance/export.go` (worker, the #45 pin mechanism), `files.go`
+StoreDocument, and `blob.Store` first.
+**Design (decided):**
+- Commit 1 (prep, no behavior change): `files.StoreDocumentStream(
+  ctx, actor, name, mime string, r io.Reader) (File, error)` — the
+  existing spool+hash Upload shape without the 25 MiB cap (system
+  artifacts; document why) but WITH the quota check (P-19 may or may
+  not have merged — write the quota call ONLY if it exists on your
+  base; otherwise record the interaction for the reviewer to wire at
+  serial-merge, do NOT invent). `StoreDocument([]byte)` becomes a
+  bytes.Reader wrapper over it.
+- Commit 2 (feature): `POST /admin/exports` scope gains
+  `include_files: bool` (default false — today's JSON behavior
+  unchanged). When true the worker produces `export-<id>.zip`
+  (mime application/zip) INSTEAD of the bare JSON:
+  - `export.json` — byte-identical content to today's document.
+  - `manifest.json` — {job_id, generated_at, file_count,
+    total_bytes, missing: [file ids]}.
+  - `files/<file_id>_<sanitized_name>` — one entry per file PINNED by
+    this job's EntityExportJob references (#45's set, exactly that
+    query), streamed via blob Open → zip entry (io.Copy — never
+    buffer a whole file).
+  - Streaming end-to-end: zip.Writer → io.Pipe → StoreDocumentStream
+    in a goroutine; a write error on either side cancels both (the
+    worker's existing failed-status lane).
+  - A file whose blob is missing/unreadable at bundle time does NOT
+    fail the job: skip the entry, list the id under manifest
+    `missing`, keep going (evidence degradation is visible, never
+    fatal).
+- Name collisions inside the zip are impossible (the file_id prefix);
+  sanitizeName reused for the suffix.
+- The result file is pinned/downloadable exactly like today's JSON
+  result (same result_file_id lane, same officer-gated download).
+**Edge cases:** include_files on a job with ZERO attachments → a
+valid zip with export.json + an empty-files manifest; a job whose
+source messages died since pinning still bundles the bytes (that is
+what the #45 pins are FOR — assert it); include_files=false output
+is byte-identical to today (regression pin on the existing test's
+expectations).
+**Performance:** memory is O(one zip block), not O(bundle);
+per-file streaming through the blob seam; the pin query is the
+existing indexed reference lookup.
+**Tests (TestExportBundle):** end-to-end: upload files, reference
+them in messages, export include_files → download the zip (officer
+token), open it in-test (archive/zip over the downloaded bytes):
+export.json parses and matches the plain export of the same scope;
+every pinned file present with exact bytes; delete a source message
++ GC-purge one file's blob out from under the pins via SQL/blob
+delete → re-export: the purged one lands in manifest.missing while
+the rest bundle (red/green: make the missing-file path fail the job
+→ this test catches it); include_files=false byte-parity with the
+pre-slice fixture; non-officer download still 403/404 per the
+existing contract.
+**Gaps to record:** eDiscovery/partner manifest format (this is the
+raw bundle); zip64 for >4 GiB bundles (archive/zip handles it —
+verify and note); no incremental/delta exports.
+
 ---
 
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
@@ -684,9 +915,9 @@ record the scope and the known design questions so nothing is lost.)
 - **P-13 `worktrack: Custom fields and item links.`** L — typed field
   defs per space + values + F-5 relationship consent ceremony polish.
   OPEN: field type set v1; validation model.
-- **P-14 `messaging: Sidebar sections.`** S — personal channel ordering
-  (read-state precedent, no events). OPEN: interaction with folders on
-  the client.
+- **P-14** — **promoted to Tier 1** (full spec above; re-scoped to
+  waking the dormant pinned/color columns — named sections need
+  schema and stay here).
 - **P-15 `messaging: Link previews (unfurl).`** M — NEEDS-DESIGN:
   SSRF-guarded egress (Zulip OutgoingSession port — the guard design
   must be specced in detail before any executor touches it), cache
@@ -701,8 +932,7 @@ record the scope and the known design questions so nothing is lost.)
 - **P-18 `files: Image thumbnails + inline rendering allowlist.`** M —
   OPEN: image processing dependency choice (pure-Go vs libvips),
   thumbnail storage keys, srcset shape.
-- **P-19 `files: Upload scan hook + org quotas.`** S — F-7 hook
-  interface + per-org byte quota enforcement on Upload/StoreDocument.
+- **P-19** — **promoted to Tier 1** (full spec above).
 - **P-20** — **promoted to Tier 1** (full spec above).
 - **P-21 `notification: Push medium.`** L — NEEDS-DESIGN: web-push
   (VAPID) vs FCM seam; device registration table (needs migration).
@@ -726,18 +956,17 @@ record the scope and the known design questions so nothing is lost.)
 - **P-30 `identity: OIDC login.`** L — NEEDS-DESIGN: library choice,
   account linking rules, JIT provisioning vs invite-only.
 - **P-31** — **promoted to Tier 1** (full spec above).
-- **P-32 `compliance: Export byte-bundles (eDiscovery format).`** M —
-  attachments IN the archive; depends on export pins (#45) — spec the
-  bundle layout.
+- **P-32** — **promoted to Tier 1** (full spec above; raw zip bundle —
+  the eDiscovery/partner manifest FORMAT stays here as a later
+  refinement).
 - **P-34 `channels: Private-channel existence masking.`** S —
   NEEDS-DESIGN: requireChannelMember returns 403 today; decide whether
   private channels 404 like DMs (survey Zulip/Slack semantics, client
   impact, and the listable-public asymmetry) before any executor
   touches it. Split off from P-33.
-- **P-35 `identity: Password reset via email.`** S — depends on P-20's
-  mail plumbing (Message seam + BaseURL). OPEN: token storage
-  (single-use DB row vs stateless MAC — leaning DB row for single-use
-  + revoke-on-change), rate limits. Spec after P-20 merges.
+- **P-35** — **promoted to Tier 1** (full spec above; token storage
+  decided: DB rows — single-use + revoke-on-change require server
+  state).
 
 ## Deliberately NOT in this queue (backend-first directive)
 The real web client, mobile apps, calls/LiveKit, the automation builder
