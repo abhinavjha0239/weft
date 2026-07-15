@@ -30,6 +30,9 @@ const (
 type Service struct {
 	pool *pgxpool.Pool
 	fan  Fanout
+	// unsubSecret keys the one-click unsubscribe MAC (P-20); empty disables
+	// the unsubscribe endpoints (they 404 — nothing to verify against).
+	unsubSecret string
 }
 
 func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }

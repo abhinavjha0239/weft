@@ -29,10 +29,22 @@ type EmailWorker struct {
 	// Delay is how long a notification stays unseen before it earns an
 	// email (Zulip's ~2-minute batching window).
 	Delay time.Duration
+	// baseURL + unsubSecret mint the one-click unsubscribe link in each
+	// digest (P-20). An empty secret leaves the link and List-Unsubscribe
+	// header off — the digest degrades gracefully.
+	baseURL     string
+	unsubSecret string
 }
 
 func NewEmailWorker(pool *pgxpool.Pool, sender mail.Sender, log *slog.Logger) *EmailWorker {
 	return &EmailWorker{pool: pool, sender: sender, log: log, Delay: 2 * time.Minute}
+}
+
+// SetUnsubscribe wires the base URL and MAC secret used to build the
+// one-click unsubscribe link embedded in each digest (empty secret = off).
+func (w *EmailWorker) SetUnsubscribe(baseURL, secret string) {
+	w.baseURL = baseURL
+	w.unsubSecret = secret
 }
 
 // Run sweeps until ctx ends.
@@ -56,6 +68,7 @@ func (w *EmailWorker) Run(ctx context.Context) {
 const emailBatch = 500
 
 type pendingEmail struct {
+	orgID   int64
 	userID  int64
 	email   string
 	kind    int16
@@ -74,7 +87,7 @@ func (w *EmailWorker) RunOnce(ctx context.Context, olderThan time.Time) (int, er
 		err := db.WithTx(ctx, w.pool, func(tx pgx.Tx) error {
 			pending = pending[:0]
 			rows, err := tx.Query(ctx, `
-				SELECT n.id, n.user_id, u.email, n.kind,
+				SELECT n.id, n.org_id, n.user_id, u.email, n.kind,
 				       COALESCE(a.full_name, ''), COALESCE(c.name, '')
 				FROM notification n
 				JOIN user_account u ON u.id = n.user_id
@@ -111,7 +124,7 @@ func (w *EmailWorker) RunOnce(ctx context.Context, olderThan time.Time) (int, er
 			for rows.Next() {
 				var id int64
 				var p pendingEmail
-				if err := rows.Scan(&id, &p.userID, &p.email, &p.kind, &p.actor, &p.channel); err != nil {
+				if err := rows.Scan(&id, &p.orgID, &p.userID, &p.email, &p.kind, &p.actor, &p.channel); err != nil {
 					rows.Close()
 					return fmt.Errorf("email: scan row: %w", err)
 				}
@@ -165,11 +178,25 @@ func (w *EmailWorker) deliver(pending []pendingEmail) int {
 		}
 		subject := fmt.Sprintf("[%s] %d unread notification%s",
 			brand.Name, len(batch), plural(len(batch)))
-		body := strings.Join(lines, "\n") +
+		// The link is per (org, user); every row in a batch shares them.
+		unsubURL := unsubscribeLink(w.baseURL, w.unsubSecret, batch[0].orgID, uid)
+		text := strings.Join(lines, "\n") +
 			fmt.Sprintf("\n\nOpen %s to read and reply.\n", brand.Name)
-		if err := w.sender.Send(mail.Message{
-			To: batch[0].email, Subject: subject, Text: body,
-		}); err != nil {
+		if unsubURL != "" {
+			text += "Unsubscribe: " + unsubURL + "\n"
+		}
+		msg := mail.Message{To: batch[0].email, Subject: subject, Text: text}
+		if html, err := renderDigestHTML(lines, unsubURL); err != nil {
+			// Fall back to text-only rather than dropping the digest.
+			w.log.Warn("email: html render failed", "user", uid, "err", err)
+		} else {
+			msg.HTML = html
+		}
+		if unsubURL != "" {
+			msg.ListUnsubscribe = unsubURL
+			msg.ListUnsubscribePost = true
+		}
+		if err := w.sender.Send(msg); err != nil {
 			w.log.Warn("email: send failed", "user", uid, "err", err)
 			continue
 		}
