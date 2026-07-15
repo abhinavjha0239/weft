@@ -107,7 +107,8 @@ func (s *Service) OpenSigned(ctx context.Context, fileID, orgID int64, sigHex, e
 	if err := s.pool.QueryRow(ctx, `
 		SELECT name, mime, size_bytes, storage_key
 		FROM file
-		WHERE id = $1 AND org_id = $2 AND kind = 1 AND deleted_at IS NULL`,
+		WHERE id = $1 AND org_id = $2 AND kind = 1 AND deleted_at IS NULL
+		  AND scan_status <> 2`,
 		fileID, orgID).Scan(&m.Name, &m.Mime, &m.Size, &key); err != nil {
 		return Meta{}, nil, apperr.NotFound("file not found")
 	}

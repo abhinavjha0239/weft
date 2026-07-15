@@ -28,7 +28,7 @@ func (s *Service) OpenAvatar(ctx context.Context, actor auth.Identity, userID in
 		SELECT f.name, f.mime, f.size_bytes, f.storage_key
 		FROM user_account u
 		JOIN file f ON f.id = u.avatar_file_id AND f.org_id = $2
-		             AND f.kind = 1 AND f.deleted_at IS NULL
+		             AND f.kind = 1 AND f.deleted_at IS NULL AND f.scan_status <> 2
 		WHERE u.id = $1 AND u.org_id = $2
 		  AND (NOT $4 OR u.id = $3 OR EXISTS (
 		      SELECT 1 FROM channel_member me
