@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strconv"
+	"strings"
 
 	"github.com/abhinavjha0239/weft/internal/brand"
 )
@@ -34,9 +35,13 @@ type Config struct {
 	SMTPFrom   string
 	SMTPUser   string
 	SMTPPass   string
-	// SigningSecret keys signed download links (P-07). Empty = link minting
-	// refuses with a clear config error; the feature is opt-in per operator.
+	// SigningSecret keys signed download links (P-07) and unsubscribe MACs
+	// (P-20). Empty = link minting refuses with a clear config error and the
+	// unsubscribe endpoints 404; both features are opt-in per operator.
 	SigningSecret string
+	// BaseURL is the public origin used to build absolute links in email
+	// (the one-click unsubscribe URL). Trailing slash trimmed.
+	BaseURL string
 }
 
 func Load() (Config, error) {
@@ -56,6 +61,10 @@ func Load() (Config, error) {
 	c.GCUnclaimedDays = envDays("GC_UNCLAIMED_DAYS", 35)
 	c.GCDeadRefDays = envDays("GC_DEAD_REF_DAYS", 30)
 	c.SigningSecret = os.Getenv(brand.EnvPrefix + "SIGNING_SECRET")
+	c.BaseURL = strings.TrimRight(os.Getenv(brand.EnvPrefix+"BASE_URL"), "/")
+	if c.BaseURL == "" {
+		c.BaseURL = "http://localhost:8080"
+	}
 	c.MailDriver = os.Getenv(brand.EnvPrefix + "MAIL_DRIVER")
 	c.SMTPAddr = os.Getenv(brand.EnvPrefix + "SMTP_ADDR")
 	c.SMTPFrom = os.Getenv(brand.EnvPrefix + "SMTP_FROM")

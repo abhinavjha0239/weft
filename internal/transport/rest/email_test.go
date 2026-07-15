@@ -20,6 +20,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/internal/platform/mail"
 )
 
 // captureSender records instead of sending — the test double behind the
@@ -29,12 +30,18 @@ type captureSender struct {
 	sent []capturedMail
 }
 
-type capturedMail struct{ to, subject, body string }
+type capturedMail struct {
+	to, subject, text, html, listUnsub string
+	listUnsubPost                      bool
+}
 
-func (c *captureSender) Send(to, subject, body string) error {
+func (c *captureSender) Send(m mail.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.sent = append(c.sent, capturedMail{to, subject, body})
+	c.sent = append(c.sent, capturedMail{
+		to: m.To, subject: m.Subject, text: m.Text, html: m.HTML,
+		listUnsub: m.ListUnsubscribe, listUnsubPost: m.ListUnsubscribePost,
+	})
 	return nil
 }
 
@@ -138,10 +145,10 @@ func TestNotificationEmails(t *testing.T) {
 	mails := capture.take()
 	if len(mails) != 1 || mails[0].to != "bob@eml.test" ||
 		!strings.Contains(mails[0].subject, "1 unread") ||
-		!strings.Contains(mails[0].body, "Alice Chen sent you a direct message") {
+		!strings.Contains(mails[0].text, "Alice Chen sent you a direct message") {
 		t.Fatalf("dm email = %+v", mails)
 	}
-	if strings.Contains(mails[0].body, "the secret plan") {
+	if strings.Contains(mails[0].text, "the secret plan") {
 		t.Fatal("email must not carry message content")
 	}
 	// At most once: the watermark blocks a re-send.
@@ -198,8 +205,8 @@ func TestNotificationEmails(t *testing.T) {
 	// picked up now that the pref is back on (prefs read at sweep time).
 	mails = capture.take()
 	if len(mails) != 1 || !strings.Contains(mails[0].subject, "3 unread") ||
-		!strings.Contains(mails[0].body, "sent you a direct message") ||
-		!strings.Contains(mails[0].body, "mentioned you in #general") {
+		!strings.Contains(mails[0].text, "sent you a direct message") ||
+		!strings.Contains(mails[0].text, "mentioned you in #general") {
 		t.Fatalf("digest = %+v", mails)
 	}
 
@@ -211,5 +218,76 @@ func TestNotificationEmails(t *testing.T) {
 	if code := putJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok,
 		map[string]any{"kind": 1, "medium": 1, "enabled": false}); code != http.StatusBadRequest {
 		t.Fatalf("in-app medium = %d, want 400", code)
+	}
+}
+
+// TestEmailKeywordDefault pins the zero-rows email default for keyword
+// notifications (kind 4). The prefs API reports keyword email ON by default
+// (defaultEmailEnabled includes KindKeyword — setting an alert word IS the
+// opt-in), but the worker's SQL fallback long omitted it, so a keyword
+// notification with NO stored pref row was never emailed. Red/green: revert
+// the RunOnce SQL to `n.kind IN (1, 2)` and this fails (the sweep sends 0).
+func TestEmailKeywordDefault(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:      identity.New(pool, permsSvc),
+		Messaging:     messaging.New(pool, permsSvc),
+		DM:            dm.New(pool),
+		Notifications: notification.New(pool),
+	}))
+	defer ts.Close()
+	runner := notification.NewRunner(pool, hub, slog.Default())
+	capture := &captureSender{}
+	worker := notification.NewEmailWorker(pool, capture, slog.Default())
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "kwd", "email": "a@kwd.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@kwd.test", "Bob Ray", "bobkwdtok")
+
+	// Bob sets an alert word but NEVER touches his email prefs — the flip
+	// under test rides the zero-rows default alone.
+	if code := putJSON(t, ts.URL+"/api/v1/alert-words", bobTok,
+		map[string]any{"words": []string{"deploy"}}); code != http.StatusOK {
+		t.Fatalf("set alert word = %d", code)
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
+		boot.Token, map[string]any{"content": "we deploy today"}, nil)
+	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
+		t.Fatalf("materialize: %v", err)
+	}
+
+	// The keyword notification is due and email-enabled by default → one email.
+	if n, err := worker.RunOnce(ctx, time.Now().Add(time.Minute)); err != nil || n != 1 {
+		t.Fatalf("keyword sweep = %d (%v), want 1 email (kind-4 default is ON)", n, err)
+	}
+	mails := capture.take()
+	if len(mails) != 1 || mails[0].to != "bob@kwd.test" ||
+		!strings.Contains(mails[0].subject, "1 unread") ||
+		!strings.Contains(mails[0].text, "used one of your alert words in #general") {
+		t.Fatalf("keyword email = %+v", mails)
 	}
 }

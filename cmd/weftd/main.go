@@ -151,7 +151,9 @@ func serve(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
-	go notification.NewEmailWorker(pool, sender, log).Run(ctx)
+	emailWorker := notification.NewEmailWorker(pool, sender, log)
+	emailWorker.SetUnsubscribe(cfg.BaseURL, cfg.SigningSecret)
+	go emailWorker.Run(ctx)
 	janitor := compliance.NewJanitor(pool, store, log)
 	janitor.UnclaimedGrace = time.Duration(cfg.GCUnclaimedDays) * 24 * time.Hour
 	janitor.DeadRefWindow = time.Duration(cfg.GCDeadRefDays) * 24 * time.Hour
@@ -159,6 +161,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 
 	notifSvc := notification.New(pool)
 	notifSvc.SetFanout(hub)
+	notifSvc.SetUnsubscribe(cfg.SigningSecret)
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
 	go automation.NewRunner(pool, msgSvc, log).Run(ctx)

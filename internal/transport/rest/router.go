@@ -146,6 +146,10 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/emoji", a.withAuth(a.handleCreateEmoji))
 	mux.HandleFunc("GET /api/v1/emoji", a.withAuth(a.handleListEmoji))
 	mux.HandleFunc("DELETE /api/v1/emoji/{name}", a.withAuth(a.handleDeleteEmoji))
+	// Unsubscribe is NOT withAuth-wrapped: the signed link self-authenticates
+	// (the file-download precedent), reading no Authorization header (P-20).
+	mux.HandleFunc("GET /api/v1/unsubscribe", a.handleUnsubscribeGet)
+	mux.HandleFunc("POST /api/v1/unsubscribe", a.handleUnsubscribePost)
 	mux.HandleFunc("GET /api/v1/notifications", a.withAuth(a.handleListNotifications))
 	mux.HandleFunc("POST /api/v1/notifications/seen", a.withAuth(a.handleMarkNotificationsSeen))
 	mux.HandleFunc("GET /api/v1/notification-prefs", a.withAuth(a.handleListNotificationPrefs))
