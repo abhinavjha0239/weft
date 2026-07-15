@@ -21,6 +21,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
@@ -40,6 +41,10 @@ type Service struct {
 	// scanning, and uploads STAY scan_status 0 (pending) — we never fake
 	// "clean" without a scanner (the honest-rungs rule).
 	scanner Scanner
+	// perms gates the org storage-quota admin endpoints (P-19); wired via
+	// SetPerms. Nil is fine for tests that never hit those endpoints —
+	// enforcement in Upload/StoreDocument needs no perms.
+	perms *perms.Service
 }
 
 func New(pool *pgxpool.Pool, store blob.Store) *Service {
@@ -84,6 +89,11 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	}
 	if size > MaxUploadBytes {
 		return File{}, apperr.Invalid(fmt.Sprintf("file too large (max %d MiB)", MaxUploadBytes>>20))
+	}
+	// Quota (P-19): reject before scanning or storing so an over-quota upload
+	// leaves no blob and no row.
+	if err := s.checkQuota(ctx, actor.OrgID, size); err != nil {
+		return File{}, err
 	}
 	sum := h.Sum(nil)
 	shaHex := hex.EncodeToString(sum)
@@ -162,6 +172,11 @@ func (s *Service) StoreDocument(ctx context.Context, actor auth.Identity, name, 
 	name = sanitizeName(name)
 	if name == "" || len(data) == 0 {
 		return File{}, apperr.Invalid("document name and content required")
+	}
+	// Compliance-export artifacts are an org's own storage usage, so they are
+	// quota-enforced too (P-19).
+	if err := s.checkQuota(ctx, actor.OrgID, int64(len(data))); err != nil {
+		return File{}, err
 	}
 	sum := sha256.Sum256(data)
 	shaHex := hex.EncodeToString(sum[:])

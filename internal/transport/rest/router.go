@@ -190,6 +190,9 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/exports", a.withAuth(a.handleListExports))
 	// P-31: compliance_officer-gated read over the raw event log.
 	mux.HandleFunc("GET /api/v1/audit/events", a.withAuth(a.handleAuditEvents))
+	// P-19: manage_org-gated org storage quota (get usage + set cap).
+	mux.HandleFunc("GET /api/v1/admin/storage-quota", a.withAuth(a.handleGetStorageQuota))
+	mux.HandleFunc("PUT /api/v1/admin/storage-quota", a.withAuth(a.handleSetStorageQuota))
 	mux.HandleFunc("POST /api/v1/automations", a.withAuth(a.handleCreateAutomation))
 	mux.HandleFunc("GET /api/v1/automations", a.withAuth(a.handleListAutomations))
 	mux.HandleFunc("PATCH /api/v1/automations/{id}", a.withAuth(a.handleUpdateAutomation))

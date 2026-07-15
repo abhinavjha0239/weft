@@ -110,6 +110,33 @@ func (a *api) handleSignLink(w http.ResponseWriter, r *http.Request, id auth.Ide
 	writeJSON(w, http.StatusOK, res)
 }
 
+// handleGetStorageQuota: GET /admin/storage-quota → {max_bytes, used_bytes}
+// (manage_org-gated in the domain). max_bytes 0 = unlimited.
+func (a *api) handleGetStorageQuota(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	info, err := a.Files.StorageQuota(r.Context(), id)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, info)
+}
+
+// handleSetStorageQuota: PUT /admin/storage-quota {max_bytes} (manage_org).
+func (a *api) handleSetStorageQuota(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	type req struct {
+		MaxBytes int64 `json:"max_bytes"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Files.SetStorageQuota(r.Context(), id, in.MaxBytes); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int64{"max_bytes": in.MaxBytes})
+}
+
 // streamFile writes the download response shared by both access paths.
 func (a *api) streamFile(w http.ResponseWriter, meta files.Meta, rc io.ReadCloser) {
 	w.Header().Set("Content-Type", meta.Mime)
