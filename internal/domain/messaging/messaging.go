@@ -131,6 +131,8 @@ type Message struct {
 	Source    string        `json:"source"`
 	Rendered  string        `json:"rendered"`
 	Reactions []ReactionAgg `json:"reactions,omitempty"`
+	// LinkPreviews are the unfurled links (P-15), document-ordered.
+	LinkPreviews []LinkPreview `json:"link_previews,omitempty"`
 	// ForwardedFrom is the source message id when this message was created by
 	// a forward (P-03); null otherwise. Clients resolve it to render the
 	// original's context. Populated by Get; list endpoints leave it null.
@@ -166,6 +168,9 @@ func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Me
 	}
 	one := []Message{m}
 	if err := attachReactions(ctx, s.pool, actor.UserID, one); err != nil {
+		return Message{}, err
+	}
+	if err := attachLinkPreviews(ctx, s.pool, one); err != nil {
 		return Message{}, err
 	}
 	return one[0], nil

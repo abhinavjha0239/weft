@@ -323,7 +323,10 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 		if err := rows.Err(); err != nil {
 			return err
 		}
-		return attachReactions(ctx, tx, actor.UserID, page.Messages)
+		if err := attachReactions(ctx, tx, actor.UserID, page.Messages); err != nil {
+			return err
+		}
+		return attachLinkPreviews(ctx, tx, page.Messages)
 	})
 	if err != nil {
 		return MessagePage{}, err
