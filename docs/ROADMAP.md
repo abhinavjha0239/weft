@@ -912,6 +912,113 @@ resolving the predicted files.go rebase conflict, adding the e2e
 pin (an over-quota export FAILS: status 4, no result) plus the
 SetPerms wiring the pre-P-19 test scaffold lacked.
 
+### P-15 `unfurl: Link previews with SSRF-guarded egress.` — L — **[ ] queued — STRONGEST-MODEL EXECUTION (not dispatched)**
+Security-critical: the server fetches attacker-chosen URLs. The egress
+guard built here is the reusable core P-24 (outbound webhook steps)
+inherits. Migration **0015_link_previews.sql**. One new dependency:
+`golang.org/x/net/html` (the x/crypto precedent — parsing HTML with
+regexes is how unfurlers get owned).
+**Design (decided):**
+- **Commit 1 — `egress: SSRF-guarded outbound HTTP client.`**
+  New `internal/platform/egress`: a hardened client factory whose
+  DialContext resolves the host itself, VETS every resolved IP, and
+  dials ONLY a vetted literal IP (resolve-once-dial-pinned closes the
+  DNS-rebinding TOCTOU; SNI/Host stay the original name). Rejected IP
+  classes: loopback, RFC1918 private, link-local v4 (169.254/16 —
+  cloud metadata) and v6 (fe80::/10), unique-local (fc00::/7),
+  unspecified, multicast/broadcast, and IPv4-mapped v6 forms of all
+  of those (Go's netip normalizes — Unmap() before classify). Scheme
+  allowlist http/https; ports 80/443 only; userinfo in the URL →
+  reject. Redirects: max 5, EVERY hop re-vetted (each redirect
+  re-enters the pinned dialer; CheckRedirect re-runs the scheme/
+  port/userinfo checks). Transport.Proxy = nil (env proxies would
+  bypass the pinning). Timeouts: 5s dial, 10s total. Fixed
+  User-Agent `<brand>Bot/1.0 (+link-preview)`; never sends
+  Authorization or cookies. `Options.LookupIP` injectable and
+  `Options.AllowLoopbackForTests bool` (grep-able, never set by
+  weftd) exist ONLY so tests can reach httptest listeners; the
+  SSRF matrix is unit-level and network-free.
+- **Commit 2 — `unfurl: Link-preview cache schema (0015).`**
+  `link_preview(id identity PK, url_hash TEXT NOT NULL UNIQUE —
+  sha256 hex of the exact URL, url TEXT NOT NULL, title TEXT NOT
+  NULL DEFAULT '', description TEXT NOT NULL DEFAULT '', image_url
+  TEXT NOT NULL DEFAULT '', site_name TEXT NOT NULL DEFAULT '',
+  status SMALLINT NOT NULL — 1 ok · 2 failed · 3 disallowed,
+  fetched_at TIMESTAMPTZ NOT NULL DEFAULT now(), expires_at
+  TIMESTAMPTZ NOT NULL)` — GLOBAL cache (no org_id: a URL's preview
+  is objective content; dedup across orgs, the Zulip per-server
+  precedent). `message_link_preview(message_id BIGINT NOT NULL,
+  preview_id BIGINT NOT NULL REFERENCES link_preview(id), position
+  SMALLINT NOT NULL, PRIMARY KEY (message_id, preview_id))` + index
+  on (message_id).
+- **Commit 3 — `unfurl: Fetch consumer, read surface, org toggle.`**
+  - `content.Links()` (mirrors Mentions): MarkLink hrefs in document
+    order, SafeURL-filtered, http/https only (mailto skipped),
+    deduped, first 2 per message (cap).
+  - New `internal/domain/unfurl`: Runner = the standard named
+    consumer ("unfurl", NOTIFY + sweep, txid-gated) on
+    message.created events. Per event: skip if the org toggle is
+    off; load the message's ast (org-scoped); extract links; for
+    each: cache hit (url_hash, unexpired) → associate; miss → fetch
+    through egress (Content-Type must be text/html or
+    application/xhtml+xml; body read via 1 MiB LimitReader;
+    x/net/html parse; og:title/og:description/og:site_name/og:image
+    with <title> fallback; caps title 200 / description 500 /
+    site_name 100 runes, control chars stripped) → upsert by
+    url_hash (`ON CONFLICT DO UPDATE` refreshes content + expiry) →
+    associate via message_link_preview. TTLs: ok 24h, failed 1h,
+    disallowed 24h (guard verdicts don't flap). Guard-rejected URL →
+    status 3 disallowed, NO retry loop. Self-URLs (config BaseURL
+    host) skipped. image_url is STORED, never fetched (client-era
+    camo/proxy is the recorded gap — rendering it raw leaks reader
+    IPs; the API note says so).
+  - Association event: when at least one preview attached, append
+    `message.preview_added` {message_id + the message's container
+    ids} in the SAME tx as the association — rides the standard
+    gateway routing so open clients refresh the message.
+  - Read surface: ListMessages/Get aggregates gain `link_previews:
+    [{url, title, description, image_url, site_name}]` (status 1
+    rows only), position-ordered — the ReactionAgg loading pattern.
+  - Org toggle: `org.settings.link_previews_enabled` (ABSENT =
+    enabled — Zulip/Slack default-on). `PUT/GET
+    /api/v1/admin/link-previews {enabled}` — manage_org, jsonb_set,
+    event `org.link_previews_changed` (the storage-quota endpoint
+    precedent, owned by unfurl via SetPerms).
+**Edge cases:** message edited to remove the link keeps existing
+associations v1 (recorded gap: no un-unfurl); deleted message's
+associations are dead rows reaped with the message lane later
+(recorded); two messages with the same URL share one cache row; a
+URL failing DNS entirely → failed (2), 1h retry; redirect chain
+public→public→private rejected at the private hop (status 3);
+non-HTML (image/pdf) → failed row, no parse; oversized HTML
+truncated at 1 MiB and parsed as-is (x/net/html tolerates
+truncation); titles with control chars/newlines flattened; consumer
+crash between fetch and Ack → at-least-once re-run hits the cache
+(idempotent upsert + PK association ON CONFLICT DO NOTHING).
+**Performance:** fetches happen ONLY in the consumer (send path
+untouched); ≤2 fetches per message, cache-deduped globally; 10s
+worst-case per fetch bounded by the runner's serial sweep (a slow
+site delays only the unfurl lane, never sends). Failed/disallowed
+caching prevents refetch storms.
+**Tests:**
+- `egress` unit matrix (network-free, injected resolver): every
+  rejected IP class incl. 169.254.169.254 and ::ffff:127.0.0.1;
+  userinfo/scheme/port rejections; redirect-to-private rejected
+  mid-chain; proxy env ignored. RED/GREEN: neuter the IP
+  classification → the loopback case must fail the suite.
+- `TestLinkPreviews` (e2e, AllowLoopbackForTests + httptest): OG
+  page → preview row + association + `message.preview_added` event
+  + ListMessages carries it; SECOND message with the same URL → hit
+  counter proves ONE fetch; failed page (500) cached failed; length
+  caps + control-char stripping asserted; org toggle off → zero
+  fetches; redirect-to-loopback → disallowed (the e2e SSRF pin —
+  RED/GREEN: drop the redirect re-vetting and this fails); non-HTML
+  skipped; guest/member read previews identically (ride the message
+  ACL — previews add NO new visibility surface).
+**Gaps to record:** image proxy/camo (client era); un-unfurl on
+edit; per-message/user opt-out; charset sniffing beyond UTF-8;
+oEmbed providers; P-24 shares the egress guard when it lands.
+
 ---
 
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
@@ -931,11 +1038,8 @@ record the scope and the known design questions so nothing is lost.)
 - **P-14** — **promoted to Tier 1** (full spec above; re-scoped to
   waking the dormant pinned/color columns — named sections need
   schema and stay here).
-- **P-15 `messaging: Link previews (unfurl).`** M — NEEDS-DESIGN:
-  SSRF-guarded egress (Zulip OutgoingSession port — the guard design
-  must be specced in detail before any executor touches it), cache
-  table, opt-out. Security-critical: strongest-model execution
-  recommended, not just review.
+- **P-15** — **promoted to Tier 1** (full spec above; STRONGEST-MODEL
+  EXECUTION — the egress guard is the reusable core P-24 inherits).
 - **P-16 `channels: Web-public channels + history_from enforcement.`**
   L — SECURITY-CRITICAL (anonymous read path + membership history
   boundaries). Strongest-model execution, full spec first.
