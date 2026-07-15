@@ -48,6 +48,7 @@ type Report struct {
 	DeadRefPurged     int `json:"dead_ref_purged"`
 	BlobsDeleted      int `json:"blobs_deleted"`
 	RevisionsScrubbed int `json:"revisions_scrubbed"`
+	MessagesVacuumed  int `json:"messages_vacuumed"`
 }
 
 // Run sweeps on a ticker until ctx ends.
@@ -67,7 +68,8 @@ func (j *Janitor) Run(ctx context.Context) {
 			if rep != (Report{}) {
 				j.log.Info("janitor: swept",
 					"unclaimed", rep.UnclaimedPurged, "dead_ref", rep.DeadRefPurged,
-					"blobs", rep.BlobsDeleted, "revisions", rep.RevisionsScrubbed)
+					"blobs", rep.BlobsDeleted, "revisions", rep.RevisionsScrubbed,
+					"messages_vacuumed", rep.MessagesVacuumed)
 			}
 		}
 	}
@@ -123,6 +125,35 @@ const (
 	                  OR m3.channel_id = h.channel_id))))`
 )
 
+// messageVacuumPredicate selects live messages whose age has passed the
+// EFFECTIVE retention policy for their scope (P-17). The scope ladder is
+// nearest-wins channel(3)→org(1), matching scrubRevisions; workspace/space/dm
+// rungs are the same recorded gap. duration_days = -1 (forever) is the
+// COALESCE default and is excluded by the `<> -1` guard — a message with no
+// policy, or a forever policy, is never vacuumed. The duration lookup is
+// spelled twice (the `<> -1` guard and the age comparison) because the
+// predicate text is shared verbatim between the batch scan and the in-tx
+// recheck, which rules out a CTE/LATERAL binding. An active legal hold on the
+// author or the channel freezes the message (the scrubRevisions guard).
+// $1 = message id (NULL in the scan), $2 = the sweep clock.
+const effectiveDuration = `
+	COALESCE(
+	  (SELECT rp.duration_days FROM retention_policy rp
+	   WHERE rp.org_id = m.org_id AND rp.scope_type = 3 AND rp.scope_id = m.channel_id),
+	  (SELECT rp.duration_days FROM retention_policy rp
+	   WHERE rp.org_id = m.org_id AND rp.scope_type = 1 AND rp.scope_id = m.org_id),
+	  -1)`
+
+const messageVacuumPredicate = `
+	m.deleted_at IS NULL AND ($1::bigint IS NULL OR m.id = $1)
+	  AND (` + effectiveDuration + `) <> -1
+	  AND m.created_at < $2::timestamptz - (` + effectiveDuration + `) * interval '1 day'
+	  AND NOT EXISTS (
+	      SELECT 1 FROM legal_hold h
+	      WHERE h.org_id = m.org_id AND h.released_at IS NULL
+	        AND (h.custodian_user_id = m.author_id
+	          OR h.channel_id = m.channel_id))`
+
 // SweepOnce runs every lane against the given clock and reports the work.
 func (j *Janitor) SweepOnce(ctx context.Context, now time.Time) (Report, error) {
 	var rep Report
@@ -135,6 +166,9 @@ func (j *Janitor) SweepOnce(ctx context.Context, now time.Time) (Report, error) 
 		return rep, err
 	}
 	if err := j.scrubRevisions(ctx, &rep.RevisionsScrubbed); err != nil {
+		return rep, err
+	}
+	if err := j.vacuumMessages(ctx, now, &rep.MessagesVacuumed); err != nil {
 		return rep, err
 	}
 	return rep, nil
@@ -250,6 +284,108 @@ func (j *Janitor) purgeFile(ctx context.Context, fileID int64, predicate string,
 		*blobs++
 	}
 	return nil
+}
+
+// vacuumMessages tombstones messages whose age has passed their scope's
+// retention policy (P-17). It reuses deleted_at — every product read path
+// already filters it, so a vacuumed message vanishes at once from the authed
+// and anonymous surfaces alike — and additionally stamps
+// retention_vacuumed_at so the purge lane can find it after the restore
+// window. Content is left in place (hidden, not blanked), recoverable until
+// the purge. Each row is locked and re-checked in its own transaction (the
+// sweepFiles pattern): a legal hold or policy change committed between scan
+// and lock spares the message.
+func (j *Janitor) vacuumMessages(ctx context.Context, now time.Time, vacuumed *int) error {
+	for {
+		rows, err := j.pool.Query(ctx, `
+			SELECT m.id FROM message m WHERE `+messageVacuumPredicate+`
+			ORDER BY m.id LIMIT `+fmt.Sprint(sweepBatch),
+			nil, now)
+		if err != nil {
+			return fmt.Errorf("janitor: vacuum scan: %w", err)
+		}
+		var ids []int64
+		for rows.Next() {
+			var id int64
+			if err := rows.Scan(&id); err != nil {
+				rows.Close()
+				return fmt.Errorf("janitor: vacuum scan: %w", err)
+			}
+			ids = append(ids, id)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return fmt.Errorf("janitor: vacuum scan: %w", err)
+		}
+		for _, id := range ids {
+			if err := j.vacuumMessage(ctx, id, now, vacuumed); err != nil {
+				return err
+			}
+		}
+		if len(ids) < sweepBatch {
+			return nil
+		}
+	}
+}
+
+// vacuumMessage tombstones one message in a transaction: lock the live row,
+// re-check the full predicate, set deleted_at + retention_vacuumed_at to the
+// sweep clock, then drop its pins and decrement its thread's count — the
+// DeleteMessage side-effects that keep the per-channel pin cap and thread
+// counters honest. Content is left in place for recovery; the purge lane
+// removes it after the window. Emits retention.message_vacuumed (system
+// actor).
+func (j *Janitor) vacuumMessage(ctx context.Context, msgID int64, now time.Time, vacuumed *int) error {
+	return db.WithTx(ctx, j.pool, func(tx pgx.Tx) error {
+		var locked int64
+		err := tx.QueryRow(ctx,
+			`SELECT id FROM message WHERE id = $1 AND deleted_at IS NULL FOR UPDATE`,
+			msgID).Scan(&locked)
+		if err == pgx.ErrNoRows {
+			return nil // deleted or vacuumed by a concurrent actor
+		}
+		if err != nil {
+			return fmt.Errorf("janitor: vacuum lock: %w", err)
+		}
+		var eligible bool
+		if err := tx.QueryRow(ctx,
+			`SELECT EXISTS (SELECT 1 FROM message m WHERE `+messageVacuumPredicate+`)`,
+			msgID, now).Scan(&eligible); err != nil {
+			return fmt.Errorf("janitor: vacuum recheck: %w", err)
+		}
+		if !eligible {
+			return nil
+		}
+		var orgID, threadID int64
+		var channelID *int64
+		if err := tx.QueryRow(ctx, `
+			UPDATE message SET deleted_at = $2, retention_vacuumed_at = $2
+			WHERE id = $1 RETURNING org_id, thread_id, channel_id`,
+			msgID, now).Scan(&orgID, &threadID, &channelID); err != nil {
+			return fmt.Errorf("janitor: vacuum: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `DELETE FROM pin WHERE message_id = $1`, msgID); err != nil {
+			return fmt.Errorf("janitor: vacuum pins: %w", err)
+		}
+		if _, err := tx.Exec(ctx, `
+			UPDATE thread SET message_count = GREATEST(message_count - 1, 0)
+			WHERE id = $1 AND kind = 1`, threadID); err != nil {
+			return fmt.Errorf("janitor: vacuum thread count: %w", err)
+		}
+		payload := map[string]any{"message_id": msgID, "thread_id": threadID}
+		if channelID != nil {
+			payload["channel_id"] = *channelID
+		}
+		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+			OrgID: orgID, ActorKind: enum.ActorSystem,
+			EntityType: enum.EntityMessage, EntityID: msgID, Verb: "retention.message_vacuumed",
+			Payload: eventlog.MustPayload(payload),
+		}); err != nil {
+			return fmt.Errorf("janitor: vacuum event: %w", err)
+		}
+		*vacuumed++
+		return nil
+	})
 }
 
 // scrubRevisions purges prior message versions wherever the EFFECTIVE
