@@ -1019,6 +1019,115 @@ caching prevents refetch storms.
 edit; per-message/user opt-out; charset sniffing beyond UTF-8;
 oEmbed providers; P-24 shares the egress guard when it lands.
 
+### P-16 `channels: Web-public channels + history_from enforcement.` — L — **[ ] queued — STRONGEST-MODEL EXECUTION (not dispatched)**
+Security-critical: it opens a NEW exposure surface (an anonymous,
+unauthenticated read path) and enforces a membership-history boundary
+that has never been enforced. ZERO migrations — `channel.visibility`
+(value 3 web_public), `channel.history_mode` (2 protected), and
+`channel_member.history_from` all exist since 0003 and have only been
+carried in comments. Read the channel DDL, `requireMember`,
+`requireThreadSend` (line ~515), `JoinChannel`, and the router's
+`withAuth`/`withIPLimit` first.
+**AUDIT FINDINGS (drive the design):**
+- The send path `requireThreadSend` CALLS `requireMember` — so the
+  read gate must NOT be loosened in place; a separate read gate is
+  mandatory or non-members could post to web-public channels.
+- `history_from` is referenced only in comments; nothing sets or
+  reads it, and no API path creates a `history_mode=2` channel. The
+  feature is unbuilt, not merely unwired.
+**Design (decided):**
+- **Commit 1 — `channels: Create and expose web-public channels.`**
+  `CreateChannelParams` gains `Visibility string`
+  ("public"|"private"|"web_public"; empty falls back to the legacy
+  `Private bool` for wire compatibility) → column 1/2/3. A web_public
+  channel is FORCED `history_mode=1` (shared) — world-readable history
+  is the point; protected+web_public is a 400. `JoinChannel` allows
+  self-join for public AND web_public (private stays invitation-only).
+  `ChannelSummary` gains `visibility string` (keep `private` bool);
+  ListChannels shows web_public org-wide like public. Event payload
+  carries visibility.
+- **Commit 2 — `messaging: Diverge the channel read gate for web-public.`**
+  New `requireChannelRead` = live membership OR
+  (`channel.visibility=3 AND archived_at IS NULL`). Applied to the
+  authenticated READ paths ONLY: `ListThreads`, `ListThreadMessages`,
+  and the `Get` message inline ACL (add a web_public branch). WRITE
+  paths are UNTOUCHED — `requireThreadSend`, `CreateThread`, pins keep
+  `requireMember`. This is the divergence the audit demands: a
+  web-public channel is world-readable, member-writable. Scope: reads
+  cover messages + thread lists; pins/files/search stay member-only
+  (recorded gap).
+- **Commit 3 — `rest: Anonymous read path for web-public channels.`**
+  A `withPublic` wrapper (mirrors `withAuth` but resolves NO identity,
+  reads NO token, applies the per-IP limiter) over a small, explicit
+  allowlist of routes under `/api/v1/public/`:
+  `GET /public/channels/{id}` (metadata),
+  `GET /public/channels/{id}/threads`,
+  `GET /public/threads/{id}/messages`. New identity-free domain
+  methods (`PublicChannel`, `PublicChannelThreads`,
+  `PublicThreadMessages`) enforce `visibility=3 AND archived_at IS
+  NULL` in SQL (defense in depth — the gate is in the query, not just
+  the routing); anything else is an oracle-free 404. Message
+  projection: id, thread_id, author_id, source, rendered, created_at,
+  plus `link_previews` (objective public content). Reactions are
+  EXCLUDED — `ReactionAgg.UserIDs` would leak org-member identities to
+  the anonymous internet (recorded gap: public reaction counts later).
+  An `authors` map {user_id → {full_name}} for the authors of the
+  RETURNED messages only (the Zulip web-public model — bounded, never
+  the directory); avatar bytes stay on the authed endpoint (gap).
+  Gateway, search, DMs, posting, joining: all remain authed and thus
+  closed to anonymous — the safe default, asserted.
+- **Commit 4 — `messaging: Enforce protected-channel history_from.`**
+  `CreateChannelParams` gains `Protected bool` → `history_mode=2`,
+  valid ONLY with private (else 400; web_public/public force shared).
+  Every membership INSERT into a protected channel stamps
+  `history_from = now()` on the NEW row (JoinChannel never applies —
+  protected ⟹ private ⟹ invitation; the real site is
+  `identity.joinChannelOnAccept`, the guarded INSERT…SELECT from #68 —
+  add `history_from = CASE WHEN c.history_mode=2 THEN now() END`).
+  Rejoin PRESERVES the original (the ON CONFLICT branch only clears
+  unsubscribed_at — already correct, assert it). The read paths
+  (`requireChannelRead`/ListThreadMessages/Get) filter a member's
+  view of a protected channel to `created_at >= history_from` (NULL =
+  all; the creator's NULL means "from creation" = all, correct). A
+  web_public reader never hits this (web_public ⟹ shared).
+**Edge cases:** archived web_public → not readable (anon 404, authed
+non-member gate closes); a private channel is never anonymously
+visible (oracle-free 404, same body as nonexistent); an authed
+non-member can READ a web_public channel but a POST still 403s
+(requireMember on the write path — THE audit pin); guest reading
+web_public is allowed (world-readable trumps the guest boundary);
+protected history_from is per-member and immune to leave/rejoin;
+deleted messages never appear on either path.
+**Performance:** the read gate is one added EXISTS branch (indexed on
+channel PK + the membership PK); the history_from filter is a
+parameter on the existing message query; the anonymous methods are
+single indexed reads. No new indexes.
+**Tests:**
+- `TestWebPublicChannels` (authed): non-member reads a web_public
+  channel's threads + messages + Get; non-member POST → 403 (RED/
+  GREEN: point the write path at requireChannelRead → the non-member
+  posts and this fails — the exact audit hole); private non-member
+  still blocked; archived web_public not readable; ListChannels shows
+  web_public to a non-member.
+- `TestPublicChannelAnon` (no Authorization header): reads metadata +
+  threads + messages + author names + link previews; a public
+  (non-web) channel and a private channel both 404 (oracle-free, same
+  body); reactions absent from the projection; POST/join/search/
+  gateway on the public namespace or without a token → 401/404
+  (closed). RED/GREEN: drop the `visibility=3` clause from
+  PublicThreadMessages → a private channel's messages leak to
+  anonymous and the oracle test fails.
+- `TestProtectedHistory`: create private protected; post m1; invite a
+  new member (history_from stamped); the newcomer sees only
+  post-join messages, the creator sees all; leave+rejoin preserves
+  the boundary. RED/GREEN: drop the `created_at >= history_from`
+  filter → the newcomer sees m1 and the test fails.
+**Gaps to record:** web-public pins/files/search/reactions;
+anonymous avatar bytes; live updates for anonymous (poll only);
+per-channel "allow web-public" org policy knob; robots/SEO/caching
+headers on the public routes (client era); protected mode only
+settable at creation (a PATCH to flip history_mode is a later slice).
+
 ---
 
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
@@ -1040,9 +1149,7 @@ record the scope and the known design questions so nothing is lost.)
   schema and stay here).
 - **P-15** — **promoted to Tier 1** (full spec above; STRONGEST-MODEL
   EXECUTION — the egress guard is the reusable core P-24 inherits).
-- **P-16 `channels: Web-public channels + history_from enforcement.`**
-  L — SECURITY-CRITICAL (anonymous read path + membership history
-  boundaries). Strongest-model execution, full spec first.
+- **P-16** — **promoted to Tier 1** (full spec above; STRONGEST-MODEL EXECUTION; zero migrations — the columns exist since 0003).
 - **P-17 `compliance: Message retention vacuum.`** L — archive-then-
   vacuum with restore window (AD-3 completion). OPEN: archive storage
   shape (rows vs export-file), restore API. Strongest-model execution.
