@@ -912,7 +912,7 @@ resolving the predicted files.go rebase conflict, adding the e2e
 pin (an over-quota export FAILS: status 4, no result) plus the
 SetPerms wiring the pre-P-19 test scaffold lacked.
 
-### P-15 `unfurl: Link previews with SSRF-guarded egress.` — L — **[ ] queued — STRONGEST-MODEL EXECUTION (not dispatched)**
+### P-15 `unfurl: Link previews with SSRF-guarded egress.` — L — **[x] shipped #84 (strongest-model executed)**
 Security-critical: the server fetches attacker-chosen URLs. The egress
 guard built here is the reusable core P-24 (outbound webhook steps)
 inherits. Migration **0015_link_previews.sql**. One new dependency:
