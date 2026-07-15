@@ -170,6 +170,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go msgSvc.RunScheduledLoop(ctx, log)
 	filesSvc := files.New(pool, store)
 	filesSvc.SetSigningSecret(cfg.SigningSecret)
+	filesSvc.SetPerms(permsSvc) // P-19 storage-quota admin gate (no scanner wired — no real driver yet)
 	msgSvc.SetFiles(filesSvc)
 	complianceSvc := compliance.New(pool, permsSvc)
 	complianceSvc.SetLogger(log)

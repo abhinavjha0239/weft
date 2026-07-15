@@ -21,6 +21,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
@@ -36,6 +37,14 @@ type Service struct {
 	// signingSecret keys the HMAC for signed download links (P-07); empty
 	// until wired from config, in which case link minting refuses.
 	signingSecret string
+	// scanner is the optional upload malware-scan seam (P-19); nil means no
+	// scanning, and uploads STAY scan_status 0 (pending) — we never fake
+	// "clean" without a scanner (the honest-rungs rule).
+	scanner Scanner
+	// perms gates the org storage-quota admin endpoints (P-19); wired via
+	// SetPerms. Nil is fine for tests that never hit those endpoints —
+	// enforcement in Upload/StoreDocument needs no perms.
+	perms *perms.Service
 }
 
 func New(pool *pgxpool.Pool, store blob.Store) *Service {
@@ -81,9 +90,42 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	if size > MaxUploadBytes {
 		return File{}, apperr.Invalid(fmt.Sprintf("file too large (max %d MiB)", MaxUploadBytes>>20))
 	}
+	// Quota (P-19): reject before scanning or storing so an over-quota upload
+	// leaves no blob and no row.
+	if err := s.checkQuota(ctx, actor.OrgID, size); err != nil {
+		return File{}, err
+	}
 	sum := h.Sum(nil)
 	shaHex := hex.EncodeToString(sum)
 	key := StorageKey(actor.OrgID, shaHex)
+
+	// Malware scan (P-19) reads the fully-spooled bytes BEFORE the blob is
+	// stored. A scanner error fails CLOSED (no row, no blob) so an outage never
+	// admits unscanned bytes; Clean records status 1; Quarantined still stores
+	// the bytes and row (status 2 — evidence for compliance/holds) but the
+	// upload is rejected 422 below and no reference can ever form. With no
+	// scanner wired the status stays 0 (pending) — never a fake clean.
+	scanStatus := int16(0)
+	quarantined := false
+	if s.scanner != nil {
+		if _, err := spool.Seek(0, io.SeekStart); err != nil {
+			return File{}, apperr.Internal("rewind spool", err)
+		}
+		verdict, err := s.scanner.Scan(ctx, name, mime, spool)
+		if err != nil {
+			return File{}, apperr.Internal("scan upload", err)
+		}
+		switch verdict {
+		case Clean:
+			scanStatus = 1
+		case Quarantined:
+			scanStatus = 2
+			quarantined = true
+		default:
+			return File{}, apperr.Internal("scan upload",
+				fmt.Errorf("scanner returned invalid verdict %d", verdict))
+		}
+	}
 
 	if _, err := spool.Seek(0, io.SeekStart); err != nil {
 		return File{}, apperr.Internal("rewind spool", err)
@@ -96,9 +138,9 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO file (org_id, kind, name, mime, size_bytes, sha256,
-				storage_key, uploader_id)
-			VALUES ($1, 1, $2, $3, $4, $5, $6, $7) RETURNING id`,
-			actor.OrgID, name, mime, size, sum, key, actor.UserID).Scan(&out.ID); err != nil {
+				storage_key, uploader_id, scan_status)
+			VALUES ($1, 1, $2, $3, $4, $5, $6, $7, $8) RETURNING id`,
+			actor.OrgID, name, mime, size, sum, key, actor.UserID, scanStatus).Scan(&out.ID); err != nil {
 			return apperr.Internal("record file", err)
 		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
@@ -114,6 +156,9 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	if err != nil {
 		return File{}, err
 	}
+	if quarantined {
+		return File{}, apperr.Unprocessable("file rejected by malware scan")
+	}
 	out.Name, out.Mime, out.Size, out.SHA = name, mime, size, shaHex
 	out.URL = fmt.Sprintf("/api/v1/files/%d", out.ID)
 	return out, nil
@@ -127,6 +172,11 @@ func (s *Service) StoreDocument(ctx context.Context, actor auth.Identity, name, 
 	name = sanitizeName(name)
 	if name == "" || len(data) == 0 {
 		return File{}, apperr.Invalid("document name and content required")
+	}
+	// Compliance-export artifacts are an org's own storage usage, so they are
+	// quota-enforced too (P-19).
+	if err := s.checkQuota(ctx, actor.OrgID, int64(len(data))); err != nil {
+		return File{}, err
 	}
 	sum := sha256.Sum256(data)
 	shaHex := hex.EncodeToString(sum[:])
@@ -200,7 +250,8 @@ func (s *Service) authorizeDownload(ctx context.Context, actor auth.Identity, fi
 	err := s.pool.QueryRow(ctx, `
 		SELECT name, mime, size_bytes, storage_key, uploader_id
 		FROM file
-		WHERE id = $1 AND org_id = $2 AND kind = 1 AND deleted_at IS NULL`,
+		WHERE id = $1 AND org_id = $2 AND kind = 1 AND deleted_at IS NULL
+		  AND scan_status <> 2`,
 		fileID, actor.OrgID).Scan(&m.Name, &m.Mime, &m.Size, &key, &uploader)
 	if err != nil {
 		return Meta{}, "", apperr.NotFound("file not found")
@@ -267,6 +318,7 @@ func (s *Service) AttachEntityReferences(ctx context.Context, tx pgx.Tx, actor a
 			SELECT f.id, $2, $3, $4
 			FROM file f
 			WHERE f.id = $1 AND f.org_id = $5 AND f.deleted_at IS NULL
+			  AND f.scan_status <> 2
 			  AND (f.uploader_id = $4 OR EXISTS (
 			      SELECT 1 FROM file_reference fr2
 			      JOIN message m2 ON fr2.entity_type = 1 AND m2.id = fr2.entity_id
