@@ -229,7 +229,7 @@ func (s *Service) ListThreads(ctx context.Context, actor auth.Identity, channelI
 	}
 	var page ThreadPage
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.requireMember(ctx, tx, channelID, actor.UserID); err != nil {
+		if err := s.requireChannelRead(ctx, tx, channelID, actor.UserID); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `
@@ -291,9 +291,23 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 		if err != nil {
 			return apperr.Internal("load thread", err)
 		}
+		var historyFrom *time.Time
 		if channelID != nil {
-			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+			if err := s.requireChannelRead(ctx, tx, *channelID, actor.UserID); err != nil {
 				return err
+			}
+			// P-16: a protected channel (history_mode 2) bounds each member's
+			// view to their join stamp. NULL — the creator, every member of a
+			// shared channel, and web-public readers (never protected) — means
+			// full history.
+			if err := tx.QueryRow(ctx, `
+				SELECT cm.history_from
+				FROM channel_member cm
+				JOIN channel c ON c.id = cm.channel_id AND c.history_mode = 2
+				WHERE cm.channel_id = $1 AND cm.user_id = $2
+				  AND cm.unsubscribed_at IS NULL`,
+				*channelID, actor.UserID).Scan(&historyFrom); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return apperr.Internal("history boundary", err)
 			}
 		}
 		if dmSpaceID != nil {
@@ -306,8 +320,9 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 			SELECT id, COALESCE(channel_id, 0), thread_id, author_id, source, rendered
 			FROM message
 			WHERE thread_id = $1 AND id < $2 AND deleted_at IS NULL
+			  AND ($4::timestamptz IS NULL OR created_at >= $4)
 			ORDER BY id DESC
-			LIMIT $3`, threadID, beforeID, limit)
+			LIMIT $3`, threadID, beforeID, limit, historyFrom)
 		if err != nil {
 			return apperr.Internal("list messages", err)
 		}
@@ -347,6 +362,27 @@ func (s *Service) requireMember(ctx context.Context, tx pgx.Tx, channelID, userI
 		return apperr.Internal("membership check", err)
 	}
 	if !member {
+		return apperr.Forbidden("not a channel member")
+	}
+	return nil
+}
+
+// requireChannelRead is the READ gate (P-16): live membership, or the channel
+// is web-public AND live. Web-public is world-readable, member-writable — the
+// WRITE paths (requireThreadSend, CreateThread, pins) must keep requireMember,
+// or non-members could post. Archiving closes the web-public branch while
+// members keep their history (the lifecycle contract).
+func (s *Service) requireChannelRead(ctx context.Context, tx pgx.Tx, channelID, userID int64) error {
+	var ok bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM channel_member
+		 WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NULL)
+		OR EXISTS (SELECT 1 FROM channel
+		 WHERE id = $1 AND visibility = 3 AND archived_at IS NULL)`,
+		channelID, userID).Scan(&ok); err != nil {
+		return apperr.Internal("read-access check", err)
+	}
+	if !ok {
 		return apperr.Forbidden("not a channel member")
 	}
 	return nil

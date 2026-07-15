@@ -15,14 +15,35 @@ import (
 )
 
 const (
-	visibilityPublic  = 1
-	visibilityPrivate = 2
+	visibilityPublic    = 1
+	visibilityPrivate   = 2
+	visibilityWebPublic = 3
 )
+
+// visibilityName is the wire name for a channel.visibility column value.
+func visibilityName(v int16) string {
+	switch v {
+	case visibilityPrivate:
+		return "private"
+	case visibilityWebPublic:
+		return "web_public"
+	default:
+		return "public"
+	}
+}
 
 type CreateChannelParams struct {
 	Name        string
 	Description string
-	Private     bool
+	// Visibility is "public", "private", or "web_public" (world-readable,
+	// P-16); empty falls back to the legacy Private bool.
+	Visibility string
+	Private    bool
+	// Protected bounds each member's history to their join time
+	// (history_mode 2, stamped as channel_member.history_from on invite
+	// accept). Valid only with private: public discovery and web-public
+	// world-readability both contradict a per-member history boundary.
+	Protected   bool
 	WorkspaceID int64 // 0 = the org's sole workspace (M1 orgs have one)
 }
 
@@ -41,6 +62,27 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 	name := strings.TrimSpace(strings.TrimPrefix(p.Name, "#"))
 	if name == "" || len(name) > 80 {
 		return CreateChannelResult{}, apperr.Invalid("channel name must be 1-80 characters")
+	}
+	visibility := int16(visibilityPublic)
+	switch p.Visibility {
+	case "":
+		if p.Private {
+			visibility = visibilityPrivate
+		}
+	case "public":
+	case "private":
+		visibility = visibilityPrivate
+	case "web_public":
+		visibility = visibilityWebPublic
+	default:
+		return CreateChannelResult{}, apperr.Invalid(`visibility must be "public", "private", or "web_public"`)
+	}
+	historyMode := int16(1)
+	if p.Protected {
+		if visibility != visibilityPrivate {
+			return CreateChannelResult{}, apperr.Invalid("protected history requires a private channel")
+		}
+		historyMode = 2
 	}
 	var out CreateChannelResult
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -103,15 +145,12 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 			return apperr.Conflict("channel name is reserved by a renamed channel")
 		}
 
-		visibility := visibilityPublic
-		if p.Private {
-			visibility = visibilityPrivate
-		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO channel (org_id, workspace_id, name, visibility,
-				description, creator_id)
-			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-			actor.OrgID, wsID, name, visibility, strings.TrimSpace(p.Description),
+				history_mode, description, creator_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+			actor.OrgID, wsID, name, visibility, historyMode,
+			strings.TrimSpace(p.Description),
 			actor.UserID).Scan(&out.ChannelID); err != nil {
 			return apperr.Internal("create channel", err)
 		}
@@ -135,7 +174,9 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 			ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 			EntityType: enum.EntityChannel, EntityID: out.ChannelID, Verb: "channel.created",
 			Payload: eventlog.MustPayload(map[string]any{
-				"channel_id": out.ChannelID, "name": name, "private": p.Private}),
+				"channel_id": out.ChannelID, "name": name,
+				"private":    visibility == visibilityPrivate,
+				"visibility": visibilityName(visibility)}),
 		}); err != nil {
 			return apperr.Internal("append event", err)
 		}
@@ -148,9 +189,12 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 }
 
 type ChannelSummary struct {
-	ID           int64  `json:"id"`
-	Name         string `json:"name"`
-	Description  string `json:"description"`
+	ID          int64  `json:"id"`
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	// Visibility is "public", "private", or "web_public"; Private is the
+	// legacy boolean, kept for wire compatibility.
+	Visibility   string `json:"visibility"`
 	Private      bool   `json:"private"`
 	Member       bool   `json:"member"`
 	RootThreadID int64  `json:"root_thread_id"`
@@ -163,19 +207,19 @@ type ChannelSummary struct {
 	Color  string `json:"color"`
 }
 
-// ListChannels: the ADR-008 C-2 read-model slice — public channels are
-// discoverable org-wide; private channels appear only to members.
+// ListChannels: the ADR-008 C-2 read-model slice — public and web-public
+// channels are discoverable org-wide; private channels appear only to members.
 func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]ChannelSummary, error) {
 	// Guests (P-5) see ONLY their channels; members also see public ones.
 	rows, err := s.pool.Query(ctx, `
-		SELECT c.id, c.name, c.description, c.visibility = 2,
+		SELECT c.id, c.name, c.description, c.visibility,
 		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0), c.folder_id,
 		       COALESCE(cm.pinned, false), COALESCE(cm.color, '')
 		FROM channel c
 		LEFT JOIN channel_member cm
 		  ON cm.channel_id = c.id AND cm.user_id = $2 AND cm.unsubscribed_at IS NULL
 		WHERE c.org_id = $1 AND c.archived_at IS NULL
-		  AND ((NOT $3 AND c.visibility = 1) OR cm.user_id IS NOT NULL)
+		  AND ((NOT $3 AND c.visibility IN (1, 3)) OR cm.user_id IS NOT NULL)
 		ORDER BY c.name`,
 		actor.OrgID, actor.UserID, actor.IsGuest())
 	if err != nil {
@@ -185,16 +229,19 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 	var out []ChannelSummary
 	for rows.Next() {
 		var c ChannelSummary
-		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member, &c.RootThreadID, &c.FolderID, &c.Pinned, &c.Color); err != nil {
+		var vis int16
+		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &vis, &c.Member, &c.RootThreadID, &c.FolderID, &c.Pinned, &c.Color); err != nil {
 			return nil, apperr.Internal("scan channel", err)
 		}
+		c.Visibility = visibilityName(vis)
+		c.Private = vis == visibilityPrivate
 		out = append(out, c)
 	}
 	return out, rows.Err()
 }
 
-// JoinChannel: self-join for PUBLIC channels (private = invitation, a later
-// endpoint; Zulip's can_subscribe_group refines this when the verb registry
+// JoinChannel: self-join for public and web-public channels (private =
+// invitation; Zulip's can_subscribe_group refines this when the verb registry
 // grows). Re-joining reactivates the membership row so history_from survives.
 func (s *Service) JoinChannel(ctx context.Context, actor auth.Identity, channelID int64) error {
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -206,7 +253,7 @@ func (s *Service) JoinChannel(ctx context.Context, actor auth.Identity, channelI
 		if err != nil {
 			return apperr.NotFound("channel not found")
 		}
-		if visibility != visibilityPublic {
+		if visibility != visibilityPublic && visibility != visibilityWebPublic {
 			return apperr.Forbidden("private channels are joined by invitation")
 		}
 		ct, err := tx.Exec(ctx, `

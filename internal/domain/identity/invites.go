@@ -235,9 +235,15 @@ func joinChannelOnAccept(ctx context.Context, tx pgx.Tx, orgID, userID, channelI
 	// act. Skipping silently is deliberate: account provisioning must not
 	// fail over a channel that archived since; the join just doesn't happen
 	// (and no member.joined is emitted for it).
+	//
+	// P-16: joining a protected channel (history_mode 2) stamps the member's
+	// history boundary; shared channels leave it NULL (full history). The
+	// stamp is written only on a NEW row — a conflict never rewrites one, so
+	// a preserved membership row keeps its original boundary.
 	ct, err := tx.Exec(ctx, `
-		INSERT INTO channel_member (channel_id, user_id)
-		SELECT c.id, $2 FROM channel c
+		INSERT INTO channel_member (channel_id, user_id, history_from)
+		SELECT c.id, $2, CASE WHEN c.history_mode = 2 THEN now() END
+		FROM channel c
 		WHERE c.id = $1 AND c.org_id = $3 AND c.archived_at IS NULL
 		ON CONFLICT DO NOTHING`, channelID, userID, orgID)
 	if err != nil {
