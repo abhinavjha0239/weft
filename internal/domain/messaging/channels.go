@@ -156,6 +156,11 @@ type ChannelSummary struct {
 	RootThreadID int64  `json:"root_thread_id"`
 	// FolderID is the channel's sidebar folder (P-09); null when unfiled.
 	FolderID *int64 `json:"folder_id"`
+	// Pinned and Color are the caller's PERSONAL sidebar prefs (P-14); false
+	// and "" for non-members and for members who never set them. Clients sort
+	// pinned-first (server ordering is unchanged — backend-first honesty).
+	Pinned bool   `json:"pinned"`
+	Color  string `json:"color"`
 }
 
 // ListChannels: the ADR-008 C-2 read-model slice — public channels are
@@ -164,7 +169,8 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 	// Guests (P-5) see ONLY their channels; members also see public ones.
 	rows, err := s.pool.Query(ctx, `
 		SELECT c.id, c.name, c.description, c.visibility = 2,
-		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0), c.folder_id
+		       cm.user_id IS NOT NULL, COALESCE(c.root_thread_id, 0), c.folder_id,
+		       COALESCE(cm.pinned, false), COALESCE(cm.color, '')
 		FROM channel c
 		LEFT JOIN channel_member cm
 		  ON cm.channel_id = c.id AND cm.user_id = $2 AND cm.unsubscribed_at IS NULL
@@ -179,7 +185,7 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 	var out []ChannelSummary
 	for rows.Next() {
 		var c ChannelSummary
-		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member, &c.RootThreadID, &c.FolderID); err != nil {
+		if err := rows.Scan(&c.ID, &c.Name, &c.Description, &c.Private, &c.Member, &c.RootThreadID, &c.FolderID, &c.Pinned, &c.Color); err != nil {
 			return nil, apperr.Internal("scan channel", err)
 		}
 		out = append(out, c)
