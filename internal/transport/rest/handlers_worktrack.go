@@ -1,6 +1,7 @@
 package rest
 
 import (
+	"encoding/json"
 	"net/http"
 	"strconv"
 	"time"
@@ -269,6 +270,93 @@ func (a *api) handleCloseSprint(w http.ResponseWriter, r *http.Request, id auth.
 	if err := a.Worktrack.CloseSprint(r.Context(), id, sprintID, worktrack.CloseSprintParams{
 		MoveToSprintID: in.MoveToSprintID,
 	}); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *api) handleCreateView(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	type req struct {
+		Name    string          `json:"name"`
+		Layout  int16           `json:"layout"`
+		SpaceID int64           `json:"space_id"`
+		Query   json.RawMessage `json:"query"`
+		Config  json.RawMessage `json:"config"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	out, err := a.Worktrack.CreateView(r.Context(), id, worktrack.CreateViewParams{
+		Name: in.Name, Layout: in.Layout, SpaceID: in.SpaceID,
+		Query: in.Query, Config: in.Config,
+	})
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (a *api) handleListViews(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	views, err := a.Worktrack.ListViews(r.Context(), id)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	if views == nil {
+		views = []worktrack.ViewSummary{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"views": views})
+}
+
+func (a *api) handleGetView(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	viewID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad view id")
+		return
+	}
+	out, err := a.Worktrack.GetView(r.Context(), id, viewID)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+func (a *api) handleUpdateView(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	viewID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad view id")
+		return
+	}
+	type req struct {
+		Name   *string         `json:"name"`
+		Layout *int16          `json:"layout"`
+		Query  json.RawMessage `json:"query"`
+		Config json.RawMessage `json:"config"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Worktrack.UpdateView(r.Context(), id, viewID, worktrack.UpdateViewParams{
+		Name: in.Name, Layout: in.Layout, Query: in.Query, Config: in.Config,
+	}); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *api) handleDeleteView(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	viewID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad view id")
+		return
+	}
+	if err := a.Worktrack.DeleteView(r.Context(), id, viewID); err != nil {
 		writeDomainError(w, a.Log, r, err)
 		return
 	}

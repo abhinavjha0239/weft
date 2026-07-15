@@ -203,6 +203,12 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/spaces/{id}/sprints", a.withAuth(a.handleListSprints))
 	mux.HandleFunc("POST /api/v1/sprints/{id}/start", a.withAuth(a.handleStartSprint))
 	mux.HandleFunc("POST /api/v1/sprints/{id}/close", a.withAuth(a.handleCloseSprint))
+	// P-12 saved views: personal boards (a saved query + layout), owner-scoped.
+	mux.HandleFunc("POST /api/v1/views", a.withAuth(a.handleCreateView))
+	mux.HandleFunc("GET /api/v1/views", a.withAuth(a.handleListViews))
+	mux.HandleFunc("GET /api/v1/views/{id}", a.withAuth(a.handleGetView))
+	mux.HandleFunc("PATCH /api/v1/views/{id}", a.withAuth(a.handleUpdateView))
+	mux.HandleFunc("DELETE /api/v1/views/{id}", a.withAuth(a.handleDeleteView))
 	mux.HandleFunc("PUT /api/v1/admin/verbs", a.withAuth(a.handleAssignVerb))
 	mux.HandleFunc("PUT /api/v1/admin/retention-policies", a.withAuth(a.handleSetRetentionPolicy))
 	mux.HandleFunc("GET /api/v1/admin/retention-policies", a.withAuth(a.handleListRetentionPolicies))
