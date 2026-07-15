@@ -1,9 +1,11 @@
 package compliance
 
 import (
+	"archive/zip"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -27,6 +29,8 @@ import (
 // implements it.
 type ExportStore interface {
 	StoreDocument(ctx context.Context, actor auth.Identity, name, mime string, data []byte) (files.File, error)
+	StoreDocumentStream(ctx context.Context, actor auth.Identity, name, mime string, r io.Reader) (files.File, error)
+	OpenForBundle(ctx context.Context, orgID, fileID int64) (io.ReadCloser, error)
 	PinForExport(ctx context.Context, tx pgx.Tx, orgID, exportJobID int64, fileIDs []int64) error
 }
 
@@ -42,6 +46,10 @@ type ExportScope struct {
 	SpaceIDs   []int64    `json:"space_ids,omitempty"`   // work-item discussions
 	From       *time.Time `json:"from,omitempty"`
 	To         *time.Time `json:"to,omitempty"`
+	// IncludeFiles (P-32) switches the result from the bare JSON document to an
+	// export-<id>.zip bundling export.json + a manifest + every pinned
+	// attachment's bytes. Default false keeps today's JSON output unchanged.
+	IncludeFiles bool `json:"include_files,omitempty"`
 }
 
 // Export statuses (export_job.status, 0006 schema).
@@ -405,21 +413,36 @@ func (s *Service) executeExport(ctx context.Context, jobID, orgID, requestedBy i
 	if err != nil {
 		return fmt.Errorf("export: marshal: %w", err)
 	}
-	result, err := s.files.StoreDocument(ctx,
-		auth.Identity{UserID: requestedBy, OrgID: orgID},
-		fmt.Sprintf("weft-export-%d.json", jobID), "application/json", data)
+	// The attachment set: fileIDs (one per message reference) pins evidence via
+	// PinForExport (ON CONFLICT dedups); uniqueAtts is the deduped list the zip
+	// bundles when include_files is set.
+	fileIDs := []int64{}
+	uniqueAtts := []exportAttachment{}
+	seenFile := map[int64]bool{}
+	for i := range doc.Messages {
+		for _, a := range doc.Messages[i].Attachments {
+			fileIDs = append(fileIDs, a.FileID)
+			if !seenFile[a.FileID] {
+				seenFile[a.FileID] = true
+				uniqueAtts = append(uniqueAtts, a)
+			}
+		}
+	}
+
+	actor := auth.Identity{UserID: requestedBy, OrgID: orgID}
+	var result files.File
+	if scope.IncludeFiles {
+		result, err = s.storeBundle(ctx, actor, jobID, orgID, data, uniqueAtts, doc.GeneratedAt)
+	} else {
+		result, err = s.files.StoreDocument(ctx, actor,
+			fmt.Sprintf("weft-export-%d.json", jobID), "application/json", data)
+	}
 	if err != nil {
 		return fmt.Errorf("export: store: %w", err)
 	}
 
 	// Completion: result pointer, attachment pins (evidence outlives
 	// retention), and the audit event — one transaction.
-	fileIDs := []int64{}
-	for i := range doc.Messages {
-		for _, a := range doc.Messages[i].Attachments {
-			fileIDs = append(fileIDs, a.FileID)
-		}
-	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		if _, err := tx.Exec(ctx, `
 			UPDATE export_job SET status = $2, result_file_id = $3, finished_at = now()
@@ -439,6 +462,97 @@ func (s *Service) executeExport(ctx context.Context, jobID, orgID, requestedBy i
 		})
 		return err
 	})
+}
+
+// exportManifest is the bundle's index (manifest.json): what the zip contains
+// and which pinned files could not be read at bundle time.
+type exportManifest struct {
+	JobID       int64     `json:"job_id"`
+	GeneratedAt time.Time `json:"generated_at"`
+	FileCount   int       `json:"file_count"` // entries actually bundled
+	TotalBytes  int64     `json:"total_bytes"`
+	Missing     []int64   `json:"missing"` // pinned ids whose bytes were gone
+}
+
+// storeBundle streams a zip (export.json + manifest.json + one entry per pinned
+// attachment) straight into StoreDocumentStream through an io.Pipe, so memory
+// stays O(one zip block) rather than O(bundle). The producer goroutine and the
+// consuming store cancel each other on either side's error.
+func (s *Service) storeBundle(ctx context.Context, actor auth.Identity, jobID, orgID int64, exportJSON []byte, atts []exportAttachment, generatedAt time.Time) (files.File, error) {
+	pr, pw := io.Pipe()
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- s.writeBundle(ctx, pw, orgID, jobID, exportJSON, atts, generatedAt)
+	}()
+	result, storeErr := s.files.StoreDocumentStream(ctx, actor,
+		fmt.Sprintf("weft-export-%d.zip", jobID), "application/zip", pr)
+	if storeErr != nil {
+		// Unblock the producer if the store aborted mid-stream.
+		_ = pr.CloseWithError(storeErr)
+	}
+	writeErr := <-errCh
+	if storeErr != nil {
+		return files.File{}, storeErr
+	}
+	if writeErr != nil {
+		return files.File{}, writeErr
+	}
+	return result, nil
+}
+
+// writeBundle produces the zip into pw. It ALWAYS closes pw (with any error, so
+// the reader sees it). A file whose blob is missing/unreadable is skipped and
+// listed under manifest `missing` — evidence degradation is visible, never
+// fatal; only a zip-writer or pipe error fails the job.
+func (s *Service) writeBundle(ctx context.Context, pw *io.PipeWriter, orgID, jobID int64, exportJSON []byte, atts []exportAttachment, generatedAt time.Time) (err error) {
+	defer func() { _ = pw.CloseWithError(err) }()
+	zw := zip.NewWriter(pw)
+	ew, err := zw.Create("export.json")
+	if err != nil {
+		return err
+	}
+	if _, err = ew.Write(exportJSON); err != nil {
+		return err
+	}
+	missing := []int64{}
+	var total int64
+	count := 0
+	for _, a := range atts {
+		rc, oerr := s.files.OpenForBundle(ctx, orgID, a.FileID)
+		if oerr != nil {
+			missing = append(missing, a.FileID)
+			continue
+		}
+		// The file_id prefix makes entry names collision-free; a.Name is
+		// already the sanitizeName'd base name stored at upload.
+		fw, cerr := zw.Create(fmt.Sprintf("files/%d_%s", a.FileID, a.Name))
+		if cerr != nil {
+			rc.Close()
+			return cerr
+		}
+		if _, cerr = io.Copy(fw, rc); cerr != nil {
+			rc.Close()
+			return cerr
+		}
+		rc.Close()
+		total += a.Size
+		count++
+	}
+	mw, err := zw.Create("manifest.json")
+	if err != nil {
+		return err
+	}
+	manifest, err := json.MarshalIndent(exportManifest{
+		JobID: jobID, GeneratedAt: generatedAt, FileCount: count,
+		TotalBytes: total, Missing: missing,
+	}, "", " ")
+	if err != nil {
+		return err
+	}
+	if _, err = mw.Write(manifest); err != nil {
+		return err
+	}
+	return zw.Close()
 }
 
 // failExport records the failure (status + audit event with the error).
