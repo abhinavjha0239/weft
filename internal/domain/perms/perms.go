@@ -14,6 +14,7 @@ package perms
 
 import (
 	"context"
+	"errors"
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
@@ -105,6 +106,71 @@ func (s *Service) Require(ctx context.Context, tx pgx.Tx, actor auth.Identity, v
 		return apperr.Forbidden("missing permission: " + verb)
 	}
 	return nil
+}
+
+// HoldersAt answers "who currently holds verb here?" — the read-side mirror
+// of Require. It resolves the winning assignment exactly as Require does (the
+// most specific scope in the chain with an assignment for the verb), then
+// expands that group to its LIVE HUMAN members through the closure. This is
+// how a fan-out addresses "whoever may administer this thing" (e.g. P-25
+// automation-failure alerts: whoever can edit the rule hears it broke).
+//
+// No assignment anywhere in the chain → no holders (nil, nil): deny-by-default
+// has no one to notify, never an error. Agent principals (kind 2) and
+// deactivated accounts are excluded; the result is ordered by user_id.
+func (s *Service) HoldersAt(ctx context.Context, tx pgx.Tx, orgID int64, verb string, chain []scopeRef) ([]int64, error) {
+	if len(chain) == 0 {
+		return nil, nil
+	}
+	types := make([]int16, len(chain))
+	ids := make([]int64, len(chain))
+	for i, sc := range chain {
+		types[i] = int16(sc.Type)
+		ids[i] = sc.ID
+	}
+	// The winning assignment's group — the same VALUES join + scope_type DESC
+	// tiebreak Require uses.
+	var groupID int64
+	err := tx.QueryRow(ctx, `
+		WITH chain AS (
+		  SELECT unnest($3::smallint[]) AS scope_type, unnest($4::bigint[]) AS scope_id
+		)
+		SELECT pa.group_id
+		FROM permission_assignment pa
+		JOIN chain c ON c.scope_type = pa.scope_type AND c.scope_id = pa.scope_id
+		WHERE pa.org_id = $1 AND pa.verb = $2
+		ORDER BY pa.scope_type DESC
+		LIMIT 1`,
+		orgID, verb, types, ids).Scan(&groupID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, apperr.Internal("resolve holders assignment", err)
+	}
+	rows, err := tx.Query(ctx, `
+		SELECT c.user_id
+		FROM user_group_closure c
+		JOIN user_account u ON u.id = c.user_id
+		  AND u.deactivated_at IS NULL AND u.kind = 1
+		WHERE c.group_id = $1
+		ORDER BY c.user_id`, groupID)
+	if err != nil {
+		return nil, apperr.Internal("expand holders", err)
+	}
+	defer rows.Close()
+	var out []int64
+	for rows.Next() {
+		var uid int64
+		if err := rows.Scan(&uid); err != nil {
+			return nil, apperr.Internal("scan holder", err)
+		}
+		out = append(out, uid)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, apperr.Internal("expand holders", err)
+	}
+	return out, nil
 }
 
 // SeedOrg creates the system role groups (nested), places the owner, seeds
