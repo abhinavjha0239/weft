@@ -391,12 +391,13 @@ type UpdateItemParams struct {
 	Title      *string
 	StatusID   *int64
 	AssigneeID *int64 // 0 clears
+	SprintID   *int64 // 0 clears (the AssigneeID precedent)
 }
 
 // UpdateItem edits fields and transitions status. Resolution is DERIVED:
 // entering a done-category status sets resolved_at; leaving clears it (W-3).
 func (s *Service) UpdateItem(ctx context.Context, actor auth.Identity, itemID int64, p UpdateItemParams) error {
-	if p.Title == nil && p.StatusID == nil && p.AssigneeID == nil {
+	if p.Title == nil && p.StatusID == nil && p.AssigneeID == nil && p.SprintID == nil {
 		return apperr.Invalid("nothing to update")
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -435,6 +436,30 @@ func (s *Service) UpdateItem(ctx context.Context, actor auth.Identity, itemID in
 				return apperr.Internal("assign", err)
 			}
 		}
+		if p.SprintID != nil {
+			var v *int64
+			if *p.SprintID != 0 {
+				// Same loadItem tx: the sprint must exist, belong to THIS item's
+				// space, and not be closed. The space pin makes a cross-space or
+				// foreign-org sprint one uniform 400; clearing (0) is always allowed.
+				var sState int
+				if err := tx.QueryRow(ctx, `
+					SELECT state FROM sprint
+					WHERE id = $1 AND org_id = $2 AND space_id = $3`,
+					*p.SprintID, actor.OrgID, spaceID).Scan(&sState); err != nil {
+					return apperr.Invalid("sprint not found in this item's space")
+				}
+				if sState == 3 {
+					return apperr.Invalid("cannot assign an item to a closed sprint")
+				}
+				v = p.SprintID
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE work_item SET sprint_id = $1, updated_at = now() WHERE id = $2`,
+				v, itemID); err != nil {
+				return apperr.Internal("assign sprint", err)
+			}
+		}
 		if p.StatusID != nil && *p.StatusID != curStatus {
 			var cat int
 			if err := tx.QueryRow(ctx,
@@ -459,7 +484,7 @@ func (s *Service) UpdateItem(ctx context.Context, actor auth.Identity, itemID in
 				return apperr.Internal("append event", err)
 			}
 		}
-		if p.Title != nil || p.AssigneeID != nil {
+		if p.Title != nil || p.AssigneeID != nil || p.SprintID != nil {
 			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 				OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 				EntityType: enum.EntityWorkItem, EntityID: itemID, Verb: "workitem.updated",

@@ -196,6 +196,12 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/items/{id}", a.withAuth(a.handleUpdateItem))
 	mux.HandleFunc("POST /api/v1/threads/{id}/promote", a.withAuth(a.handlePromoteThread))
 	mux.HandleFunc("POST /api/v1/threads/{id}/messages", a.withAuth(a.handleSendToThread))
+	// P-11 sprints: a sprint is a column on work_item (one per item). All
+	// mutations gate on org-scoped edit_items (per-space sprint verb is a gap).
+	mux.HandleFunc("POST /api/v1/spaces/{id}/sprints", a.withAuth(a.handleCreateSprint))
+	mux.HandleFunc("GET /api/v1/spaces/{id}/sprints", a.withAuth(a.handleListSprints))
+	mux.HandleFunc("POST /api/v1/sprints/{id}/start", a.withAuth(a.handleStartSprint))
+	mux.HandleFunc("POST /api/v1/sprints/{id}/close", a.withAuth(a.handleCloseSprint))
 	mux.HandleFunc("PUT /api/v1/admin/verbs", a.withAuth(a.handleAssignVerb))
 	mux.HandleFunc("PUT /api/v1/admin/retention-policies", a.withAuth(a.handleSetRetentionPolicy))
 	mux.HandleFunc("GET /api/v1/admin/retention-policies", a.withAuth(a.handleListRetentionPolicies))
