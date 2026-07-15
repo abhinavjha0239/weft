@@ -367,7 +367,7 @@ allowed (cap 50 rows as today).
 search; unknown-operator-as-term; guest search stays inside their
 channels (existing membership join must already ensure — assert it).
 
-### P-20 `notification: HTML digest emails + one-click unsubscribe.` — M — **[ ] queued**
+### P-20 `notification: HTML digest emails + one-click unsubscribe.` — M — **[x] shipped #71**
 Zero migrations. Read `prefs.go`, `email.go`, `platform/mail/mail.go`,
 and `files/signed.go` (the MAC + self-auth precedents) first.
 **Design (decided):**
@@ -438,7 +438,7 @@ when set, injection-safe headers).
 **Gaps to record:** per-kind unsubscribe page (v1 is all-or-nothing);
 resubscribe = the existing prefs API; HTML polish is client-era work.
 
-### P-25 `automation: Failure notifications to scope admins.` — M — **[ ] queued**
+### P-25 `automation: Failure notifications to scope admins.` — M — **[x] shipped #72**
 Read `perms.go` (Require + chain), `automation/runner.go`
 (execute/finishRun), `notification/runner.go` insert (payload + ping
 pattern), and the 0010 dedupe index first.
@@ -508,8 +508,14 @@ kind 6 by default and sends it after opt-in.
 **Gaps to record:** failure detail lives in ListRuns (the notification
 is the doorbell); per-rule mute knob later; workspace/space scopes when
 their admin verbs land.
+**EXECUTION NOTES (#72):** the predicted P-20 overlap surfaced at the
+serial-merge rebase as two test adaptations, folded into the feature
+commit: `capturedMail.body` → `.text` (the Message seam rename) and
+TestUnsubscribe's kind count 5 → 6 — whose failure log (`6:false`)
+proved the prefKinds-registry pattern: the unsubscribe endpoint,
+written before kind 6 existed, flipped it automatically.
 
-### P-29 `identity: Profile edit, password change, session management.` — M — **[ ] queued**
+### P-29 `identity: Profile edit, password change, session management.` — M — **[x] shipped #73**
 Zero migrations (`auth_session` already has ip/user_agent/revoked_at;
 FromToken already enforces revocation). Read `auth/auth.go`,
 `identity/identity.go` (Bootstrap validation + Me), and
@@ -539,11 +545,15 @@ FromToken already enforces revocation). Read `auth/auth.go`,
     now-revoked session lives until reconnect (gateway auths at
     connect); REST is immediate. Live kick = a queued slice.
 - Commit 3 (profile + password):
-  - `UpdateMe(ctx, actor, fullName)`: trim; mirror Bootstrap's
-    full_name validation EXACTLY (read it; extract a helper only if
-    trivial); reject control chars (status.go precedent). Org-scoped
-    UPDATE. NOT event-logged (avatar/status precedent — comment it;
-    clients see it on the next profile fetch).
+  - `UpdateMe(ctx, actor, fullName)`: trim → non-empty required (400)
+    → max 100 runes (400) → control chars rejected (status.go
+    precedent); interior whitespace allowed. (CORRECTED: this bullet
+    originally said "mirror Bootstrap's full_name validation EXACTLY"
+    — Bootstrap has NONE, it defaults an empty name to the email; the
+    executor correctly STOPPED and these rules were pinned by the
+    reviewer. Bootstrap's defaulting is untouched.) Org-scoped UPDATE.
+    NOT event-logged (avatar/status precedent — comment it; clients
+    see it on the next profile fetch).
     `PATCH /api/v1/me` {full_name} → updated MyProfile.
   - `auth.ChangePassword(ctx, pool, userID, current, new)`: verify
     current against user_credential (a missing credential row → the
@@ -572,8 +582,15 @@ the OTHER session's token 401s, the current token survives, the new
 password logs in.
 **Gaps to record:** password reset via email (P-35, needs P-20);
 websocket kick on revoke; session labels/geo.
+**EXECUTION NOTES (#73):** the executor STOPPED on the original
+full_name bullet (spec bug, corrected above) and resumed after the
+reviewer pinned the rules. Two behavior-required deviations shipped:
+`RevokeSession` adds `expires_at > now()` (the spec's own "expired →
+404" edge case demands it) and `auth.ChangePassword` takes the
+presenting session's token hash (needed to revoke all OTHER sessions
+in the same tx while the presenting one survives).
 
-### P-31 `compliance: Audit read API.` — M — **[ ] queued**
+### P-31 `compliance: Audit read API.` — M — **[x] shipped #74**
 Read `compliance/compliance.go` (gating pattern), `0001_event_log.sql`
 (columns + the (org_id, id) index), and the search add() builder
 precedent first.
@@ -620,7 +637,7 @@ no gap vs one big query; limit clamps (0→50, 500→200); malformed since
 convenience route later; workspace-scoped officer reads when workspace
 admin verbs land.
 
-### P-33 `messaging: Oracle-free 404 for DM non-participants.` — S — **[ ] queued**
+### P-33 `messaging: Oracle-free 404 for DM non-participants.` — S — **[x] shipped #75**
 Resolves the 403/404 inconsistency recorded at P-08/#66: DM thread
 read/send/mark-read return 403 to non-participants
 (requireParticipant → Forbidden) while single-message Get is an
