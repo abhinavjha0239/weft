@@ -7,7 +7,9 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/abhinavjha0239/weft/internal/platform/ratelimit"
 )
@@ -89,6 +91,23 @@ func clientIP(r *http.Request) string {
 		return r.RemoteAddr
 	}
 	return host
+}
+
+// requestUserAgent returns the client's User-Agent as session metadata:
+// flattened to a single line, forced to valid UTF-8 (the column is TEXT and
+// the header is client-controlled bytes), and capped at 256 bytes without
+// splitting a rune at the cut. Display only — never trusted for anything.
+func requestUserAgent(r *http.Request) string {
+	ua := strings.ReplaceAll(r.UserAgent(), "\r", " ")
+	ua = strings.ReplaceAll(ua, "\n", " ")
+	ua = strings.ToValidUTF8(ua, "")
+	if len(ua) > 256 {
+		ua = ua[:256]
+		for len(ua) > 0 && !utf8.ValidString(ua) {
+			ua = ua[:len(ua)-1]
+		}
+	}
+	return ua
 }
 
 // withIPLimit protects a handler with a per-IP bucket (pre-auth surfaces).

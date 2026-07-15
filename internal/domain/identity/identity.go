@@ -6,6 +6,9 @@ package identity
 import (
 	"context"
 	"errors"
+	"strings"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -34,6 +37,10 @@ type BootstrapParams struct {
 	Email    string
 	Password string
 	FullName string
+	// IP and UserAgent are recorded on the minted session (P-29 metadata);
+	// empty values are allowed.
+	IP        string
+	UserAgent string
 }
 
 type BootstrapResult struct {
@@ -137,7 +144,7 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 		}); err != nil {
 			return apperr.Internal("append event", err)
 		}
-		token, err := auth.CreateSession(ctx, tx, out.UserID)
+		token, err := auth.CreateSession(ctx, tx, out.UserID, p.IP, p.UserAgent)
 		if err != nil {
 			return apperr.Internal("create session", err)
 		}
@@ -150,9 +157,10 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 	return out, nil
 }
 
-// Login verifies credentials and mints a session.
-func (s *Service) Login(ctx context.Context, orgSlug, email, password string) (string, error) {
-	token, err := auth.Login(ctx, s.pool, orgSlug, email, password)
+// Login verifies credentials and mints a session, recording the client's ip
+// and user agent as session metadata.
+func (s *Service) Login(ctx context.Context, orgSlug, email, password, ip, userAgent string) (string, error) {
+	token, err := auth.Login(ctx, s.pool, orgSlug, email, password, ip, userAgent)
 	if err != nil {
 		return "", apperr.Unauthorized("invalid credentials")
 	}
@@ -194,6 +202,36 @@ func (s *Service) Me(ctx context.Context, actor auth.Identity) (MyProfile, error
 		return MyProfile{}, apperr.Internal("me", err)
 	}
 	return p, nil
+}
+
+const maxFullNameRunes = 100
+
+// UpdateMe renames the actor's own account (P-29). Validation: trimmed,
+// non-empty (an explicit PATCH with an empty name is user error — Bootstrap's
+// empty→email defaulting is a bootstrap-only convenience, not a precedent),
+// at most 100 runes, and control-character free (the status.go precedent;
+// interior whitespace is fine — names contain spaces). NOT event-logged
+// (the avatar/status precedent for personal profile data): clients see the
+// new name on their next profile fetch.
+func (s *Service) UpdateMe(ctx context.Context, actor auth.Identity, fullName string) (MyProfile, error) {
+	name := strings.TrimSpace(fullName)
+	if name == "" {
+		return MyProfile{}, apperr.Invalid("full_name is required")
+	}
+	if utf8.RuneCountInString(name) > maxFullNameRunes {
+		return MyProfile{}, apperr.Invalid("full_name must be at most 100 characters")
+	}
+	for _, r := range name {
+		if unicode.IsControl(r) {
+			return MyProfile{}, apperr.Invalid("full_name must not contain control characters")
+		}
+	}
+	if _, err := s.pool.Exec(ctx, `
+		UPDATE user_account SET full_name = $1 WHERE id = $2 AND org_id = $3`,
+		name, actor.UserID, actor.OrgID); err != nil {
+		return MyProfile{}, apperr.Internal("update full_name", err)
+	}
+	return s.Me(ctx, actor)
 }
 
 // guestVisibleClause is the P-5 boundary on people-read surfaces: guests

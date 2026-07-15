@@ -18,6 +18,24 @@ func (a *api) handleMe(w http.ResponseWriter, r *http.Request, id auth.Identity)
 	writeJSON(w, http.StatusOK, me)
 }
 
+// handlePatchMe: PATCH /api/v1/me {full_name} — rename the caller's own
+// account (P-29); validation lives in the domain.
+func (a *api) handlePatchMe(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	type req struct {
+		FullName string `json:"full_name"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	me, err := a.Identity.UpdateMe(r.Context(), id, in.FullName)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, me)
+}
+
 // handleListUsers serves both profile forms: GET /users?ids=1,2,3 is the
 // batch lookup; without ids it is the active-member directory (pickers).
 func (a *api) handleListUsers(w http.ResponseWriter, r *http.Request, id auth.Identity) {
