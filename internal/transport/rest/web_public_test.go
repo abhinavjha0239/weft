@@ -20,7 +20,8 @@ import (
 
 // TestWebPublicChannels: P-16 (authed surface). Creating a web_public channel
 // via the visibility param, the legacy Private-bool fallback, org-wide
-// discovery, non-member self-join, and the channel.created payload.
+// discovery, the diverged read gate (non-members and guests read, only
+// members write), non-member self-join, and the channel.created payload.
 func TestWebPublicChannels(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -107,6 +108,92 @@ func TestWebPublicChannels(t *testing.T) {
 	}
 	if g := list["general"]; g.Visibility != "public" {
 		t.Fatalf("general visibility = %q, want public", g.Visibility)
+	}
+
+	// The diverged read gate: owner seeds a thread in town-square and a
+	// message in vault, then a NON-MEMBER reads the web-public channel.
+	var welcome struct {
+		ThreadID      int64 `json:"thread_id"`
+		RootMessageID int64 `json:"root_message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, town.ChannelID),
+		boot.Token, map[string]any{"title": "welcome", "content": "first post"}, &welcome)
+	var secret struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, vault.ChannelID),
+		boot.Token, map[string]any{"content": "vault secret"}, &secret)
+	var tpage struct {
+		Threads []struct {
+			ID int64 `json:"id"`
+		} `json:"threads"`
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, town.ChannelID),
+		caseyTok, &tpage); code != http.StatusOK || len(tpage.Threads) != 1 {
+		t.Fatalf("non-member web_public threads = %d (%d threads), want 200 with 1", code, len(tpage.Threads))
+	}
+	var mpage struct {
+		Messages []struct {
+			ID int64 `json:"id"`
+		} `json:"messages"`
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, welcome.ThreadID),
+		caseyTok, &mpage); code != http.StatusOK || len(mpage.Messages) != 1 {
+		t.Fatalf("non-member web_public messages = %d (%d msgs), want 200 with 1", code, len(mpage.Messages))
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, welcome.RootMessageID),
+		caseyTok, nil); code != http.StatusOK {
+		t.Fatalf("non-member web_public Get = %d, want 200", code)
+	}
+
+	// World-readable, member-writable: the non-member's POST still 403s (the
+	// audit pin — the send path keeps requireMember).
+	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, welcome.ThreadID),
+		caseyTok, map[string]any{"content": "drive-by"}); code != http.StatusForbidden {
+		t.Fatalf("non-member web_public POST = %d, want 403", code)
+	}
+
+	// Private stays closed to non-members: 403 on the list, oracle-free 404
+	// on Get.
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, vault.ChannelID),
+		caseyTok, nil); code != http.StatusForbidden {
+		t.Fatalf("non-member private threads = %d, want 403", code)
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, secret.MessageID),
+		caseyTok, nil); code != http.StatusNotFound {
+		t.Fatalf("non-member private Get = %d, want 404", code)
+	}
+
+	// A guest reads web-public — world-readable trumps the guest boundary —
+	// while their channel list stays memberships-only.
+	var ginv identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+		"role": 50, "channel_ids": []int64{boot.ChannelID}}, &ginv)
+	var gina identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": ginv.Token, "email": "gina@wp.test", "password": "password123",
+		"full_name": "Gina Guest"}, &gina)
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, welcome.ThreadID),
+		gina.Token, nil); code != http.StatusOK {
+		t.Fatalf("guest web_public read = %d, want 200", code)
+	}
+	if _, ok := listChannels(t, ts.URL, gina.Token)["town-square"]; ok {
+		t.Fatal("web_public listed to a guest non-member (guest list is memberships-only)")
+	}
+
+	// Archiving closes the web-public branch for non-members.
+	var expo struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "expo", "visibility": "web_public"}, &expo)
+	if code := patchJSON(t, fmt.Sprintf("%s/api/v1/channels/%d", ts.URL, expo.ChannelID),
+		boot.Token, map[string]any{"archived": true}); code != http.StatusOK {
+		t.Fatalf("archive expo = %d, want 200", code)
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, expo.ChannelID),
+		caseyTok, nil); code != http.StatusForbidden {
+		t.Fatalf("archived web_public threads = %d, want 403", code)
 	}
 
 	// Self-join works for web_public like public; posting follows membership.

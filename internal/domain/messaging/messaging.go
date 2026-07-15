@@ -140,9 +140,10 @@ type Message struct {
 }
 
 // Get fetches one message the actor may read — the same visibility rule as
-// ListMessages: channel messages require membership of the governing
-// channel; DM messages require participation; space-thread messages
-// (neither container) are org-visible in the v1 slice.
+// ListMessages: channel messages require membership of the governing channel
+// or the channel being live web-public (P-16); DM messages require
+// participation; space-thread messages (neither container) are org-visible in
+// the v1 slice.
 func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Message, error) {
 	var m Message
 	err := s.pool.QueryRow(ctx, `
@@ -150,10 +151,14 @@ func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Me
 		       m.rendered, m.forwarded_from_message_id
 		FROM message m
 		WHERE m.id = $1 AND m.org_id = $3 AND m.deleted_at IS NULL
-		  AND ((m.channel_id IS NOT NULL AND EXISTS (
+		  AND ((m.channel_id IS NOT NULL AND (EXISTS (
 		         SELECT 1 FROM channel_member cm
 		         WHERE cm.channel_id = m.channel_id AND cm.user_id = $2
-		           AND cm.unsubscribed_at IS NULL))
+		           AND cm.unsubscribed_at IS NULL)
+		       OR EXISTS (
+		         SELECT 1 FROM channel c
+		         WHERE c.id = m.channel_id AND c.visibility = 3
+		           AND c.archived_at IS NULL)))
 		    OR (m.dm_space_id IS NOT NULL AND EXISTS (
 		         SELECT 1 FROM dm_participant dp
 		         WHERE dp.dm_space_id = m.dm_space_id AND dp.user_id = $2))

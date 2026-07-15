@@ -229,7 +229,7 @@ func (s *Service) ListThreads(ctx context.Context, actor auth.Identity, channelI
 	}
 	var page ThreadPage
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.requireMember(ctx, tx, channelID, actor.UserID); err != nil {
+		if err := s.requireChannelRead(ctx, tx, channelID, actor.UserID); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `
@@ -292,7 +292,7 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 			return apperr.Internal("load thread", err)
 		}
 		if channelID != nil {
-			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+			if err := s.requireChannelRead(ctx, tx, *channelID, actor.UserID); err != nil {
 				return err
 			}
 		}
@@ -347,6 +347,27 @@ func (s *Service) requireMember(ctx context.Context, tx pgx.Tx, channelID, userI
 		return apperr.Internal("membership check", err)
 	}
 	if !member {
+		return apperr.Forbidden("not a channel member")
+	}
+	return nil
+}
+
+// requireChannelRead is the READ gate (P-16): live membership, or the channel
+// is web-public AND live. Web-public is world-readable, member-writable — the
+// WRITE paths (requireThreadSend, CreateThread, pins) must keep requireMember,
+// or non-members could post. Archiving closes the web-public branch while
+// members keep their history (the lifecycle contract).
+func (s *Service) requireChannelRead(ctx context.Context, tx pgx.Tx, channelID, userID int64) error {
+	var ok bool
+	if err := tx.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM channel_member
+		 WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NULL)
+		OR EXISTS (SELECT 1 FROM channel
+		 WHERE id = $1 AND visibility = 3 AND archived_at IS NULL)`,
+		channelID, userID).Scan(&ok); err != nil {
+		return apperr.Internal("read-access check", err)
+	}
+	if !ok {
 		return apperr.Forbidden("not a channel member")
 	}
 	return nil
