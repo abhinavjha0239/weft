@@ -183,6 +183,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/admin/legal-holds/{id}/release", a.withAuth(a.handleReleaseLegalHold))
 	mux.HandleFunc("POST /api/v1/admin/exports", a.withAuth(a.handleRequestExport))
 	mux.HandleFunc("GET /api/v1/admin/exports", a.withAuth(a.handleListExports))
+	// P-31: compliance_officer-gated read over the raw event log.
+	mux.HandleFunc("GET /api/v1/audit/events", a.withAuth(a.handleAuditEvents))
 	mux.HandleFunc("POST /api/v1/automations", a.withAuth(a.handleCreateAutomation))
 	mux.HandleFunc("GET /api/v1/automations", a.withAuth(a.handleListAutomations))
 	mux.HandleFunc("PATCH /api/v1/automations/{id}", a.withAuth(a.handleUpdateAutomation))

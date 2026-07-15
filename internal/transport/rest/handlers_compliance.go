@@ -3,6 +3,7 @@ package rest
 import (
 	"net/http"
 	"strconv"
+	"time"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/domain/compliance"
@@ -92,6 +93,44 @@ func (a *api) handleListExports(w http.ResponseWriter, r *http.Request, id auth.
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"exports": out})
+}
+
+// handleAuditEvents: GET /api/v1/audit/events — the compliance_officer read
+// over the raw event log (P-31), keyset-paginated newest first. All filters
+// are optional query params; malformed since/until are the only 400s here (the
+// verb-length bound and the officer gate live in the domain).
+func (a *api) handleAuditEvents(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	q := r.URL.Query()
+	f := compliance.AuditFilter{Verb: q.Get("verb")}
+	if v, err := strconv.ParseInt(q.Get("entity_type"), 10, 16); err == nil {
+		f.EntityType = int16(v)
+	}
+	f.ActorID, _ = strconv.ParseInt(q.Get("actor_id"), 10, 64)
+	f.EntityID, _ = strconv.ParseInt(q.Get("entity_id"), 10, 64)
+	f.Cursor, _ = strconv.ParseInt(q.Get("cursor"), 10, 64)
+	f.Limit, _ = strconv.Atoi(q.Get("limit"))
+	if s := q.Get("since"); s != "" {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "since must be an RFC3339 timestamp")
+			return
+		}
+		f.Since = &ts
+	}
+	if s := q.Get("until"); s != "" {
+		ts, err := time.Parse(time.RFC3339, s)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "until must be an RFC3339 timestamp")
+			return
+		}
+		f.Until = &ts
+	}
+	page, err := a.Compliance.AuditEvents(r.Context(), id, f)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, page)
 }
 
 func (a *api) handleReleaseLegalHold(w http.ResponseWriter, r *http.Request, id auth.Identity) {
