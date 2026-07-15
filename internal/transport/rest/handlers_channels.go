@@ -43,6 +43,31 @@ func (a *api) handleListChannels(w http.ResponseWriter, r *http.Request, id auth
 	writeJSON(w, http.StatusOK, map[string]any{"channels": channels})
 }
 
+// handleSetSidebarPrefs: PUT /channels/{id}/sidebar {pinned, color} — the
+// caller's OWN sidebar presentation (P-14). PUT-replace, not merge; a missing
+// field takes its zero value (pinned=false, color=""=clear). A non-member,
+// unsubscribed member, or foreign-org channel is an oracle-free 404.
+func (a *api) handleSetSidebarPrefs(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	channelID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad channel id")
+		return
+	}
+	type req struct {
+		Pinned bool   `json:"pinned"`
+		Color  string `json:"color"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Messaging.SetSidebarPrefs(r.Context(), id, channelID, in.Pinned, in.Color); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
 func (a *api) handleJoinChannel(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	channelID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
 	if err != nil {
