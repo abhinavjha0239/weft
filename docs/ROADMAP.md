@@ -668,7 +668,7 @@ body does NOT echo the dm_space_id); participant flows unchanged;
 single-message Get still 404 (regression pin).
 **Gaps to record:** P-34 channel existence masking (NEEDS-DESIGN).
 
-### P-35 `identity: Password reset via email.` — M — **[ ] queued**
+### P-35 `identity: Password reset via email.` — M — **[x] shipped #78**
 Migration **0013_password_reset.sql** (the number is PINNED — P-19 in
 this batch takes 0014; db.Migrate is filename-keyed and gap-tolerant,
 verified). Read `auth/auth.go` (ChangePassword, session pattern),
@@ -731,7 +731,7 @@ the double-confirm test goes green-when-it-should-fail — prove red.
 **Gaps to record:** client link format + reset web page (client
 era); placeholder claiming; org-configurable TTL.
 
-### P-14 `messaging: Sidebar pins and colors.` — S — **[ ] queued**
+### P-14 `messaging: Sidebar pins and colors.` — S — **[x] shipped #79**
 Zero migrations — `channel_member.pinned` (BOOLEAN, default false)
 and `channel_member.color` (TEXT, nullable) have been dormant since
 0003 (the C-4 quartet). This slice WAKES them; named custom sections
@@ -768,7 +768,7 @@ writes and the test catches it); second user's flags are independent
 **Gaps to record:** named sections (schema), pinned-first server
 ordering, folder/section client interaction (client era).
 
-### P-19 `files: Upload scan seam + org storage quota.` — M — **[ ] queued**
+### P-19 `files: Upload scan seam + org storage quota.` — M — **[x] shipped #80**
 Migration **0014_file_org_live_index.sql** (PINNED; see P-35 note).
 `file.scan_status` (0 pending · 1 clean · 2 quarantined) has been
 dormant since 0006 (F-7). Read `files.go` Upload (the spool+hash
@@ -839,8 +839,15 @@ quota event logged.
 **Gaps to record:** no real scanner driver (seam only); async
 re-scan lane; per-user quotas; blob-level dedup accounting; 413 vs
 400 taxonomy if reduced.
+**EXECUTION NOTES (#80):** no reduction was needed — apperr gained
+append-only 413/422 kinds (spec-sanctioned). The executor flagged a
+spec-internal tension and resolved it correctly, pinned by tests:
+`max_bytes=0` = unlimited (the explicit definition wins); the
+"0-byte quota blocks" edge bullet reads as a FULL quota rejecting.
+Lesson recorded: edge-case bullets must not contradict the
+definition they illustrate.
 
-### P-32 `compliance: Export byte-bundles (zip).` — M — **[ ] queued**
+### P-32 `compliance: Export byte-bundles (zip).` — M — **[x] shipped #81**
 Zero migrations (`export_job.scope` JSONB carries the new flag). Read
 `compliance/export.go` (worker, the #45 pin mechanism), `files.go`
 StoreDocument, and `blob.Store` first.
@@ -898,6 +905,12 @@ existing contract.
 **Gaps to record:** eDiscovery/partner manifest format (this is the
 raw bundle); zip64 for >4 GiB bundles (archive/zip handles it —
 verify and note); no incremental/delta exports.
+**EXECUTION NOTES (#81):** the spec-mandated "do NOT invent the
+quota interaction" hold worked: the executor recorded it, and the
+reviewer wired P-19's checkQuota into StoreDocumentStream while
+resolving the predicted files.go rebase conflict, adding the e2e
+pin (an over-quota export FAILS: status 4, no result) plus the
+SetPerms wiring the pre-P-19 test scaffold lacked.
 
 ---
 
