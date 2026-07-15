@@ -176,3 +176,106 @@ func TestMostSpecificWins(t *testing.T) {
 		t.Fatalf("owner (⊂ admins) must keep send: %v", err)
 	}
 }
+
+// TestHoldersAt: the read-side mirror of Require. The org default for
+// manage_org (role:admins) expands through the closure to admins ∪ owners,
+// excluding agent principals (kind 2) and deactivated accounts; a channel
+// override of the verb wins over the org default (fewer holders here proves
+// it); and a verb with no assignment resolves to no holders (deny-default).
+func TestHoldersAt(t *testing.T) {
+	pool := testPool(t)
+	f := setup(t, pool)
+	ctx := context.Background()
+
+	// Populate role:admins with a live human, an agent, and a deactivated
+	// human (the owner is already there via owners ⊂ admins).
+	var humanAdmin, agentAdmin, deadAdmin int64
+	err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx, `INSERT INTO user_account (org_id, kind, email, full_name)
+			VALUES ($1,1,'ha@t.test','Human Admin') RETURNING id`, f.orgID).Scan(&humanAdmin); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `INSERT INTO user_account (org_id, kind, email, full_name)
+			VALUES ($1,2,'agent@t.test','Agent') RETURNING id`, f.orgID).Scan(&agentAdmin); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `INSERT INTO user_account (org_id, kind, email, full_name, deactivated_at)
+			VALUES ($1,1,'dead@t.test','Dead Admin', now()) RETURNING id`, f.orgID).Scan(&deadAdmin); err != nil {
+			return err
+		}
+		admins, err := f.svc.SystemGroupID(ctx, tx, f.orgID, GroupAdmins)
+		if err != nil {
+			return err
+		}
+		for _, uid := range []int64{humanAdmin, agentAdmin, deadAdmin} {
+			if _, err := tx.Exec(ctx,
+				`INSERT INTO user_group_member (group_id, user_id) VALUES ($1, $2)`, admins, uid); err != nil {
+				return err
+			}
+		}
+		return f.svc.RebuildClosure(ctx, tx, f.orgID)
+	})
+	if err != nil {
+		t.Fatalf("seed admins: %v", err)
+	}
+
+	holders := func(t *testing.T, verb string, chainFn func(tx pgx.Tx) ([]scopeRef, error)) []int64 {
+		t.Helper()
+		var out []int64
+		if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+			chain, err := chainFn(tx)
+			if err != nil {
+				return err
+			}
+			out, err = f.svc.HoldersAt(ctx, tx, f.orgID, verb, chain)
+			return err
+		}); err != nil {
+			t.Fatalf("holders: %v", err)
+		}
+		return out
+	}
+
+	orgChain := func(tx pgx.Tx) ([]scopeRef, error) { return OrgScope(f.orgID), nil }
+	chanChain := func(tx pgx.Tx) ([]scopeRef, error) { return f.svc.ChannelScope(ctx, tx, f.orgID, f.channelID) }
+
+	// Org default: manage_org → admins ∪ owners, live humans only, sorted.
+	got := holders(t, VerbManageOrg, orgChain)
+	want := []int64{f.owner.UserID, humanAdmin}
+	if !equalInt64s(got, want) {
+		t.Fatalf("manage_org holders = %v, want %v (owner+admin, agent/deactivated excluded)", got, want)
+	}
+
+	// Channel override beats the org default: point administer_channel at
+	// owners for this channel. The org default (admins) would return
+	// owner+humanAdmin; the override returns owner ALONE — proving the
+	// channel-scope assignment won.
+	if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		owners, err := f.svc.SystemGroupID(ctx, tx, f.orgID, GroupOwners)
+		if err != nil {
+			return err
+		}
+		return f.svc.Assign(ctx, tx, f.orgID, VerbAdministerChannel, ChannelRef(f.channelID), owners)
+	}); err != nil {
+		t.Fatalf("channel override: %v", err)
+	}
+	if got := holders(t, VerbAdministerChannel, chanChain); !equalInt64s(got, []int64{f.owner.UserID}) {
+		t.Fatalf("administer_channel holders = %v, want [%d] (channel override beat org admins)", got, f.owner.UserID)
+	}
+
+	// A verb with no assignment anywhere → no holders (deny-default).
+	if got := holders(t, VerbComplianceOfficer, orgChain); len(got) != 0 {
+		t.Fatalf("unassigned verb holders = %v, want none", got)
+	}
+}
+
+func equalInt64s(a, b []int64) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}

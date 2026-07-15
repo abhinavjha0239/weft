@@ -224,6 +224,8 @@ func line(p pendingEmail) string {
 		return fmt.Sprintf("- %s posted in a thread you follow%s", who, where)
 	case KindKeyword:
 		return fmt.Sprintf("- %s used one of your alert words%s", who, where)
+	case KindAutomationFailure:
+		return "- An automation run failed"
 	default:
 		return fmt.Sprintf("- New activity%s", where)
 	}

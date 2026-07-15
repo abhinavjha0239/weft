@@ -117,10 +117,12 @@ func TestNotificationEmails(t *testing.T) {
 	var prefs struct {
 		Prefs []notification.MediumPref `json:"prefs"`
 	}
-	if code := getJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok, &prefs); code != 200 || len(prefs.Prefs) != 5 {
+	if code := getJSON(t, ts.URL+"/api/v1/notification-prefs", bobTok, &prefs); code != 200 || len(prefs.Prefs) != 6 {
 		t.Fatalf("prefs = %d %+v", code, prefs.Prefs)
 	}
 	for _, p := range prefs.Prefs {
+		// kinds 1 (dm), 2 (mention), 4 (keyword) default ON; 3/5/6 default OFF
+		// (kind 6 automation-failure is in-app only until an admin opts in).
 		want := p.Kind == 1 || p.Kind == 2 || p.Kind == 4
 		if p.Enabled != want {
 			t.Fatalf("default pref kind %d = %v, want %v", p.Kind, p.Enabled, want)

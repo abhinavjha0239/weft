@@ -164,7 +164,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	notifSvc.SetUnsubscribe(cfg.SigningSecret)
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
-	go automation.NewRunner(pool, msgSvc, log).Run(ctx)
+	go automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log).Run(ctx)
 	go msgSvc.RunScheduledLoop(ctx, log)
 	filesSvc := files.New(pool, store)
 	filesSvc.SetSigningSecret(cfg.SigningSecret)

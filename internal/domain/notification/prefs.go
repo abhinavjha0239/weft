@@ -24,7 +24,7 @@ func defaultEmailEnabled(kind int16) bool {
 }
 
 // prefKinds are the settable reason classes.
-var prefKinds = []int16{KindDM, KindMention, KindFollowedThread, KindKeyword, KindChannelActivity}
+var prefKinds = []int16{KindDM, KindMention, KindFollowedThread, KindKeyword, KindChannelActivity, KindAutomationFailure}
 
 type MediumPref struct {
 	Kind    int16 `json:"kind"`
@@ -78,7 +78,7 @@ func (s *Service) SetMediumPref(ctx context.Context, actor auth.Identity, kind, 
 		}
 	}
 	if !valid {
-		return apperr.Invalid("kind must be 1 (dm), 2 (mention), 3 (followed), 4 (keyword), or 5 (channel activity)")
+		return apperr.Invalid("kind must be 1 (dm), 2 (mention), 3 (followed), 4 (keyword), 5 (channel activity), or 6 (automation failure)")
 	}
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO notification_medium_pref (user_id, kind, medium, enabled)
