@@ -81,6 +81,10 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.Handle("POST /api/v1/orgs/bootstrap", preAuth(http.HandlerFunc(a.handleBootstrap)))
 	mux.Handle("POST /api/v1/auth/login", preAuth(http.HandlerFunc(a.handleLogin)))
 	mux.Handle("POST /api/v1/invites/accept", preAuth(http.HandlerFunc(a.handleAcceptInvite)))
+	// P-35 password reset: pre-auth (IP-limited like login); the emailed token
+	// is the capability, so no Authorization is read.
+	mux.Handle("POST /api/v1/password-reset/request", preAuth(http.HandlerFunc(a.handlePasswordResetRequest)))
+	mux.Handle("POST /api/v1/password-reset/confirm", preAuth(http.HandlerFunc(a.handlePasswordResetConfirm)))
 	mux.HandleFunc("POST /api/v1/invites", a.withAuth(a.handleCreateInvite))
 	mux.HandleFunc("GET /api/v1/invites", a.withAuth(a.handleListInvites))
 	mux.HandleFunc("DELETE /api/v1/invites/{id}", a.withAuth(a.handleRevokeInvite))

@@ -7,6 +7,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"unicode"
 	"unicode/utf8"
 
@@ -20,11 +21,18 @@ import (
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
+	"github.com/abhinavjha0239/weft/internal/platform/mail"
 )
 
 type Service struct {
 	pool  *pgxpool.Pool
 	perms *perms.Service
+	// mailer carries password-reset mail (P-35), wired via SetMailer at
+	// composition (the SetSigningSecret pattern). Nil in tests/config that
+	// never send: the request endpoint still succeeds and sends nothing,
+	// warning once via noMailerWarn.
+	mailer       mail.Sender
+	noMailerWarn sync.Once
 }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
