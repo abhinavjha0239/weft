@@ -15,6 +15,7 @@ func (a *api) handleCreateChannel(w http.ResponseWriter, r *http.Request, id aut
 		Description string `json:"description"`
 		Visibility  string `json:"visibility"`
 		Private     bool   `json:"private"`
+		Protected   bool   `json:"protected"`
 		WorkspaceID int64  `json:"workspace_id"`
 	}
 	in, ok := decode[req](w, r)
@@ -23,7 +24,8 @@ func (a *api) handleCreateChannel(w http.ResponseWriter, r *http.Request, id aut
 	}
 	out, err := a.Messaging.CreateChannel(r.Context(), id, messaging.CreateChannelParams{
 		Name: in.Name, Description: in.Description,
-		Visibility: in.Visibility, Private: in.Private, WorkspaceID: in.WorkspaceID,
+		Visibility: in.Visibility, Private: in.Private, Protected: in.Protected,
+		WorkspaceID: in.WorkspaceID,
 	})
 	if err != nil {
 		writeDomainError(w, a.Log, r, err)

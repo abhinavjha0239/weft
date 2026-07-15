@@ -291,9 +291,23 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 		if err != nil {
 			return apperr.Internal("load thread", err)
 		}
+		var historyFrom *time.Time
 		if channelID != nil {
 			if err := s.requireChannelRead(ctx, tx, *channelID, actor.UserID); err != nil {
 				return err
+			}
+			// P-16: a protected channel (history_mode 2) bounds each member's
+			// view to their join stamp. NULL — the creator, every member of a
+			// shared channel, and web-public readers (never protected) — means
+			// full history.
+			if err := tx.QueryRow(ctx, `
+				SELECT cm.history_from
+				FROM channel_member cm
+				JOIN channel c ON c.id = cm.channel_id AND c.history_mode = 2
+				WHERE cm.channel_id = $1 AND cm.user_id = $2
+				  AND cm.unsubscribed_at IS NULL`,
+				*channelID, actor.UserID).Scan(&historyFrom); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+				return apperr.Internal("history boundary", err)
 			}
 		}
 		if dmSpaceID != nil {
@@ -306,8 +320,9 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 			SELECT id, COALESCE(channel_id, 0), thread_id, author_id, source, rendered
 			FROM message
 			WHERE thread_id = $1 AND id < $2 AND deleted_at IS NULL
+			  AND ($4::timestamptz IS NULL OR created_at >= $4)
 			ORDER BY id DESC
-			LIMIT $3`, threadID, beforeID, limit)
+			LIMIT $3`, threadID, beforeID, limit, historyFrom)
 		if err != nil {
 			return apperr.Internal("list messages", err)
 		}

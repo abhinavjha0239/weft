@@ -162,7 +162,14 @@ func (s *Service) Get(ctx context.Context, actor auth.Identity, msgID int64) (Me
 		    OR (m.dm_space_id IS NOT NULL AND EXISTS (
 		         SELECT 1 FROM dm_participant dp
 		         WHERE dp.dm_space_id = m.dm_space_id AND dp.user_id = $2))
-		    OR (m.channel_id IS NULL AND m.dm_space_id IS NULL))`,
+		    OR (m.channel_id IS NULL AND m.dm_space_id IS NULL))
+		  AND NOT EXISTS (
+		         SELECT 1 FROM channel c2
+		         JOIN channel_member cm2 ON cm2.channel_id = c2.id
+		           AND cm2.user_id = $2 AND cm2.unsubscribed_at IS NULL
+		         WHERE c2.id = m.channel_id AND c2.history_mode = 2
+		           AND cm2.history_from IS NOT NULL
+		           AND m.created_at < cm2.history_from)`,
 		msgID, actor.UserID, actor.OrgID).Scan(&m.ID, &m.ChannelID, &m.ThreadID,
 		&m.AuthorID, &m.Source, &m.Rendered, &m.ForwardedFrom)
 	if errors.Is(err, pgx.ErrNoRows) {

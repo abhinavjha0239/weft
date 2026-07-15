@@ -417,3 +417,185 @@ func TestPublicChannelAnon(t *testing.T) {
 		t.Fatal("anon gateway must not be 200")
 	}
 }
+
+// TestProtectedHistory: P-16 (protected channels). A private channel created
+// with protected=true stamps history_from on invite-accept joins; the
+// newcomer's reads start at their join while the creator keeps full history;
+// the boundary survives leave and a rejoin reactivation; shared channels
+// stay boundary-free; protected without private is a 400.
+func TestProtectedHistory(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		UserID    int64  `json:"user_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "prot", "email": "ora@prot.test", "password": "password123",
+		"full_name": "Ora Owner",
+	}, &boot)
+
+	// Protected is private-only: default-public and web_public both 400.
+	if code := postJSONStatus(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "x1", "protected": true}); code != http.StatusBadRequest {
+		t.Fatalf("protected public = %d, want 400", code)
+	}
+	if code := postJSONStatus(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "x2", "visibility": "web_public", "protected": true}); code != http.StatusBadRequest {
+		t.Fatalf("protected web_public = %d, want 400", code)
+	}
+
+	var ledger struct {
+		ChannelID    int64 `json:"channel_id"`
+		RootThreadID int64 `json:"root_thread_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "ledger", "visibility": "private", "protected": true}, &ledger)
+	var vis, hm int16
+	if err := pool.QueryRow(ctx,
+		`SELECT visibility, history_mode FROM channel WHERE id = $1`,
+		ledger.ChannelID).Scan(&vis, &hm); err != nil || vis != 2 || hm != 2 {
+		t.Fatalf("ledger visibility=%d history_mode=%d (%v), want 2/2", vis, hm, err)
+	}
+	// The creator's own membership carries no boundary (NULL = all history).
+	var ownerHF *time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT history_from FROM channel_member
+		WHERE channel_id = $1 AND user_id = $2`,
+		ledger.ChannelID, boot.UserID).Scan(&ownerHF); err != nil || ownerHF != nil {
+		t.Fatalf("creator history_from = %v (%v), want NULL", ownerHF, err)
+	}
+
+	// m1 exists BEFORE mia joins; #general gets a pre-join message too (the
+	// shared-channel contrast).
+	var ideas struct {
+		ThreadID      int64 `json:"thread_id"`
+		RootMessageID int64 `json:"root_message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, ledger.ChannelID),
+		boot.Token, map[string]any{"title": "ideas", "content": "before times"}, &ideas)
+	var genMsg struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
+		boot.Token, map[string]any{"content": "old news"}, &genMsg)
+
+	// Invite mia into the protected channel (plus the default #general).
+	var minv identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+		"role": 40, "channel_ids": []int64{ledger.ChannelID}}, &minv)
+	var mia identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": minv.Token, "email": "mia@prot.test", "password": "password123",
+		"full_name": "Mia New"}, &mia)
+	var miaHF, miaGenHF *time.Time
+	if err := pool.QueryRow(ctx, `
+		SELECT history_from FROM channel_member
+		WHERE channel_id = $1 AND user_id = $2`,
+		ledger.ChannelID, mia.UserID).Scan(&miaHF); err != nil || miaHF == nil {
+		t.Fatalf("mia ledger history_from = %v (%v), want stamped", miaHF, err)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT history_from FROM channel_member
+		WHERE channel_id = $1 AND user_id = $2`,
+		boot.ChannelID, mia.UserID).Scan(&miaGenHF); err != nil || miaGenHF != nil {
+		t.Fatalf("mia general history_from = %v (%v), want NULL (shared)", miaGenHF, err)
+	}
+
+	// m2 lands after the join.
+	var m2 struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, ideas.ThreadID),
+		boot.Token, map[string]any{"content": "after mia"}, &m2)
+
+	// mia sees only m2; the creator sees both; the thread summary itself is
+	// visible to mia (the boundary hides content, not the conversation).
+	var mpage struct {
+		Messages []struct {
+			ID int64 `json:"id"`
+		} `json:"messages"`
+	}
+	msgsURL := fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, ideas.ThreadID)
+	if code := getJSON(t, msgsURL, mia.Token, &mpage); code != http.StatusOK ||
+		len(mpage.Messages) != 1 || mpage.Messages[0].ID != m2.MessageID {
+		t.Fatalf("mia protected view = %d %+v, want only m2", code, mpage.Messages)
+	}
+	if code := getJSON(t, msgsURL, boot.Token, &mpage); code != http.StatusOK || len(mpage.Messages) != 2 {
+		t.Fatalf("creator protected view = %d (%d msgs), want 2", code, len(mpage.Messages))
+	}
+	var tpage struct {
+		Threads []struct {
+			ID int64 `json:"id"`
+		} `json:"threads"`
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, ledger.ChannelID),
+		mia.Token, &tpage); code != http.StatusOK || len(tpage.Threads) != 1 {
+		t.Fatalf("mia thread list = %d (%d), want the summary visible", code, len(tpage.Threads))
+	}
+	// Get honors the boundary — pre-join is an oracle-free 404, post-join a
+	// 200 — and the shared channel has no boundary at all.
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, ideas.RootMessageID),
+		mia.Token, nil); code != http.StatusNotFound {
+		t.Fatalf("mia Get pre-join = %d, want 404", code)
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, m2.MessageID),
+		mia.Token, nil); code != http.StatusOK {
+		t.Fatalf("mia Get post-join = %d, want 200", code)
+	}
+	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, genMsg.MessageID),
+		mia.Token, nil); code != http.StatusOK {
+		t.Fatalf("mia Get shared pre-join = %d, want 200", code)
+	}
+
+	// Leave: access closes, the stamp survives on the preserved row.
+	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/channels/%d/leave", ts.URL, ledger.ChannelID),
+		mia.Token, map[string]any{}); code != http.StatusOK {
+		t.Fatalf("mia leave = %d", code)
+	}
+	if code := getJSON(t, msgsURL, mia.Token, nil); code != http.StatusForbidden {
+		t.Fatalf("mia after leave = %d, want 403", code)
+	}
+	if err := pool.QueryRow(ctx, `
+		SELECT history_from FROM channel_member
+		WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NOT NULL`,
+		ledger.ChannelID, mia.UserID).Scan(&miaHF); err != nil || miaHF == nil {
+		t.Fatalf("history_from after leave = %v (%v), want preserved", miaHF, err)
+	}
+	// Reactivate with the exact JoinChannel rejoin shape (private channels
+	// gain a member-add endpoint in a later slice — recorded gap): the
+	// preserved row keeps its ORIGINAL boundary, so the view is unchanged.
+	if _, err := pool.Exec(ctx, `
+		UPDATE channel_member SET unsubscribed_at = NULL
+		WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NOT NULL`,
+		ledger.ChannelID, mia.UserID); err != nil {
+		t.Fatalf("reactivate: %v", err)
+	}
+	if code := getJSON(t, msgsURL, mia.Token, &mpage); code != http.StatusOK ||
+		len(mpage.Messages) != 1 || mpage.Messages[0].ID != m2.MessageID {
+		t.Fatalf("mia after rejoin = %d %+v, want only m2 still", code, mpage.Messages)
+	}
+}

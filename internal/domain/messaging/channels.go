@@ -37,8 +37,13 @@ type CreateChannelParams struct {
 	Description string
 	// Visibility is "public", "private", or "web_public" (world-readable,
 	// P-16); empty falls back to the legacy Private bool.
-	Visibility  string
-	Private     bool
+	Visibility string
+	Private    bool
+	// Protected bounds each member's history to their join time
+	// (history_mode 2, stamped as channel_member.history_from on invite
+	// accept). Valid only with private: public discovery and web-public
+	// world-readability both contradict a per-member history boundary.
+	Protected   bool
 	WorkspaceID int64 // 0 = the org's sole workspace (M1 orgs have one)
 }
 
@@ -71,6 +76,13 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 		visibility = visibilityWebPublic
 	default:
 		return CreateChannelResult{}, apperr.Invalid(`visibility must be "public", "private", or "web_public"`)
+	}
+	historyMode := int16(1)
+	if p.Protected {
+		if visibility != visibilityPrivate {
+			return CreateChannelResult{}, apperr.Invalid("protected history requires a private channel")
+		}
+		historyMode = 2
 	}
 	var out CreateChannelResult
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -135,9 +147,10 @@ func (s *Service) CreateChannel(ctx context.Context, actor auth.Identity, p Crea
 
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO channel (org_id, workspace_id, name, visibility,
-				description, creator_id)
-			VALUES ($1, $2, $3, $4, $5, $6) RETURNING id`,
-			actor.OrgID, wsID, name, visibility, strings.TrimSpace(p.Description),
+				history_mode, description, creator_id)
+			VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING id`,
+			actor.OrgID, wsID, name, visibility, historyMode,
+			strings.TrimSpace(p.Description),
 			actor.UserID).Scan(&out.ChannelID); err != nil {
 			return apperr.Internal("create channel", err)
 		}
