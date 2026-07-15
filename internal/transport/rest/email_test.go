@@ -20,6 +20,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/internal/platform/mail"
 )
 
 // captureSender records instead of sending — the test double behind the
@@ -29,12 +30,18 @@ type captureSender struct {
 	sent []capturedMail
 }
 
-type capturedMail struct{ to, subject, body string }
+type capturedMail struct {
+	to, subject, text, html, listUnsub string
+	listUnsubPost                      bool
+}
 
-func (c *captureSender) Send(to, subject, body string) error {
+func (c *captureSender) Send(m mail.Message) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.sent = append(c.sent, capturedMail{to, subject, body})
+	c.sent = append(c.sent, capturedMail{
+		to: m.To, subject: m.Subject, text: m.Text, html: m.HTML,
+		listUnsub: m.ListUnsubscribe, listUnsubPost: m.ListUnsubscribePost,
+	})
 	return nil
 }
 
@@ -138,10 +145,10 @@ func TestNotificationEmails(t *testing.T) {
 	mails := capture.take()
 	if len(mails) != 1 || mails[0].to != "bob@eml.test" ||
 		!strings.Contains(mails[0].subject, "1 unread") ||
-		!strings.Contains(mails[0].body, "Alice Chen sent you a direct message") {
+		!strings.Contains(mails[0].text, "Alice Chen sent you a direct message") {
 		t.Fatalf("dm email = %+v", mails)
 	}
-	if strings.Contains(mails[0].body, "the secret plan") {
+	if strings.Contains(mails[0].text, "the secret plan") {
 		t.Fatal("email must not carry message content")
 	}
 	// At most once: the watermark blocks a re-send.
@@ -198,8 +205,8 @@ func TestNotificationEmails(t *testing.T) {
 	// picked up now that the pref is back on (prefs read at sweep time).
 	mails = capture.take()
 	if len(mails) != 1 || !strings.Contains(mails[0].subject, "3 unread") ||
-		!strings.Contains(mails[0].body, "sent you a direct message") ||
-		!strings.Contains(mails[0].body, "mentioned you in #general") {
+		!strings.Contains(mails[0].text, "sent you a direct message") ||
+		!strings.Contains(mails[0].text, "mentioned you in #general") {
 		t.Fatalf("digest = %+v", mails)
 	}
 
@@ -280,7 +287,7 @@ func TestEmailKeywordDefault(t *testing.T) {
 	mails := capture.take()
 	if len(mails) != 1 || mails[0].to != "bob@kwd.test" ||
 		!strings.Contains(mails[0].subject, "1 unread") ||
-		!strings.Contains(mails[0].body, "used one of your alert words in #general") {
+		!strings.Contains(mails[0].text, "used one of your alert words in #general") {
 		t.Fatalf("keyword email = %+v", mails)
 	}
 }

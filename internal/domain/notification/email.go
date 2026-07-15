@@ -167,7 +167,9 @@ func (w *EmailWorker) deliver(pending []pendingEmail) int {
 			brand.Name, len(batch), plural(len(batch)))
 		body := strings.Join(lines, "\n") +
 			fmt.Sprintf("\n\nOpen %s to read and reply.\n", brand.Name)
-		if err := w.sender.Send(batch[0].email, subject, body); err != nil {
+		if err := w.sender.Send(mail.Message{
+			To: batch[0].email, Subject: subject, Text: body,
+		}); err != nil {
 			w.log.Warn("email: send failed", "user", uid, "err", err)
 			continue
 		}
