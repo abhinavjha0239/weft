@@ -367,6 +367,290 @@ allowed (cap 50 rows as today).
 search; unknown-operator-as-term; guest search stays inside their
 channels (existing membership join must already ensure — assert it).
 
+### P-20 `notification: HTML digest emails + one-click unsubscribe.` — M — **[ ] queued**
+Zero migrations. Read `prefs.go`, `email.go`, `platform/mail/mail.go`,
+and `files/signed.go` (the MAC + self-auth precedents) first.
+**Design (decided):**
+- Commit 1 (standalone bug fix): the email worker's zero-rows default
+  (`n.kind IN (1, 2)` in `email.go` RunOnce) disagrees with
+  `defaultEmailEnabled` (dm/mention/KEYWORD) — the prefs API shows
+  keyword email ON by default but the worker never sends it. Fix the
+  SQL to `(1, 2, 4)`. Test: a keyword notification with zero pref rows
+  gets emailed (red/green: revert the SQL → the test fails).
+- Commit 2 (seam refactor, no behavior change): `mail.Sender` becomes
+  `Send(m Message) error` with `Message{To, Subject, Text, HTML,
+  ListUnsubscribe string, ListUnsubscribePost bool}`. smtp driver:
+  multipart/alternative when HTML != "" (the text/plain part ALWAYS
+  present, listed first), `List-Unsubscribe: <url>` +
+  `List-Unsubscribe-Post: List-Unsubscribe=One-Click` (RFC 8058) when
+  set, crypto-random boundary, existing sanitizeHeader on every header
+  value. log driver logs to/subject/text_bytes/html_bytes. Update the
+  single caller (`email.go`) mechanically.
+- Commit 3 (feature):
+  - `config.BaseURL` (`WEFT_BASE_URL`, default `http://localhost:8080`,
+    trailing `/` trimmed). weftd threads BaseURL + cfg.SigningSecret
+    into the EmailWorker (the files.SetSigningSecret pattern).
+  - Unsubscribe MAC: `hex(HMAC-SHA256(secret, "unsub|<org_id>|<user_id>"))`
+    — the literal `unsub|` prefix domain-separates it from the files
+    MAC (which starts with a digit). NO expiry: unsubscribe links must
+    not rot; secret rotation invalidating them is documented operator
+    behavior.
+  - Link: `{base}/api/v1/unsubscribe?o=<org>&u=<user>&sig=<mac>`.
+  - Digests gain an HTML alternative (html/template const in a new
+    `template.go`: brand.Name header, `<ul>` of the existing line()
+    strings — auto-escaped, unsubscribe footer link) and a text footer
+    `Unsubscribe: <url>`. HTML always ships; the unsubscribe link +
+    List headers appear ONLY when the secret is configured (degrade
+    gracefully, never emit a broken link).
+  - Endpoints registered OUTSIDE withAuth (the handleDownloadFile
+    self-auth precedent); they never consult Authorization:
+    - `GET /api/v1/unsubscribe` → secret unset: 404. o/u must be > 0
+      and the sig must verify (hmac.Equal) → else 401. Returns a
+      minimal inline-HTML page whose ONLY action is a
+      `<form method="post">` button. MUST NOT change state — mail
+      clients prefetch GET links.
+    - `POST /api/v1/unsubscribe` (same params; body ignored) → same
+      verification; the user must exist in org o (deactivated users
+      MAY still unsubscribe) else 404 → upsert
+      `notification_medium_pref (user, kind, 2=email, enabled=false)`
+      for EVERY kind in `prefKinds` (one statement via unnest) → 200
+      `{"unsubscribed": true}`. Idempotent.
+  - Domain logic lives in notification (`Unsubscribe(ctx, orgID,
+    userID)` + MAC mint/verify helpers); the handler stays thin.
+  - `prefKinds` is the single registry the flip iterates. P-25 appends
+    kind 6 to the same slice — a trivial adjacent-line merge is
+    expected at serial-merge time.
+**Edge cases:** forged/truncated sig → 401 via constant-time compare;
+unknown user under a valid-looking sig → 404; repeated POST stays 200;
+GET never flips (assert it); no Authorization header required or read.
+**Performance:** one MAC per user per digest; the flip is one unnest
+upsert bounded by len(prefKinds).
+**Tests (TestUnsubscribe + email-worker extensions):** commit-1 keyword
+default; capture a real digest via a recording Sender → link parses;
+GET returns the form page AND prefs stay unchanged; POST flips every
+kind (ListMediumPrefs all-false) and a due DM notification is NOT
+emailed afterward; second POST idempotent; forged sig (correct-length
+hex over the right o/u minted with the WRONG secret — the forgedURL
+precedent) → 401, proven load-bearing (neuter hmac.Equal → it returns
+200: show red); one-nibble-flipped sig → 401; secret unset → 404 both
+verbs; smtp Message assembly unit test (both MIME parts, headers only
+when set, injection-safe headers).
+**Gaps to record:** per-kind unsubscribe page (v1 is all-or-nothing);
+resubscribe = the existing prefs API; HTML polish is client-era work.
+
+### P-25 `automation: Failure notifications to scope admins.` — M — **[ ] queued**
+Read `perms.go` (Require + chain), `automation/runner.go`
+(execute/finishRun), `notification/runner.go` insert (payload + ping
+pattern), and the 0010 dedupe index first.
+**Design (decided):**
+- Commit 1 (perms prep): exported `HoldersAt(ctx, tx, orgID, verb,
+  chain) ([]int64, error)` — resolve the WINNING assignment exactly as
+  Require does (chain VALUES join, `ORDER BY pa.scope_type DESC LIMIT
+  1`), then expand it:
+  `SELECT c.user_id FROM user_group_closure c JOIN user_account u ON
+  u.id = c.user_id AND u.deactivated_at IS NULL AND u.kind = 1 WHERE
+  c.group_id = $win ORDER BY c.user_id`. No assignment in the chain →
+  (nil, nil). Unit tests in perms_test: org default (manage_org →
+  role:admins) returns admins ∪ owners (closure nesting); a
+  channel-scope assignment beats the org one; deactivated accounts and
+  agents (kind 2) excluded.
+- Commit 2 (feature):
+  - enum: `EntityAutomationRun EntityType = 18` (append-only).
+  - notification: `KindAutomationFailure = 6`; append to `prefKinds`;
+    update SetMediumPref's kind-list error message; `defaultEmailEnabled`
+    UNCHANGED (kind 6 email default OFF — in-app only; admins opt in
+    via the existing prefs PUT). email.go line(): kind 6 → "- An
+    automation run failed".
+  - notification: extract the dndSuppressed SQL into a shared
+    package-level helper (mechanical move, Runner + Service both call
+    it). `RecordAutomationFailure(ctx, tx, orgID, runID int64,
+    recipients []int64) ([]int64, error)`: one
+    `INSERT … SELECT unnest($3::bigint[]) … ON CONFLICT (user_id, kind,
+    entity_type, entity_id) DO NOTHING RETURNING user_id` with kind 6 /
+    entity (18, runID); returns the users actually inserted.
+    `PingNotification(ctx, orgID, userID, kind, entityType, entityID)`:
+    DND-gated (actor 0 → no VIP pierce), payload EXACTLY the
+    materializer shape `{kind, entity_type, entity_id, actor_id}`
+    (thread_id omitted).
+  - runner: `NewRunner(pool, msg, perms, notif, log)` — update weftd +
+    tests. In execute(), when the final status ∈ {4 partial-error,
+    5 failed}: throttle probe in the SAME tx —
+    `SELECT status IN (4,5) AND finished_at > now() - interval '1 hour'
+    FROM automation_run WHERE automation_id=$1 AND id <> $2 AND
+    status <> 1 ORDER BY id DESC LIMIT 1`
+    (rides automation_run_list_idx; semantics: alert on ENTRY into the
+    failing state, at most hourly while continuously failing, any
+    success re-arms). Not throttled → recipients: scope org →
+    HoldersAt(manage_org, OrgScope); scope channel →
+    HoldersAt(administer_channel, ChannelScope(...)) — only scopes 1/3
+    exist (requireScopeAdmin precedent). RecordAutomationFailure in the
+    finishRun tx; ping the RETURNED ids after WithTx commits.
+  - Rationale (recorded): recipients mirror the WRITE gate
+    (requireScopeAdmin) — whoever can edit the rule hears it broke. No
+    fan-out cap needed: hourly throttle per rule + kind-6 email
+    defaults OFF.
+**Edge cases:** zero holders → no rows, the run still finalizes;
+no creator special-case; re-execution of the same (automation, event)
+cannot double-insert (run idempotency + dedupe key); statuses 3/6/7/8
+never notify.
+**Performance:** failure path only — one indexed probe + one holders
+resolve + one batch insert; zero cost on the success path.
+**Tests (TestAutomationFailureNotifies):** failing rule → every org
+admin AND the owner get exactly one kind-6 row (entity 18, run id);
+member/guest get none (red/green: resolve recipients without the
+closure/verb path → this fails); immediate second failure → zero new
+rows; backdate finished_at >1h via SQL → notifies again; a success
+between failures re-arms; channel-scoped rule with a channel-specific
+administer_channel assignment notifies THAT group, not org admins;
+ping captured for an active admin, suppressed for a snoozed one
+(capturing fanout); prefs PUT accepts kind 6; the email worker skips
+kind 6 by default and sends it after opt-in.
+**Gaps to record:** failure detail lives in ListRuns (the notification
+is the doorbell); per-rule mute knob later; workspace/space scopes when
+their admin verbs land.
+
+### P-29 `identity: Profile edit, password change, session management.` — M — **[ ] queued**
+Zero migrations (`auth_session` already has ip/user_agent/revoked_at;
+FromToken already enforces revocation). Read `auth/auth.go`,
+`identity/identity.go` (Bootstrap validation + Me), and
+`middleware.go` clientIP first.
+**Design (decided):**
+- Commit 1 (metadata prep, no new endpoints): `CreateSession(ctx, q,
+  userID, ip, userAgent)` and `Login(..., ip, ua)`; REST
+  login/bootstrap/invite-accept handlers pass `clientIP(r)` and
+  `r.UserAgent()` capped at 256 bytes, sanitized to a single line.
+  Sweep ALL callers (`git grep CreateSession`). Empty values allowed.
+- Commit 2 (sessions): auth exports `TokenHash` (today's hashToken).
+  identity gains:
+  - `Sessions(ctx, actor, currentHash)`: live rows (revoked_at IS NULL
+    AND expires_at > now()) for the actor, newest first;
+    `current` = token_hash match; pre-slice rows return "" ip/ua.
+  - `RevokeSession(ctx, actor, sessionID)`: `UPDATE auth_session SET
+    revoked_at = now() WHERE id=$1 AND user_id=$2 AND revoked_at IS
+    NULL`; 0 rows → NotFound("session not found") — foreign, absent,
+    and already-revoked are indistinguishable (oracle-free). Revoking
+    the CURRENT session is allowed (that is logout).
+  - `RevokeOtherSessions(ctx, actor, currentHash) (int64, error)`.
+  - REST: `GET /api/v1/me/sessions` ·
+    `DELETE /api/v1/me/sessions/{id}` (204) ·
+    `DELETE /api/v1/me/sessions` → `{"revoked": n}`. Handlers derive
+    currentHash from the presented bearer token.
+  - KNOWN GAP (PR body + REALITY.md): an open websocket authed by a
+    now-revoked session lives until reconnect (gateway auths at
+    connect); REST is immediate. Live kick = a queued slice.
+- Commit 3 (profile + password):
+  - `UpdateMe(ctx, actor, fullName)`: trim; mirror Bootstrap's
+    full_name validation EXACTLY (read it; extract a helper only if
+    trivial); reject control chars (status.go precedent). Org-scoped
+    UPDATE. NOT event-logged (avatar/status precedent — comment it;
+    clients see it on the next profile fetch).
+    `PATCH /api/v1/me` {full_name} → updated MyProfile.
+  - `auth.ChangePassword(ctx, pool, userID, current, new)`: verify
+    current against user_credential (a missing credential row → the
+    same Forbidden); wrong → apperr.Forbidden("current password is
+    incorrect") (the token IS valid — 401 would be wrong). New
+    password: mirror Bootstrap's rule + reject > 72 BYTES (bcrypt
+    truncates silently; if Bootstrap lacks the 72 check, enforce here
+    only and note it). Same tx: update hash + updated_at AND revoke
+    all OTHER live sessions. `POST /api/v1/me/password`
+    {current_password, new_password} → `{"revoked_sessions": n}`.
+**Edge cases:** guests manage their own account normally; no agent
+special-case; expired sessions absent from the list and 404 on revoke;
+concurrent password changes → the loser's `current` fails.
+**Performance:** single-row indexed ops on auth_session_user_idx.
+**Tests (TestSessions / TestProfileEdit / TestChangePassword):** two
+logins with distinct UA → list=2, correct `current`, ip/ua recorded;
+revoke other → that token 401s immediately, current fine;
+revoke-all-others with 3 live → {revoked:2}; FOREIGN session id → 404
+and the victim's token stays valid (red/green: drop user_id from the
+UPDATE's WHERE → this test catches cross-user revocation — the
+load-bearing assertion); revoking the current session 401s your next
+request (logout); PATCH name reflected in Me + Profiles; empty/too
+long/control-char names 400; wrong current password → 403 and the old
+password still logs in; correct change → old password fails at login,
+the OTHER session's token 401s, the current token survives, the new
+password logs in.
+**Gaps to record:** password reset via email (P-35, needs P-20);
+websocket kick on revoke; session labels/geo.
+
+### P-31 `compliance: Audit read API.` — M — **[ ] queued**
+Read `compliance/compliance.go` (gating pattern), `0001_event_log.sql`
+(columns + the (org_id, id) index), and the search add() builder
+precedent first.
+**Design (decided):**
+- `GET /api/v1/audit/events` — org-scope `compliance_officer` ONLY
+  (`perms.Require(VerbComplianceOfficer, OrgScope)` inside the tx, the
+  compliance.go pattern). F-9 invariant: owners/admins WITHOUT the
+  explicit grant get 403.
+- Filters (optional, AND-composed): `entity_type` (>0), `verb` (exact
+  string; >64 chars → 400), `actor_id` (>0), `entity_id` (>0),
+  `since`/`until` (RFC3339, on occurred_at; malformed → 400), `cursor`
+  (id < cursor), `limit` (1..200, default 50, clamp not error).
+  Dynamic WHERE via the parameterized add()-placeholder pattern —
+  never interpolated values.
+- Query: SELECT id, occurred_at, recorded_at, actor_kind, actor_id,
+  entity_type, entity_id, verb, workspace_id, payload, origin FROM
+  event_log WHERE org_id=$1 [...] ORDER BY id DESC LIMIT $n. Newest
+  first; `next_cursor` = last id on a FULL page, else 0. `hint` is
+  deliberately excluded (delivery routing noise, not audit data).
+  Payload returns verbatim — F-4 guarantees structural deltas +
+  revision references, never the only copy of content.
+- Response: `{"events": [...], "next_cursor": N}` with RFC3339
+  timestamps; payload/origin as raw JSON.
+- No new index (decided): pages ride (org_id, id DESC); filters are
+  scan predicates. Officer-gated cold path with LIMIT-bounded pages;
+  sparse filters over a huge org can scan long — RECORD in the PR
+  scale review; a covering (org_id, verb, id) index is the queued
+  mitigation. No txid gate — this is a historical read, not a
+  consumer; a late-committing row may appear on a later page (comment
+  this at the query).
+**Edge cases:** empty result → `events: []`, next_cursor 0; unknown
+verb string → empty 200 (NO verb-registry validation — audits may
+query removed verbs); partitioning is invisible to the query.
+**Performance:** one indexed DESC scan per page; JSONB payload size
+dominates — the 200 cap keeps pages sane.
+**Tests (TestAuditReadAPI):** owner WITHOUT the grant → 403 (red/green:
+drop Require → 200 — THE load-bearing test); with the grant (reuse
+compliance_test's grant helper) → newest-first real events; verb /
+entity_type / actor_id filters narrow exactly; since/until (place rows
+via SQL UPDATE of occurred_at); cursor walk over >1 page — no overlap,
+no gap vs one big query; limit clamps (0→50, 500→200); malformed since
+→ 400; two orgs → each officer sees only their org.
+**Gaps to record:** export lane pairs with P-32; per-entity
+convenience route later; workspace-scoped officer reads when workspace
+admin verbs land.
+
+### P-33 `messaging: Oracle-free 404 for DM non-participants.` — S — **[ ] queued**
+Resolves the 403/404 inconsistency recorded at P-08/#66: DM thread
+read/send/mark-read return 403 to non-participants
+(requireParticipant → Forbidden) while single-message Get is an
+oracle-free 404.
+**Design (decided):**
+- `threads.go` requireParticipant: `apperr.Forbidden("not a participant
+  of this conversation")` → `apperr.NotFound("conversation not
+  found")`, with a contract comment: participation IS visibility — a
+  non-participant cannot distinguish absent from denied (matches
+  messaging.Get).
+- That one change covers all three call sites (ListMessages, the
+  InsertThreadMessage path, readstate). Sweep
+  `git grep requireParticipant` to confirm nothing maps the Forbidden
+  type specially.
+- Update every test pinning 403 on DM paths — dm_leave_test.go asserts
+  it explicitly (assertions AND comments) — via a
+  `git grep -nE "403|Forbidden"` sweep over messaging/dm tests.
+- Explicit NON-goal (decided): requireChannelMember STAYS 403. Channel
+  existence semantics differ (public channels are listable; the
+  private-channel question is P-34 NEEDS-DESIGN). Touch no channel
+  gate.
+**Edge cases:** gateway DM routing filters by participation (no error
+path — unaffected); search ACL is a filter (unaffected); dm.Open/Leave
+are already oracle-free (unaffected).
+**Tests:** non-participant AND a departed leaver get 404 with body
+"conversation not found" on thread read + send + mark-read (assert the
+body does NOT echo the dm_space_id); participant flows unchanged;
+single-message Get still 404 (regression pin).
+**Gaps to record:** P-34 channel existence masking (NEEDS-DESIGN).
+
 ---
 
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
@@ -402,9 +686,7 @@ record the scope and the known design questions so nothing is lost.)
   thumbnail storage keys, srcset shape.
 - **P-19 `files: Upload scan hook + org quotas.`** S — F-7 hook
   interface + per-org byte quota enforcement on Upload/StoreDocument.
-- **P-20 `notification: Email templates + unsubscribe.`** S — HTML
-  wrapper + per-user unsubscribe token endpoint flipping all email
-  prefs off. OPEN: none really — near Tier-1.
+- **P-20** — **promoted to Tier 1** (full spec above).
 - **P-21 `notification: Push medium.`** L — NEEDS-DESIGN: web-push
   (VAPID) vs FCM seam; device registration table (needs migration).
 - **P-22 `automation: Conditions and templating.`** M — field-compare
@@ -416,24 +698,29 @@ record the scope and the known design questions so nothing is lost.)
 - **P-24 `automation: Outbound HTTP steps + delivery health.`** L —
   NEEDS-DESIGN: SSRF guard (shares P-15's egress design), retry/backoff,
   alert-before-auto-disable (AU-4).
-- **P-25 `automation: Maintainer failure notifications.`** S — failed
-  runs DM the rule's scope admins via the notification pipeline (kind:
-  item-event class). Near Tier-1.
+- **P-25** — **promoted to Tier 1** (full spec above).
 - **P-26 `automation: LLM steps + budgets + approval gates.`** XL —
   NEEDS-DESIGN: model gateway seam, budget metering, run status 8 flow.
 - **P-27 `importer: Slack.`** XL — export parsing + slack_incoming
   compat endpoint. Ground in Slack export format docs before speccing.
 - **P-28 `importer: Jira.`** XL — deliberately last (M3 exit).
-- **P-29 `identity: Profile edit + session revocation + password
-  reset.`** M — near Tier-1; OPEN: reset-token flow without email
-  templates (depends P-20).
+- **P-29** — **promoted to Tier 1** (full spec above; password RESET
+  split out as P-35 — it depends on P-20's mail plumbing).
 - **P-30 `identity: OIDC login.`** L — NEEDS-DESIGN: library choice,
   account linking rules, JIT provisioning vs invite-only.
-- **P-31 `admin: Audit read API.`** M — filtered event-log reads for
-  compliance_officer (AD-2). Near Tier-1: spec the filter params.
+- **P-31** — **promoted to Tier 1** (full spec above).
 - **P-32 `compliance: Export byte-bundles (eDiscovery format).`** M —
   attachments IN the archive; depends on export pins (#45) — spec the
   bundle layout.
+- **P-34 `channels: Private-channel existence masking.`** S —
+  NEEDS-DESIGN: requireChannelMember returns 403 today; decide whether
+  private channels 404 like DMs (survey Zulip/Slack semantics, client
+  impact, and the listable-public asymmetry) before any executor
+  touches it. Split off from P-33.
+- **P-35 `identity: Password reset via email.`** S — depends on P-20's
+  mail plumbing (Message seam + BaseURL). OPEN: token storage
+  (single-use DB row vs stateless MAC — leaning DB row for single-use
+  + revoke-on-change), rate limits. Spec after P-20 merges.
 
 ## Deliberately NOT in this queue (backend-first directive)
 The real web client, mobile apps, calls/LiveKit, the automation builder
