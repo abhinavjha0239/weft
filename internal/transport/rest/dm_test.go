@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -119,17 +120,21 @@ func TestDirectMessages(t *testing.T) {
 	if resp.StatusCode != http.StatusNotFound {
 		t.Fatalf("charlie message fetch = %d, want 404", resp.StatusCode)
 	}
-	req, _ = http.NewRequestWithContext(ctx, "GET",
-		fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, opened.RootThreadID), nil)
-	req.Header.Set("Authorization", "Bearer "+charlieTok)
-	resp, _ = http.DefaultClient.Do(req)
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusForbidden {
-		t.Fatalf("charlie thread list = %d, want 403", resp.StatusCode)
-	}
-	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, opened.RootThreadID),
-		charlieTok, map[string]any{"content": "let me in"}); code != http.StatusForbidden {
-		t.Fatalf("charlie send into DM = %d, want 403", code)
+	// Non-participant on the DM *thread*: read, send, and mark-read are all
+	// oracle-free 404s (requireParticipant → NotFound, matching the
+	// single-message Get above), and the body never leaks the dm_space_id.
+	for _, tc := range []struct{ name, method, url, body string }{
+		{"thread read", "GET", fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, opened.RootThreadID), ""},
+		{"send", "POST", fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, opened.RootThreadID), `{"content":"let me in"}`},
+		{"mark-read", "POST", fmt.Sprintf("%s/api/v1/threads/%d/read", ts.URL, opened.RootThreadID), `{"up_to":1}`},
+	} {
+		code, body := dmReq(t, tc.method, tc.url, charlieTok, tc.body)
+		if code != http.StatusNotFound {
+			t.Fatalf("charlie %s = %d, want 404", tc.name, code)
+		}
+		if !strings.Contains(body, "conversation not found") || strings.Contains(body, fmt.Sprint(opened.ID)) {
+			t.Fatalf("charlie %s body = %q, want oracle-free 404 (no dm id)", tc.name, body)
+		}
 	}
 	if got := searchIDs(t, ts.URL, charlieTok, "psst"); len(got) != 0 {
 		t.Fatalf("charlie found DM content in search: %d hits", len(got))

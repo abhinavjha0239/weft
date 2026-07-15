@@ -3,6 +3,7 @@ package rest
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -28,13 +29,11 @@ import (
 // no predicate edits. It also proves rejoin via the create-or-get ensure-actor
 // path (dm_key is preserved, so the leaver lands back on the full history).
 //
-// Note on status codes: a non-participant reading/sending on a DM *thread*
-// endpoint gets 403 (messaging.requireParticipant → Forbidden), while a
-// single-message Get is oracle-free 404 (the ACL folded into its WHERE). This
-// is a pre-existing codebase inconsistency P-08 deliberately does not touch;
-// normalizing the DM-thread ACL to 404 is a separate messaging-ACL slice (it
-// edits a shared gate and would rewrite TestDirectMessages). Both statuses
-// mean the leaver is fully cut off. dm.Leave itself is oracle-free 404.
+// Note on status codes: reading/sending/marking-read a DM *thread* as a
+// non-participant is an oracle-free 404 (messaging.requireParticipant →
+// NotFound), matching the single-message Get — participation IS visibility, so
+// a leaver cannot tell an absent conversation from a denied one (P-33
+// normalized this; it was a 403 through P-08). dm.Leave itself is 404 too.
 func TestGroupDMLeave(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -141,13 +140,22 @@ func TestGroupDMLeave(t *testing.T) {
 	if listsDM(t, ts.URL, bobTok, group.ID) {
 		t.Fatalf("bob's /dms still lists the group after leaving")
 	}
-	// 2. Reading the thread → 403; sending → 403 (requireParticipant gate).
-	if code := getJSON(t, threadURL(ts.URL, root), bobTok, nil); code != http.StatusForbidden {
-		t.Fatalf("bob read thread after leaving = %d, want 403", code)
-	}
-	if code := postJSONStatus(t, threadURL(ts.URL, root), bobTok,
-		map[string]any{"content": "let me back in"}); code != http.StatusForbidden {
-		t.Fatalf("bob send after leaving = %d, want 403", code)
+	// 2. Reading, sending, AND marking-read the thread are all oracle-free
+	//    404s now (requireParticipant → NotFound): the leaver cannot tell the
+	//    conversation apart from one that never existed, and the body never
+	//    echoes the dm_space_id.
+	for _, tc := range []struct{ name, method, url, body string }{
+		{"read", "GET", threadURL(ts.URL, root), ""},
+		{"send", "POST", threadURL(ts.URL, root), `{"content":"let me back in"}`},
+		{"mark-read", "POST", fmt.Sprintf("%s/api/v1/threads/%d/read", ts.URL, root), `{"up_to":1}`},
+	} {
+		code, body := dmReq(t, tc.method, tc.url, bobTok, tc.body)
+		if code != http.StatusNotFound {
+			t.Fatalf("bob %s after leaving = %d, want 404", tc.name, code)
+		}
+		if !strings.Contains(body, "conversation not found") || strings.Contains(body, fmt.Sprint(group.ID)) {
+			t.Fatalf("bob %s body = %q, want oracle-free 'conversation not found' (no dm id)", tc.name, body)
+		}
 	}
 	// 3. The single message he could read a moment ago → oracle-free 404.
 	if code := getJSON(t, msgURL(ts.URL, msg1), bobTok, nil); code != http.StatusNotFound {
@@ -266,6 +274,29 @@ func leaveURL(base string, dmSpaceID int64) string {
 
 func threadURL(base string, threadID int64) string {
 	return fmt.Sprintf("%s/api/v1/threads/%d/messages", base, threadID)
+}
+
+// dmReq issues an authed request WITHOUT decoding and returns the status plus
+// the raw body — used to assert an oracle-free 404 whose body must carry the
+// generic "conversation not found" and never echo the dm_space_id.
+func dmReq(t *testing.T, method, url, token, jsonBody string) (int, string) {
+	t.Helper()
+	var body io.Reader
+	if jsonBody != "" {
+		body = strings.NewReader(jsonBody)
+	}
+	req, _ := http.NewRequest(method, url, body)
+	req.Header.Set("Authorization", "Bearer "+token)
+	if jsonBody != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, url, err)
+	}
+	defer resp.Body.Close()
+	b, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, string(b)
 }
 
 func msgURL(base string, msgID int64) string {
