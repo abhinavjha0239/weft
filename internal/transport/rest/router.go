@@ -209,6 +209,16 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/views/{id}", a.withAuth(a.handleGetView))
 	mux.HandleFunc("PATCH /api/v1/views/{id}", a.withAuth(a.handleUpdateView))
 	mux.HandleFunc("DELETE /api/v1/views/{id}", a.withAuth(a.handleDeleteView))
+	// P-13 custom fields + item links: field defs per space, values on items,
+	// typed relationships keyed by internal id (survive moves). All gate on
+	// org-scoped edit_items.
+	mux.HandleFunc("POST /api/v1/spaces/{id}/field-defs", a.withAuth(a.handleCreateFieldDef))
+	mux.HandleFunc("GET /api/v1/spaces/{id}/field-defs", a.withAuth(a.handleListFieldDefs))
+	mux.HandleFunc("PATCH /api/v1/field-defs/{id}", a.withAuth(a.handleUpdateFieldDef))
+	mux.HandleFunc("DELETE /api/v1/field-defs/{id}", a.withAuth(a.handleDeleteFieldDef))
+	mux.HandleFunc("POST /api/v1/items/{id}/links", a.withAuth(a.handleCreateLink))
+	mux.HandleFunc("GET /api/v1/items/{id}/links", a.withAuth(a.handleListLinks))
+	mux.HandleFunc("DELETE /api/v1/items/{id}/links/{link_id}", a.withAuth(a.handleDeleteLink))
 	mux.HandleFunc("PUT /api/v1/admin/verbs", a.withAuth(a.handleAssignVerb))
 	mux.HandleFunc("PUT /api/v1/admin/retention-policies", a.withAuth(a.handleSetRetentionPolicy))
 	mux.HandleFunc("GET /api/v1/admin/retention-policies", a.withAuth(a.handleListRetentionPolicies))

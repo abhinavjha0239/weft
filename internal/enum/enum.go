@@ -38,6 +38,7 @@ const (
 	EntityChannelFolder EntityType = 17
 	EntityAutomationRun EntityType = 18
 	EntitySprint        EntityType = 19
+	EntityFieldDef      EntityType = 20
 )
 
 // UserKind is user_account.kind (CC-5: agent covers all non-human principals).
