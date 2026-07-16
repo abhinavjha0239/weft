@@ -1223,7 +1223,7 @@ path).
 
 ---
 
-### P-11 `worktrack: Sprints.` — M — **[ ] SPEC-READY (Opus dispatch; branch `feat/worktrack-sprints`)**
+### P-11 `worktrack: Sprints.` — M — **[x] shipped #92** (Opus-executed; carry-over guard red/green-proven)
 ZERO migrations: the `sprint` table (state 1 future · 2 active · 3
 closed, `starts_at/ends_at/completed_at`, `sprint_space_idx`) and
 `work_item.sprint_id` (FK + partial index) have existed since 0005 with
@@ -1286,7 +1286,7 @@ close; workitem.sprint_changed as a first-class automation trigger.
 
 ---
 
-### P-12 `worktrack: Board ordering (LexoRank) and saved views.` — M — **[ ] SPEC-READY (Opus dispatch; branch `feat/worktrack-board-order`)**
+### P-12 `worktrack: Board ordering (LexoRank) and saved views.` — M — **[x] shipped #93** (Opus-executed; rank-collision red/green-proven)
 ZERO migrations: `work_item.rank TEXT COLLATE "C"` +
 `rank_context_id` + `work_item_rank_idx` and the whole `view_def`
 table (layout 1 list · 2 kanban · 3 timeline · 4 saved-search, query
@@ -1347,7 +1347,7 @@ server support beyond storage.
 
 ---
 
-### P-13 `worktrack: Custom fields and item links.` — L — **[ ] SPEC-READY (Opus dispatch; branch `feat/worktrack-fields-links`)**
+### P-13 `worktrack: Custom fields and item links.` — L — **[x] shipped #94** (Opus-executed; field-type-check red/green-proven)
 ZERO migrations: `field_def` (typed taxonomy, `applies_to` item-type
 ids, `required`, `options` JSONB, `UNIQUE(space_id,key)`),
 `work_item.fields` JSONB (GIN-indexed values), and `link_type` +
