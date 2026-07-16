@@ -510,7 +510,7 @@ func (s *Service) ListItems(ctx context.Context, actor auth.Identity, spaceID in
 		JOIN item_type it ON it.id = w.type_id
 		JOIN status st ON st.id = w.status_id
 		WHERE w.space_id = $1 AND w.org_id = $2 AND w.trashed_at IS NULL
-		ORDER BY w.rank COLLATE "C"`, spaceID, actor.OrgID)
+		ORDER BY w.rank NULLS LAST, w.id`, spaceID, actor.OrgID)
 	if err != nil {
 		return nil, apperr.Internal("list items", err)
 	}
