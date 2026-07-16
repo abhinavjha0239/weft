@@ -12,6 +12,7 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
@@ -41,6 +42,7 @@ func TestDrafts(t *testing.T) {
 		Pool: pool, Hub: hub, Log: slog.Default(),
 		Identity:  identity.New(pool, permsSvc),
 		Messaging: messaging.New(pool, permsSvc),
+		DM:        dm.New(pool),
 	}))
 	defer ts.Close()
 
@@ -108,5 +110,75 @@ func TestDrafts(t *testing.T) {
 	}
 	if code := deleteReq(t, fmt.Sprintf("%s/api/v1/drafts/%d", ts.URL, d2.ID), boot.Token); code != http.StatusNotFound {
 		t.Fatalf("re-delete = %d, want 404", code)
+	}
+
+	// Existence masking: a container hint the actor cannot see is an
+	// oracle-free 404, byte-identical to a nonexistent id — a draft POST must
+	// never confirm a private channel / foreign DM / hidden thread exists.
+	// RED/GREEN: revert checkDraftTargets to the bare org-pinned existence
+	// check and the private-channel draft below becomes a 201, flipping the
+	// "want 404" (and the byte-identity) asserts red — the success-vs-404
+	// oracle this fix closes.
+	var vault struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "vault", "visibility": "private"}, &vault)
+	if vault.ChannelID == 0 {
+		t.Fatal("private channel create failed")
+	}
+	// Alice makes a thread in the private channel; Carol gets a DM with Alice.
+	var vt struct {
+		ThreadID int64 `json:"thread_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels/"+fmt.Sprint(vault.ChannelID)+"/threads",
+		boot.Token, map[string]any{"title": "secret", "content": "shh"}, &vt)
+	_ = addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"carol@drf.test", "Carol Vega", "caroldrftok")
+	var carolID int64
+	if err := pool.QueryRow(ctx, `SELECT id FROM user_account WHERE email = 'carol@drf.test'`).Scan(&carolID); err != nil {
+		t.Fatalf("carol id: %v", err)
+	}
+	var dm struct {
+		DMSpaceID int64 `json:"dm_space_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/dms", boot.Token, map[string]any{"user_ids": []int64{carolID}}, &dm)
+
+	// Bob is an org member but is in NONE of these (vault, the thread, the DM).
+	// Each masked hint must match its nonexistent-id sibling byte-for-byte.
+	absentChan, _ := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+		map[string]any{"channel_id": 999999, "source": "x"})
+	maskChanCode, maskChanBody := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+		map[string]any{"channel_id": vault.ChannelID, "source": "x"})
+	if maskChanCode != http.StatusNotFound {
+		t.Fatalf("outsider draft to private channel = %d, want 404 (existence oracle)", maskChanCode)
+	}
+	if _, absentChanBody := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+		map[string]any{"channel_id": 999998, "source": "x"}); absentChanBody != maskChanBody || absentChan != maskChanCode {
+		t.Fatalf("private-channel draft not byte-identical to absent: mask %q vs absent %q", maskChanBody, absentChanBody)
+	}
+	if dm.DMSpaceID != 0 {
+		maskDM, maskDMBody := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+			map[string]any{"dm_space_id": dm.DMSpaceID, "source": "x"})
+		_, absentDMBody := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+			map[string]any{"dm_space_id": 999999, "source": "x"})
+		if maskDM != http.StatusNotFound || maskDMBody != absentDMBody {
+			t.Fatalf("outsider draft to foreign DM = %d %q, want 404 identical to absent %q", maskDM, maskDMBody, absentDMBody)
+		}
+	}
+	if vt.ThreadID != 0 {
+		maskThr, maskThrBody := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+			map[string]any{"thread_id": vt.ThreadID, "source": "x"})
+		_, absentThrBody := authRaw(t, "POST", ts.URL+"/api/v1/drafts", bobTok,
+			map[string]any{"thread_id": 999999, "source": "x"})
+		if maskThr != http.StatusNotFound || maskThrBody != absentThrBody {
+			t.Fatalf("outsider draft to private-channel thread = %d %q, want 404 identical to absent %q", maskThr, maskThrBody, absentThrBody)
+		}
+	}
+	// The mask does not block a MEMBER: Alice drafts into her own private
+	// channel and thread fine (the fix gates visibility, not the owner).
+	if code := postJSONStatus(t, ts.URL+"/api/v1/drafts", boot.Token,
+		map[string]any{"channel_id": vault.ChannelID, "source": "mine"}); code != http.StatusCreated {
+		t.Fatalf("member draft to own private channel = %d, want 201", code)
 	}
 }

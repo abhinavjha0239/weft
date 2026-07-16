@@ -13,8 +13,10 @@ import (
 
 // Drafts are private per-user compose state — never ACL'd beyond ownership,
 // never event-logged, never visible to anyone else (the read-state
-// precedent). Container hints (channel/thread/dm) are optional and only
-// checked for org-locality; sending is where the real gates run.
+// precedent). Container hints (channel/thread/dm) are optional; each is
+// validated through the SAME read-visibility gate its container's read path
+// uses, so a stored hint can never reveal more than a read would. Sending is
+// where the full send/permission gates run.
 
 const maxDraftBytes = 100 << 10 // 100 KiB — far beyond any message
 
@@ -41,28 +43,62 @@ func validateDraft(p DraftParams) error {
 	return nil
 }
 
-// checkDraftTargets pins any provided container hint to the actor's org —
-// a foreign id is a 404, keeping rows tidy without leaking anything.
+// checkDraftTargets validates any provided container hint through the SAME
+// read-visibility gate its container's read path uses, so a stored hint can
+// never reveal more than a read would. Each hint the actor cannot see is an
+// oracle-free 404, byte-identical to a nonexistent or foreign-org id:
+//   - channel → requireChannelRead (a private channel the actor is not in is
+//     the masked "channel not found", the P-34 decision table verbatim);
+//   - dm_space → requireParticipant (a DM they are not in is "conversation not
+//     found", the P-33 mask);
+//   - thread → its container's gate, every denial mapped to one "thread not
+//     found" (below).
+//
+// Without this a draft POST/PATCH was a success-vs-404 EXISTENCE ORACLE:
+// probing an id returned 201 when a private channel / foreign DM / hidden
+// thread existed and 404 when it did not — stronger than the 403 P-34 closed
+// and, via the dm_space hint, a re-opening of the P-33 DM mask.
 func (s *Service) checkDraftTargets(ctx context.Context, tx pgx.Tx, actor auth.Identity, p DraftParams) error {
-	for _, c := range []struct {
-		id    *int64
-		table string
-	}{
-		{p.ChannelID, "channel"},
-		{p.ThreadID, "thread"},
-		{p.DMSpaceID, "dm_space"},
-	} {
-		if c.id == nil {
-			continue
+	if p.ChannelID != nil {
+		if err := s.requireChannelRead(ctx, tx, actor.OrgID, *p.ChannelID, actor.UserID); err != nil {
+			return err
 		}
-		var ok bool
-		if err := tx.QueryRow(ctx,
-			`SELECT EXISTS (SELECT 1 FROM `+c.table+` WHERE id = $1 AND org_id = $2)`,
-			*c.id, actor.OrgID).Scan(&ok); err != nil {
-			return apperr.Internal("draft target check", err)
+	}
+	if p.DMSpaceID != nil {
+		if err := s.requireParticipant(ctx, tx, *p.DMSpaceID, actor.UserID); err != nil {
+			return err
 		}
-		if !ok {
-			return apperr.NotFound(c.table + " not found")
+	}
+	if p.ThreadID != nil {
+		if err := s.checkDraftThread(ctx, tx, actor, *p.ThreadID); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// checkDraftThread masks a thread hint by its container's read gate. A thread
+// in a private channel the actor cannot read, or in a DM they are not in, is
+// the SAME "thread not found" 404 as a nonexistent thread — every container
+// denial is mapped to that one body so the hint is fully oracle-free at the
+// thread id (absent and masked are indistinguishable). Space-governed threads
+// follow v1 org-wide space visibility (a recorded gap), so they are accepted.
+func (s *Service) checkDraftThread(ctx context.Context, tx pgx.Tx, actor auth.Identity, threadID int64) error {
+	var channelID, dmSpaceID, spaceID *int64
+	if err := tx.QueryRow(ctx, `
+		SELECT channel_id, dm_space_id, space_id FROM thread
+		WHERE id = $1 AND org_id = $2`, threadID, actor.OrgID).
+		Scan(&channelID, &dmSpaceID, &spaceID); err != nil {
+		return apperr.NotFound("thread not found")
+	}
+	switch {
+	case channelID != nil:
+		if err := s.requireChannelRead(ctx, tx, actor.OrgID, *channelID, actor.UserID); err != nil {
+			return apperr.NotFound("thread not found")
+		}
+	case dmSpaceID != nil:
+		if err := s.requireParticipant(ctx, tx, *dmSpaceID, actor.UserID); err != nil {
+			return apperr.NotFound("thread not found")
 		}
 	}
 	return nil
