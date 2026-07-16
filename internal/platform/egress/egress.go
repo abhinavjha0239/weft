@@ -130,6 +130,14 @@ func (c *Client) Post(ctx context.Context, rawURL string, headers map[string]str
 	return c.http.Do(req)
 }
 
+// HTTPClient exposes the guarded *http.Client for libraries that insist on
+// one of their own — go-oidc discovery/JWKS and oauth2 token exchange, injected
+// via oidc.ClientContext (which sets the oauth2.HTTPClient context key). Every
+// request they make then rides the pinned dialer and redirect vetting, so ID
+// tokens and codes are exchanged over the same SSRF guard as everything else.
+// It is the client New built; callers must not mutate it.
+func (c *Client) HTTPClient() *http.Client { return c.http }
+
 // VetURLShape runs only the static, network-free URL checks (scheme http(s),
 // no userinfo, standard ports) that vetURL applies with production options —
 // for validating a configured destination at definition time, so an operator
