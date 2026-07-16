@@ -172,7 +172,14 @@ func serve(ctx context.Context, cfg config.Config) error {
 	msgSvc := messaging.New(pool, permsSvc)
 	autoSvc := automation.New(pool, permsSvc)
 	autoSvc.SetMessaging(msgSvc) // the slash-command channel-send gate
-	go automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log).Run(ctx)
+	autoRunner := automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log)
+	// P-24: the delivery lane's outbound webhook calls ride the SSRF-guarded
+	// egress client — the ONLY path an http_request step may dial. No test
+	// options here (production wiring never allows loopback).
+	autoRunner.SetEgress(egress.New(egress.Options{
+		UserAgent: brand.Name + "Bot/1.0 (+webhook)",
+	}))
+	go autoRunner.Run(ctx)
 	go msgSvc.RunScheduledLoop(ctx, log)
 	filesSvc := files.New(pool, store)
 	filesSvc.SetSigningSecret(cfg.SigningSecret)

@@ -10,6 +10,7 @@
 package egress
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -63,6 +64,13 @@ func New(opts Options) *Client {
 			MaxResponseHeaderBytes: 64 << 10,
 		},
 		CheckRedirect: func(req *http.Request, via []*http.Request) error {
+			// A POST delivery NEVER follows a redirect: re-POSTing the body to
+			// the 30x target is a cross-host header/credential-leak shape. Hand
+			// the 3xx back to the caller (recorded as a non-2xx failure) rather
+			// than chasing it. Get (unfurl) keeps its redirect budget untouched.
+			if len(via) > 0 && via[0].Method == http.MethodPost {
+				return http.ErrUseLastResponse
+			}
 			if len(via) >= 5 {
 				return fmt.Errorf("%w: too many redirects", ErrDisallowed)
 			}
@@ -91,6 +99,48 @@ func (c *Client) Get(ctx context.Context, rawURL string) (*http.Response, error)
 	}
 	req.Header.Set("User-Agent", c.opts.UserAgent)
 	return c.http.Do(req)
+}
+
+// Post sends body to rawURL through the same guard as Get: the URL shape is
+// vetted before any network work, the pinned dialer vets every resolved
+// address, and no credentials of OUR own are attached (no cookie jar, no
+// Authorization we add — the caller's validated headers may include one, which
+// is the outbound-webhook auth use-case). Unlike Get it NEVER follows a
+// redirect (New's CheckRedirect hands a 30x straight back as a non-2xx
+// response). Content-Type is fixed application/json; caller headers are set
+// first so our User-Agent and Content-Type always win. The caller owns
+// resp.Body and MUST cap reads with an io.LimitReader.
+func (c *Client) Post(ctx context.Context, rawURL string, headers map[string]string, body []byte) (*http.Response, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDisallowed, err)
+	}
+	if err := c.opts.vetURL(u); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("User-Agent", c.opts.UserAgent)
+	req.Header.Set("Content-Type", "application/json")
+	return c.http.Do(req)
+}
+
+// VetURLShape runs only the static, network-free URL checks (scheme http(s),
+// no userinfo, standard ports) that vetURL applies with production options —
+// for validating a configured destination at definition time, so an operator
+// gets early feedback on an obviously-bad shape. The address-class checks and
+// the pinned dial still run at send; this is not a substitute for them.
+func VetURLShape(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("%w: %v", ErrDisallowed, err)
+	}
+	return Options{}.vetURL(u)
 }
 
 // vetURL rejects URL shapes before any network work: only plain http(s), no
