@@ -8,6 +8,7 @@ package automation
 // database. Cron-string grammar is a recorded gap.
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
@@ -168,4 +169,28 @@ func atWallClock(year int, month time.Month, day, hh, mm int, loc *time.Location
 		return t
 	}
 	return t.Add(time.Hour)
+}
+
+// scheduleNextAt is the schedule_next_at lifecycle value for a rule: the next
+// fire when the rule is enabled AND its trigger is a schedule, otherwise nil
+// (NULL). An unparseable or non-schedule definition yields nil — the claim
+// never invents a fire. Called from Update; Create stores rules disabled, so
+// it never sets one.
+func scheduleNextAt(enabled bool, rawDef json.RawMessage) *time.Time {
+	if !enabled {
+		return nil
+	}
+	var d Definition
+	if err := json.Unmarshal(rawDef, &d); err != nil {
+		return nil
+	}
+	if d.Trigger.Kind != kindSchedule || d.Trigger.Schedule == nil {
+		return nil
+	}
+	loc, err := scheduleLocation(d.Trigger.Schedule.TZ)
+	if err != nil {
+		return nil
+	}
+	n := nextFire(*d.Trigger.Schedule, time.Now(), loc)
+	return &n
 }

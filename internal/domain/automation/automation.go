@@ -330,11 +330,12 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 		var actorUserID *int64
 		var consentAt *time.Time
 		var enabled bool
+		var storedDef json.RawMessage
 		err := tx.QueryRow(ctx, `
-			SELECT scope_type, scope_id, actor_user_id, actor_consent_at, enabled
+			SELECT scope_type, scope_id, actor_user_id, actor_consent_at, enabled, definition
 			FROM automation
 			WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE`,
-			id, actor.OrgID).Scan(&scopeType, &scopeID, &actorUserID, &consentAt, &enabled)
+			id, actor.OrgID).Scan(&scopeType, &scopeID, &actorUserID, &consentAt, &enabled, &storedDef)
 		if err != nil {
 			return apperr.NotFound("automation not found")
 		}
@@ -390,7 +391,26 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 				id, *p.Enabled); err != nil {
 				return apperr.Internal("toggle automation", err)
 			}
+			enabled = *p.Enabled
 			changed["enabled"] = *p.Enabled
+		}
+		// Schedule lifecycle: recompute schedule_next_at whenever enablement or
+		// the definition changed. An enabled schedule rule carries its next
+		// fire; a disabled rule or a non-schedule trigger carries NULL. Renames
+		// and the loop-flag toggle leave it alone, so a schedule never drifts
+		// on an unrelated edit. This also composes the F-13 arc: a definition
+		// edit that disables a human-actor rule lands here with enabled=false
+		// and NULLs the fire time.
+		if p.Enabled != nil || p.Definition != nil {
+			effectiveDef := storedDef
+			if p.Definition != nil {
+				effectiveDef = p.Definition
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE automation SET schedule_next_at = $2 WHERE id = $1`,
+				id, scheduleNextAt(enabled, effectiveDef)); err != nil {
+				return apperr.Internal("update schedule fire", err)
+			}
 		}
 		_, err = eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
