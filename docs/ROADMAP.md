@@ -1748,6 +1748,388 @@ retention/purge lane (compliance janitor candidate); config-able
 thresholds/backoff; per-org delivery fairness; redirect-following
 opt-in.
 
+### The mixed quartet ships in PARALLEL: P-18 + P-34 + P-21 + P-30
+Four different subsystems (files, channels, notifications, identity) —
+unlike the automation cluster there is no shared function to fight
+over. Expected merge overlap is only router.go/main.go/REALITY.md
+appends (the worktrack pattern: reviewer serial-merges, taking dev's
+file and appending each slice's additions, regression-proven).
+Migration numbers are PRE-ASSIGNED so parallel branches cannot
+collide: P-21 = 0019, P-30 = 0020; P-18 and P-34 are zero-migration.
+If merge order differs from the numbers, the reviewer renumbers at
+merge.
+
+### P-18 `files: Image thumbnails + inline rendering allowlist.` — M — **SPEC-READY (parallel quartet; decompression-bomb cap is the security pin)**
+ZERO migrations. A thumbnail is a DERIVED BLOB, not a File: it lives
+at a deterministic key derived from the ORIGINAL's content hash
+(`StorageKey(org, sha) + "/thumb/w480.jpg"`), so org dedup rides free,
+no file row, no FK, and blob GC of the original must also delete its
+thumb (one extra `store.Delete` beside the existing one — find the
+purge call in compliance.Janitor's file lanes and mirror it). Read
+files.go (Upload's spool+hash shape, authorizeDownload, StorageKey),
+avatar.go + handlers_media.go (the magic-byte allowlist png/jpeg/webp/
+gif and SVG-rejection stance), handlers_files.go (why general
+downloads are attachment-disposition), the blob.Store interface, and
+compliance's file purge lanes first.
+**Design (decided):**
+- **Pure-Go imaging behind a seam** — no libvips, no cgo (the no-dep
+  bias; the seam keeps vips swappable later). New
+  `internal/platform/imaging`: `Thumbnail(r io.Reader, maxDim int)
+  ([]byte, Meta, error)` where Meta = {SrcW, SrcH, W, H}. Decode via
+  stdlib image/png, image/jpeg, image/gif + `golang.org/x/image/webp`
+  (decode-only is fine); scale with `golang.org/x/image/draw`
+  (CatmullRom); encode ALWAYS as JPEG q80 over a white-composited
+  background (universal, small; animated GIF = first frame, recorded
+  gap). `golang.org/x/image` is a new dependency — same trust tier as
+  the existing x/crypto and x/time, explicitly allowed here.
+- **THE SECURITY PIN — decompression-bomb cap**: call
+  `image.DecodeConfig` FIRST (bounded header read) and refuse
+  `width*height > 40_000_000` (40MP) or either dimension > 12000
+  BEFORE any full decode — a 50000×50000 PNG is a few KB on disk and
+  gigabytes decoded. Only then decode. The cap lives in imaging with
+  its own unit test.
+- **Generation**: synchronous inside Upload, AFTER the malware scan
+  verdict and store.Put, best-effort — sniff the spooled bytes with
+  http.DetectContentType; if in the image allowlist, generate + Put
+  the thumb blob. A generation failure (corrupt image, over-cap) is
+  logged and SKIPPED, never a failed upload. Max dim 480.
+- **Serve-by-convention + lazy backfill**:
+  `GET /api/v1/files/{id}/thumbnail` — authorize with EXACTLY
+  authorizeDownload (a file you cannot download has no thumbnail —
+  oracle-free 404), then Open the derived key; on miss AND the
+  original is an allowlisted image within caps, generate-and-store
+  once (pre-P-18 uploads backfill lazily), else 404. Serve INLINE:
+  `Content-Type: image/jpeg`, nosniff, `Cache-Control: private,
+  max-age=3600`, inline disposition — safe because WE encoded these
+  bytes (the avatar precedent); this is the whole "inline rendering
+  allowlist": only weft-encoded renditions ever serve inline, all
+  originals keep attachment disposition (the stored-XSS stance in
+  handlers_files.go is unchanged). Remote/markdown image URLs keep
+  rendering as links (parse.go's existing behavior — privacy: no
+  hotlink fetches).
+- **Response meta**: the thumbnail response carries `X-Image-Width`/
+  `X-Image-Height` (original) + the thumb dimensions as headers from
+  imaging.Meta — no schema change; clients that need layout hints
+  read them (a dimensions column is a recorded gap).
+**Edge cases:** non-image file → 404 (never generated, never
+inline); quarantined (scan_status=2) or deleted file → the existing
+authorizeDownload denial; over-cap image → 404 thumbnail while the
+original still downloads; tiny image (≤480 both dims) → thumb is a
+re-encode at original size (never upscale); webp with alpha →
+white-composited JPEG; GC purge of the original removes the thumb
+blob (assert via the janitor test pattern); two files sharing sha
+(dedup) share the thumb key — deleting ONE file's row must NOT delete
+the shared thumb while the twin lives (the existing twin rule —
+reuse the same liveness check the blob purge uses, cite it).
+**Tests (`TestImageThumbnails` e2e + imaging unit table):** unit:
+each format decodes + scales, JPEG output dims exact, bomb cap
+refuses a crafted 50000×50000 PNG header, no upscale. E2E (real PG +
+the fs blob store like files tests): upload png → thumbnail 200
+inline jpeg with sane headers; lazy backfill for a file uploaded
+through StoreDocument (no thumb at upload) — first GET generates;
+non-image upload → 404; foreign-org/no-ACL file → 404; GC purge
+removes thumb; dedup-twin keeps it. RED/GREEN (pin in a comment):
+drop the DecodeConfig pixel cap → the crafted-header bomb generates a
+thumbnail and the `bomb → 404` assert goes red — the load-bearing
+line.
+**Gaps to record:** srcset/multiple sizes; animated GIF/video
+previews; PDF/code previews (ADR-012's full list); dimensions in a
+queryable column; full-size validated-inline lightbox path; EXIF
+orientation (v1 ignores it — document); libvips behind the seam if
+fleet-scale demands.
+
+### P-34 `channels: Private-channel existence masking.` — S — **SPEC-READY (parallel quartet; zero migrations)**
+Semantics survey DONE, decision made: private channels 404 like DMs.
+Today is INTERNALLY INCONSISTENT — single-message Get already masks
+(web_public_test.go asserts non-member private Get = 404, the P-33
+contract) while ListThreads/join/send return 403 through
+requireMember/requireChannelRead (threads.go:356/375, neither
+org-pinned). Slack semantics; Zulip agrees for unsubscribed private
+streams. PUBLIC channels stay 403 for non-members — they are
+directory-listable (the "listable-public asymmetry" is real and
+correct); web-public stays readable (P-16).
+**Design (decided):**
+- **One org-pinned access probe** in messaging:
+  `channelAccess(ctx, tx, orgID, channelID, userID) (visibility
+  int16, member bool, err)` — one query joining channel (org-pinned,
+  any archived state) + membership EXISTS. Absent/foreign-org row →
+  `apperr.NotFound("channel not found")` — indistinguishable from the
+  masked case by construction.
+- **requireMember and requireChannelRead become wrappers** over the
+  probe, gaining the orgID param (thread it from each caller's
+  actor — all nine call sites have actor in scope: pins.go:147,
+  readstate.go:41, subscriptions.go:48/91, threads.go:58/153/232/
+  296/543). Denial mapping, THE decision table:
+  visibility=2 ∧ !member → NotFound (the mask);
+  visibility=1 ∧ !member → Forbidden (public is knowable — a join
+  affordance, and the send-before-join 403 tests stay honest);
+  visibility=3 → read allowed as today (write still needs member,
+  and a non-member write miss on web-public stays Forbidden — it is
+  world-READABLE, so existence is public anyway).
+- **JoinChannel** (channels.go, the P-16 self-join): joining a
+  private channel you cannot see must ALSO be NotFound (today 403 —
+  channels_test.go:106 asserts it; that test flips). Joining public
+  stays as-is.
+- **Channel Get/meta + every by-id surface**: sweep EVERY handler
+  that resolves a channel id (git grep the handlers for channel
+  PathValue) — folders add/remove, mark-read, typing, pins list,
+  subscriptions — anything reaching the gates inherits the fix via
+  the wrappers; anything doing its own channel lookup must be
+  audited to the same table. List the audited sites in the PR.
+- **Guests**: unchanged mechanics (they ride the same gates). A
+  guest probing a PUBLIC channel by id still gets 403 (existence of
+  public channels is org-public; the guest-directory question is a
+  recorded gap, not this slice).
+- **Events/invites**: invite-prejoined private channels and
+  admin-verb holders (administer_channel resolved up the chain) are
+  MEMBERS or admin-scoped already — administering a private channel
+  you are not in: perms.ChannelScope loads the channel row org-pinned
+  and the admin verb is checked BEFORE membership in admin paths —
+  verify admins retain access (they must; masking is for the
+  unprivileged) and assert it in the test.
+**Edge cases:** nonexistent id, foreign-org id, and private-non-member
+must be THREE INDISTINGUISHABLE 404s (assert byte-identical bodies,
+the P-16 test pattern); member of an archived private channel keeps
+history (lifecycle contract — the probe must not filter archived for
+members); public-channel non-member send stays 403
+(channels_test.go:93/115 keep passing); web-public anonymous reads
+(P-16 public.go) are UNTOUCHED — they never pass through these gates.
+**Tests (`TestPrivateChannelMasking`, real PG):** the three-way
+indistinguishability on ListThreads + Join + send + pins + mark-read;
+public non-member still 403 everywhere; member unaffected; admin
+non-member retains admin surfaces; guest unchanged; update the two
+flipped asserts (web_public_test.go:161-163 list 403→404,
+channels_test.go:106-107 join 403→404) IN THE SAME COMMIT as the gate
+change. RED/GREEN (pin in a comment): revert the wrapper's private
+mapping (NotFound → Forbidden) → the indistinguishability assert goes
+red (a 403 distinguishes denied-from-absent — the oracle reopens).
+**Gaps to record:** guest existence-masking for public channels
+(needs the directory design); named-404 UX for clients (a "you may
+need an invite" hint would re-open the oracle — deliberately NOT
+doing it); P-16's anonymous surface already masks (no change).
+
+### P-21 `notification: Push medium.` — L — **SPEC-READY (parallel quartet; migration 0019; endpoints are user-registered URLs → every send rides the egress guard)**
+Migration `0019_push_subscriptions.sql`: `CREATE TABLE
+push_subscription (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY
+KEY, org_id BIGINT NOT NULL REFERENCES org (id), user_id BIGINT NOT
+NULL REFERENCES user_account (id), endpoint TEXT NOT NULL, p256dh
+BYTEA NOT NULL, auth BYTEA NOT NULL, created_at TIMESTAMPTZ NOT NULL
+DEFAULT now(), last_ok_at TIMESTAMPTZ, UNIQUE (user_id, endpoint));`
++ `ALTER TABLE notification ADD COLUMN pushed_at TIMESTAMPTZ;` + the
+due partial index mirroring 0012's email one: `(created_at) WHERE
+seen_at IS NULL AND pushed_at IS NULL`. The medium plumbing ALREADY
+exists: notification_medium_pref medium 3 = push (0012, "reserved"),
+and channel_member.notif_push (0003) stays dormant (recorded gap —
+kind-level prefs only in v1). Read email.go IN FULL (RunOnce's
+claim/mark/deliver, the prefs COALESCE with zero-row defaults, the
+DND unmarked-skip), prefs.go, mail.go (the driver seam + log-driver
+default), config.go, and the P-24 egress additions first.
+**Design (decided):**
+- **Web Push (RFC 8030/8291/8292) implemented in-house — NO new
+  dependency**: new `internal/platform/webpush` with (a) VAPID ES256
+  JWTs (stdlib crypto/ecdsa P-256; aud = the endpoint origin, exp
+  12h, sub from config); (b) RFC 8291 aes128gcm payload encryption —
+  ephemeral ECDH over crypto/ecdh P-256 + x/crypto/hkdf (already a
+  transitive dep of x/crypto in go.mod... verify; if hkdf is not
+  importable from the existing x/crypto version, STOP and report) +
+  stdlib AES-GCM. **The implementation MUST reproduce RFC 8291
+  Appendix A byte-for-byte**: encode the RFC's exact keys/salt/
+  plaintext as a unit-test fixture and assert the exact ciphertext —
+  this vector test is non-negotiable and is what makes hand-rolling
+  responsible. FCM is NOT in v1 (a later Sender implementation
+  behind the same seam; recorded gap).
+- **Config**: `WEFT_VAPID_PUBLIC_KEY` / `WEFT_VAPID_PRIVATE_KEY`
+  (base64url raw keys) + `WEFT_PUSH_SUBJECT` (mailto:/https:).
+  Unset → the push lane is a structural no-op and the subscribe API
+  409s with a clear "push not configured" (the mail log-driver
+  spirit: dev/CI never need keys). `weftd gen-vapid-keys` subcommand
+  prints a fresh pair (mirror how existing subcommands are wired in
+  main.go).
+- **Subscription API** (authed, self-scoped): `POST
+  /api/v1/me/push-subscriptions {endpoint, keys:{p256dh, auth}}` —
+  endpoint must pass `egress.VetURLShape` AND be https (400
+  otherwise), keys base64url-decoded and length-checked (p256dh = 65
+  bytes uncompressed point, auth = 16 bytes), ≤10 live subscriptions
+  per user (409 over), upsert on (user, endpoint); `GET` lists the
+  caller's own (endpoint TRUNCATED for display — it is a capability
+  URL); `DELETE /api/v1/me/push-subscriptions/{id}` self-scoped
+  oracle-free 404 (the sessions precedent). VAPID public key
+  discovery: `GET /api/v1/push/vapid-key` (authed) → {key} or 404
+  when unconfigured.
+- **Push lane** (`PushWorker` beside EmailWorker, 30s tick,
+  mark-then-send AT-MOST-ONCE — the email trade, right for
+  notifications): claim exactly like RunOnce but `pushed_at IS NULL`,
+  medium = 3, NO age delay (push is the immediacy medium; a
+  seen-races-send extra push is acceptable, document), zero-rows
+  default = **dm + mention ON for push** (mirror email's kind IN
+  (1,2,4)? DECISION: push defaults ON for kinds 1 and 2 only —
+  keyword email's opt-in-by-setting-a-word logic does not carry to
+  push; a stored medium-3 pref row overrides, and the existing
+  PUT /notification-prefs already accepts medium 3 — verify, it was
+  built "reserved"), DND unmarked-skip identical to email (VIP
+  pierce included). Per claimed row: build a minimal JSON payload
+  {kind, org_id, entity_type, entity_id, actor_name, channel_name —
+  who/where ONLY, NEVER message content (the email-digest privacy
+  rule)}, encrypt per-subscription, POST via **the egress guard**
+  with headers TTL:86400, Urgency:normal, Content-Encoding:
+  aes128gcm, Authorization: vapid t=…,k=…. egress needs the
+  Content-Type override — add `egress.PostRaw(ctx, url, headers,
+  body []byte, contentType string)` sharing Post's spine verbatim
+  (vetURL, pinned dialer, no redirects for POST, no cookies) with
+  the caller-set content type; Post itself is UNTOUCHED (P-24's
+  envelope contract).
+- **Endpoint lifecycle**: 200/201 → last_ok_at = now(); 404/410 from
+  the push service → DELETE the subscription row (the standard
+  contract — the browser revoked it); 429/5xx/timeout → leave the
+  row, the notification is already marked (at-most-once, a drop not
+  a dup); egress.ErrDisallowed (a private/odd endpoint that slipped
+  registration — DNS moved) → delete the subscription too and log.
+- **Fan-out**: one notification row → push to EVERY live
+  subscription of that user (a phone and a laptop both ring).
+**Edge cases:** push unconfigured → subscribe 409, lane no-op, zero
+errors in logs; subscription registered against a private-IP
+endpoint → 400 at registration (VetURLShape passes https/ports but
+the ADDRESS check happens at send — registration-time DNS vetting
+would be a TOCTOU lie, so the guard at SEND is the truth and such a
+row dies on first delivery via the ErrDisallowed path — document
+this shape explicitly); deactivated user's rows never claimed (the
+email JOIN already excludes — mirror it); seen-before-tick → never
+pushed; the SAME notification emailed AND pushed is correct (media
+are independent).
+**Tests (`TestPushMedium` e2e + webpush unit):** unit: THE RFC 8291
+Appendix A vector byte-exact; VAPID JWT parses + verifies with the
+public key, aud/exp correct. E2E (real PG + an httptest push service
++ egress AllowLoopbackForTests, the P-24 pattern): subscribe →
+mention → lane run → the fake service receives a request with
+aes128gcm encoding + a vapid Authorization + a payload that DECRYPTS
+(test-side RFC 8291 decrypt with the subscription keys) to the
+who/where JSON with NO message content; DND snooze skips unmarked
+then delivers after; medium-3 pref off → nothing; 410 → row deleted;
+seen → never pushed; two subscriptions → two deliveries; unconfigured
+→ 409 + no-op. RED/GREEN (pins in comments): (1) neuter the
+egress-guarded send (plain http.Client, the P-24 pin shape) → a
+subscription pointing at a loopback/private endpoint DELIVERS and the
+never-dialed assert goes red — the load-bearing line; (2) drop the
+`seen_at IS NULL` clause from the claim → an already-seen
+notification pushes and the `seen → no push` assert goes red.
+**Gaps to record:** FCM/APNs senders behind the seam; per-channel
+notif_push tri-state override; delivery receipts/collapse keys; rate
+limiting per endpoint origin; push for web-public anonymous (never);
+subscription pruning by age; the client service-worker (client-era).
+
+### P-30 `identity: OIDC login.` — L — **SPEC-READY (parallel quartet; migration 0020; THE new-dependency slice — go-oidc; invite remains the authorization)**
+Migration `0020_oidc.sql`: `CREATE TABLE auth_provider (id BIGINT
+GENERATED ALWAYS AS IDENTITY PRIMARY KEY, org_id BIGINT NOT NULL
+REFERENCES org (id), name TEXT NOT NULL, -- url-safe slug, unique per
+org issuer TEXT NOT NULL, client_id TEXT NOT NULL, client_secret TEXT
+NOT NULL, enabled BOOLEAN NOT NULL DEFAULT false, created_at
+TIMESTAMPTZ NOT NULL DEFAULT now(), UNIQUE (org_id, name));` +
+`CREATE TABLE external_identity (id BIGINT GENERATED ALWAYS AS
+IDENTITY PRIMARY KEY, org_id BIGINT NOT NULL REFERENCES org (id),
+user_id BIGINT NOT NULL REFERENCES user_account (id), provider_id
+BIGINT NOT NULL REFERENCES auth_provider (id), subject TEXT NOT NULL,
+email_at_link TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now(),
+UNIQUE (provider_id, subject));` + `CREATE TABLE oidc_flow
+(state_hash TEXT PRIMARY KEY, provider_id BIGINT NOT NULL REFERENCES
+auth_provider (id), pkce_verifier TEXT NOT NULL, nonce TEXT NOT NULL,
+created_at TIMESTAMPTZ NOT NULL DEFAULT now(), used_at TIMESTAMPTZ);`
+(the password_reset single-use-row pattern: only the state's sha256
+is stored, used_at IS NULL is the replay guard, expired rows swept).
+Read auth.go IN FULL (Login's credential JOIN — an OIDC-only user
+simply has NO user_credential row and password login naturally
+excludes them; CreateSession; FromToken), identity.go, invites.go
+(the authorization model), password_reset.go (the single-use claim +
+oracle-free discipline), and the P-16/P-20 outside-withAuth endpoint
+precedents first.
+**Design (decided):**
+- **Dependency: `github.com/coreos/go-oidc/v3` + `golang.org/x/
+  oauth2`** — ID-token verification (discovery, JWKS rotation, alg
+  pinning, iss/aud/exp) is the one thing this codebase must NOT
+  hand-roll; go-oidc is the de-facto standard. This is a DELIBERATE
+  exception to the no-dep bias — say so in the commit body. Pin
+  latest stable; `go mod tidy` diff should show only these two
+  roots + their minimal graph.
+- **Provider CRUD** (manage_org-gated, the admin surface):
+  `POST/GET/PATCH/DELETE /api/v1/admin/auth-providers` — name
+  `^[a-z0-9][a-z0-9-]{0,31}$` unique per org; issuer must be https
+  and pass `egress.VetURLShape` (400); client_secret is WRITE-ONLY —
+  GET/List return `has_secret: true`, never the value (the
+  invite-token show-once spirit); a PATCH may rotate it. Creating
+  disabled; enabling requires a successful DISCOVERY probe (fetch
+  issuer/.well-known/openid-configuration through go-oidc at enable
+  time → 422 with the provider error on failure, so a typo'd issuer
+  never strands logins). Every mutation event-logged (no secret in
+  payloads, ever).
+- **Login flow** (pre-auth, outside withAuth, per-IP authLimit like
+  login): `GET /api/v1/auth/oidc/{org_slug}/{provider}/start` →
+  resolve org+enabled provider (absent/disabled = one oracle-free
+  404), mint state (32B random; store sha256 + PKCE S256 verifier +
+  nonce in oidc_flow), 302 to the IdP authorize URL (scope "openid
+  email", response_type=code, PKCE S256, nonce). `GET
+  /api/v1/auth/oidc/{org_slug}/{provider}/callback?code&state` →
+  claim the flow row IN ONE TX (`used_at IS NULL` single-use — the
+  password-reset race guard verbatim, red/green target), 10-min TTL;
+  exchange the code (go-oidc/oauth2 with the PKCE verifier — inject
+  an egress-guarded http.Client via oauth2.HTTPClient/context so
+  even the token exchange rides the pinned dialer); VERIFY the ID
+  token with go-oidc (iss, aud = client_id, exp, sig) AND assert the
+  nonce claim equals the flow row's nonce (replay/mix-up defense —
+  red/green target).
+- **Account resolution — the decision table** (kind=1 humans only,
+  deactivated always excluded):
+  1. `external_identity(provider, sub)` exists → mint session
+     (CreateSession with ip/UA like Login). DONE.
+  2. Else if token has `email` AND `email_verified == true` AND
+     exactly one LIVE kind=1 user_account matches (org_id,
+     lower(email)) → LINK: insert external_identity + mint session.
+     An UNVERIFIED email must NEVER link (red/green target — the
+     account-takeover shape: an IdP that hands out unverified
+     mailboxes must not grant someone else's account).
+  3. Else → 403 `{"error": "no account for this identity — ask an
+     admin for an invite"}`. NO JIT provisioning: the invite IS the
+     authorization (the founding model). Domain-scoped auto-join is
+     a recorded gap, deliberately config-gated future work.
+  Placeholder (kind=3) claiming via OIDC: recorded gap (belongs with
+  the importer-claim design).
+- **Session handoff**: the callback answers 200 JSON `{token,
+  user_id, org_id}` — the API-era austerity (the password-reset
+  "mail carries the token, no web page" precedent). A redirect-based
+  client handoff needs an allowlisted redirect target and is a
+  recorded gap. Sessions/logout/self-management: UNCHANGED (the
+  P-29 surfaces work on OIDC sessions identically).
+- **Coexistence**: a user with BOTH a credential and external
+  identities logs in either way; ChangePassword/reset untouched
+  (no credential row → reset silently sends nothing, already true).
+  An org knob to disable password login is a recorded gap.
+**Edge cases:** disabled provider mid-flow (start ok, callback after
+disable) → the callback re-checks enabled → 404; state replay → the
+used_at guard → 401; expired flow row (>10min) → 401; two users
+sharing an email cannot exist (user_account_email_key) so rule 2's
+"exactly one" is structural — but assert the deactivated-user
+exclusion; email claim ABSENT → rule 3; a second provider linking a
+second identity to the same user is fine (UNIQUE is per provider);
+org slug/provider mismatches all collapse to the one 404.
+**Tests (`TestOIDCLogin`, real PG + a FAKE IdP httptest server —
+discovery doc + JWKS + token endpoint signing RS256 with a test key;
+fully offline, the fixtures discipline):** happy first login links
+by verified email + session works via /me; second login rides
+external_identity (no re-link); unverified email → 403 AND no
+external_identity row (red/green pin 1: drop the email_verified
+check → the takeover succeeds and the no-link assert goes red — the
+load-bearing line); unknown email → 403 no-JIT; state replay → 401
+(red/green pin 2: drop the used_at single-use clause → the replayed
+callback mints a SECOND session and the replay assert goes red);
+nonce mismatch → 401; disabled provider → 404; provider CRUD: secret
+never echoed, discovery-probe failure → 422, non-admin → 403;
+password login for a linked user still works; OIDC-only user cannot
+password-login (no credential row).
+**Gaps to record:** JIT provisioning behind an org policy knob +
+domain allowlist; placeholder claiming; group/role mapping from IdP
+claims; RP-initiated logout / backchannel logout; refresh tokens
+(sessions are weft-native — none needed); client redirect handoff;
+encrypting client_secret at rest (DB-column crypto is a platform
+decision, not this slice).
+
 ---
 
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
@@ -1769,13 +2151,16 @@ record the scope and the known design questions so nothing is lost.)
 - **P-17** — **promoted to Tier 1** (full spec above; strongest-model
   execution; archive shape decided = in-place tombstone; restore API
   deferred as a recorded gap).
-- **P-18 `files: Image thumbnails + inline rendering allowlist.`** M —
-  OPEN: image processing dependency choice (pure-Go vs libvips),
-  thumbnail storage keys, srcset shape.
+- **P-18** — **promoted to Tier 1** (full spec above; zero migrations —
+  thumbs are derived blobs keyed off the original's sha; pure-Go
+  imaging via golang.org/x/image behind a seam, no libvips/cgo;
+  decompression-bomb cap is the security pin).
 - **P-19** — **promoted to Tier 1** (full spec above).
 - **P-20** — **promoted to Tier 1** (full spec above).
-- **P-21 `notification: Push medium.`** L — NEEDS-DESIGN: web-push
-  (VAPID) vs FCM seam; device registration table (needs migration).
+- **P-21** — **promoted to Tier 1** (full spec above; migration 0019;
+  Web Push/VAPID in-house against the RFC 8291 Appendix A vector —
+  no new dep; FCM is a later Sender behind the seam; every send
+  rides the egress guard since endpoints are user-registered URLs).
 - **P-22** — **[x] shipped #97** (mention-injection guard is the
   structural label-multiset comparison, not escaping, as decided).
 - **P-23** — **[x] shipped #98** (migration 0017; capability-token
@@ -1793,17 +2178,19 @@ record the scope and the known design questions so nothing is lost.)
 - **P-28 `importer: Jira.`** XL — deliberately last (M3 exit).
 - **P-29** — **promoted to Tier 1** (full spec above; password RESET
   split out as P-35 — it depends on P-20's mail plumbing).
-- **P-30 `identity: OIDC login.`** L — NEEDS-DESIGN: library choice,
-  account linking rules, JIT provisioning vs invite-only.
+- **P-30** — **promoted to Tier 1** (full spec above; migration 0020;
+  library decided: coreos/go-oidc/v3 + x/oauth2 — THE deliberate
+  new-dependency exception; linking = (provider,subject) then
+  verified-email to a live human; NO JIT — the invite remains the
+  authorization).
 - **P-31** — **promoted to Tier 1** (full spec above).
 - **P-32** — **promoted to Tier 1** (full spec above; raw zip bundle —
   the eDiscovery/partner manifest FORMAT stays here as a later
   refinement).
-- **P-34 `channels: Private-channel existence masking.`** S —
-  NEEDS-DESIGN: requireChannelMember returns 403 today; decide whether
-  private channels 404 like DMs (survey Zulip/Slack semantics, client
-  impact, and the listable-public asymmetry) before any executor
-  touches it. Split off from P-33.
+- **P-34** — **promoted to Tier 1** (full spec above; zero migrations;
+  decided: private 404s like DMs — messaging was already internally
+  inconsistent (Get masks, lists don't); public keeps 403 (listable),
+  web-public untouched).
 - **P-35** — **promoted to Tier 1** (full spec above; token storage
   decided: DB rows — single-use + revoke-on-change require server
   state).
