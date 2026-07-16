@@ -124,8 +124,12 @@ type Automation struct {
 	ActorUserID      *int64          `json:"actor_user_id,omitempty"`
 	ActorConsented   bool            `json:"actor_consented"`
 	AllowRuleTrigger bool            `json:"allow_rule_trigger"`
-	CreatedBy        int64           `json:"created_by"`
-	CreatedAt        time.Time       `json:"created_at"`
+	// WebhookToken is the capability token for a webhook rule, surfaced only to
+	// scope admins (Create and List are requireScopeAdmin-gated). Nil for every
+	// non-webhook rule.
+	WebhookToken *string   `json:"webhook_token,omitempty"`
+	CreatedBy    int64     `json:"created_by"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type CreateParams struct {
@@ -264,8 +268,19 @@ func (s *Service) Create(ctx context.Context, actor auth.Identity, p CreateParam
 		if err := s.requireScopeAdmin(ctx, tx, actor, p.ScopeType, p.ScopeID); err != nil {
 			return err
 		}
-		if _, err := s.validateDefinition(ctx, tx, actor.OrgID, p.ScopeType, p.ScopeID, p.Definition); err != nil {
+		def, err := s.validateDefinition(ctx, tx, actor.OrgID, p.ScopeType, p.ScopeID, p.Definition)
+		if err != nil {
 			return err
+		}
+		// A webhook trigger mints its capability token at birth (Create stores
+		// the rule disabled, so no schedule fire time is ever set here).
+		var webhookToken *string
+		if def.Trigger.Kind == kindWebhook {
+			tok, terr := newWebhookToken()
+			if terr != nil {
+				return terr
+			}
+			webhookToken = &tok
 		}
 		var consentAt *time.Time
 		if p.ActorUserID != nil {
@@ -286,18 +301,19 @@ func (s *Service) Create(ctx context.Context, actor auth.Identity, p CreateParam
 		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO automation (org_id, scope_type, scope_id, name, definition,
-				actor_user_id, actor_consent_at, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				actor_user_id, actor_consent_at, created_by, webhook_token)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			RETURNING id, version, created_at`,
 			actor.OrgID, p.ScopeType, p.ScopeID, p.Name, p.Definition,
-			p.ActorUserID, consentAt, actor.UserID).Scan(&out.ID, &out.Version, &out.CreatedAt); err != nil {
+			p.ActorUserID, consentAt, actor.UserID, webhookToken).Scan(&out.ID, &out.Version, &out.CreatedAt); err != nil {
 			return apperr.Internal("create automation", err)
 		}
 		out.ScopeType, out.ScopeID, out.Name = p.ScopeType, p.ScopeID, p.Name
 		out.Definition, out.ActorUserID = p.Definition, p.ActorUserID
 		out.ActorConsented = consentAt != nil
+		out.WebhookToken = webhookToken
 		out.CreatedBy = actor.UserID
-		_, err := eventlog.Append(ctx, tx, eventlog.Event{
+		_, err = eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 			EntityType: enum.EntityAutomation, EntityID: out.ID, Verb: "automation.created",
 			Payload: eventlog.MustPayload(map[string]any{
@@ -331,11 +347,14 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 		var consentAt *time.Time
 		var enabled bool
 		var storedDef json.RawMessage
+		var webhookToken *string
 		err := tx.QueryRow(ctx, `
-			SELECT scope_type, scope_id, actor_user_id, actor_consent_at, enabled, definition
+			SELECT scope_type, scope_id, actor_user_id, actor_consent_at, enabled,
+			       definition, webhook_token
 			FROM automation
 			WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE`,
-			id, actor.OrgID).Scan(&scopeType, &scopeID, &actorUserID, &consentAt, &enabled, &storedDef)
+			id, actor.OrgID).Scan(&scopeType, &scopeID, &actorUserID, &consentAt,
+			&enabled, &storedDef, &webhookToken)
 		if err != nil {
 			return apperr.NotFound("automation not found")
 		}
@@ -355,8 +374,29 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 			changed["name"] = *p.Name
 		}
 		if p.Definition != nil {
-			if _, err := s.validateDefinition(ctx, tx, actor.OrgID, scopeType, scopeID, p.Definition); err != nil {
+			newDef, err := s.validateDefinition(ctx, tx, actor.OrgID, scopeType, scopeID, p.Definition)
+			if err != nil {
 				return err
+			}
+			// webhook_token lifecycle: mint when the trigger becomes a webhook
+			// (keeping any existing token so a URL already handed out survives
+			// unrelated edits), NULL when it stops being one. Rotation is a
+			// separate, explicit action.
+			var nextToken *string
+			if newDef.Trigger.Kind == kindWebhook {
+				if webhookToken != nil {
+					nextToken = webhookToken
+				} else {
+					tok, terr := newWebhookToken()
+					if terr != nil {
+						return terr
+					}
+					nextToken = &tok
+				}
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE automation SET webhook_token = $2 WHERE id = $1`, id, nextToken); err != nil {
+				return apperr.Internal("update webhook token", err)
 			}
 			clearConsent := actorUserID != nil
 			if _, err := tx.Exec(ctx, `
@@ -491,7 +531,7 @@ func (s *Service) List(ctx context.Context, actor auth.Identity, scopeType int16
 		rows, err := tx.Query(ctx, `
 			SELECT id, scope_type, scope_id, name, enabled, definition, version,
 			       actor_user_id, actor_consent_at IS NOT NULL, allow_rule_trigger,
-			       created_by, created_at
+			       created_by, created_at, webhook_token
 			FROM automation
 			WHERE org_id = $1 AND scope_type = $2 AND scope_id = $3 AND deleted_at IS NULL
 			ORDER BY id`, actor.OrgID, scopeType, scopeID)
@@ -503,7 +543,7 @@ func (s *Service) List(ctx context.Context, actor auth.Identity, scopeType int16
 			var a Automation
 			if err := rows.Scan(&a.ID, &a.ScopeType, &a.ScopeID, &a.Name, &a.Enabled,
 				&a.Definition, &a.Version, &a.ActorUserID, &a.ActorConsented,
-				&a.AllowRuleTrigger, &a.CreatedBy, &a.CreatedAt); err != nil {
+				&a.AllowRuleTrigger, &a.CreatedBy, &a.CreatedAt, &a.WebhookToken); err != nil {
 				return apperr.Internal("scan automation", err)
 			}
 			out = append(out, a)
