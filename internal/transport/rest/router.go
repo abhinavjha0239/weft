@@ -246,6 +246,9 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/automations/{id}", a.withAuth(a.handleDeleteAutomation))
 	mux.HandleFunc("POST /api/v1/automations/{id}/consent", a.withAuth(a.handleConsentAutomation))
 	mux.HandleFunc("GET /api/v1/automations/{id}/runs", a.withAuth(a.handleListAutomationRuns))
+	// P-24: the outbound-webhook delivery-health dashboard (scope-admin gated
+	// like runs).
+	mux.HandleFunc("GET /api/v1/automations/{id}/deliveries", a.withAuth(a.handleListAutomationDeliveries))
 	// P-23 slash + webhook triggers. The slash invocation is authed; the
 	// webhook-token rotation is scope-admin (gated in the domain).
 	mux.HandleFunc("POST /api/v1/automations/slash", a.withAuth(a.handleSlash))

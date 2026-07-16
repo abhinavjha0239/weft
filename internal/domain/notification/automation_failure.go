@@ -45,6 +45,37 @@ func (s *Service) RecordAutomationFailure(ctx context.Context, tx pgx.Tx, orgID,
 	return inserted, rows.Err()
 }
 
+// RecordAutomationDeliveryFailure inserts a kind-6 delivery-health alert (P-24)
+// for each recipient, keyed on the webhook_delivery that crossed the threshold
+// (entity_type = EntityWebhookDelivery). It reuses RecordAutomationFailure's
+// dedupe/return machinery but points at the DELIVERY, not a run: each health
+// threshold (5, 15, 20) is a distinct delivery row, so the three alerts of one
+// failing streak are three distinct notifications rather than colliding on one
+// dedupe key. Returns the users actually inserted so the caller pings exactly
+// those after the tx commits.
+func (s *Service) RecordAutomationDeliveryFailure(ctx context.Context, tx pgx.Tx, orgID, deliveryID int64, recipients []int64) ([]int64, error) {
+	rows, err := tx.Query(ctx, `
+		INSERT INTO notification (org_id, user_id, kind, entity_type, entity_id, actor_id)
+		SELECT $1, u, $2, $3, $4, NULL
+		FROM unnest($5::bigint[]) AS u
+		ON CONFLICT (user_id, kind, entity_type, entity_id) DO NOTHING
+		RETURNING user_id`,
+		orgID, int16(KindAutomationFailure), int16(enum.EntityWebhookDelivery), deliveryID, recipients)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var inserted []int64
+	for rows.Next() {
+		var uid int64
+		if err := rows.Scan(&uid); err != nil {
+			return nil, err
+		}
+		inserted = append(inserted, uid)
+	}
+	return inserted, rows.Err()
+}
+
 // PingNotification delivers a live in-app ping for a row materialized outside
 // the message pipeline (e.g. an automation-failure alert) — DND-gated exactly
 // like the materializer's own ping, with a system actor (0) that earns no VIP

@@ -19,26 +19,27 @@ const (
 type EntityType int16
 
 const (
-	EntityMessage       EntityType = 1
-	EntityThread        EntityType = 2
-	EntityChannel       EntityType = 3
-	EntityWorkItem      EntityType = 4
-	EntityUser          EntityType = 5
-	EntitySpace         EntityType = 6
-	EntityFile          EntityType = 7
-	EntityOrg           EntityType = 8
-	EntityWorkspace     EntityType = 9
-	EntityGroup         EntityType = 10
-	EntityDM            EntityType = 11
-	EntityLegalHold     EntityType = 12
-	EntityAutomation    EntityType = 13
-	EntityExportJob     EntityType = 14
-	EntityScheduled     EntityType = 15
-	EntityEmoji         EntityType = 16
-	EntityChannelFolder EntityType = 17
-	EntityAutomationRun EntityType = 18
-	EntitySprint        EntityType = 19
-	EntityFieldDef      EntityType = 20
+	EntityMessage         EntityType = 1
+	EntityThread          EntityType = 2
+	EntityChannel         EntityType = 3
+	EntityWorkItem        EntityType = 4
+	EntityUser            EntityType = 5
+	EntitySpace           EntityType = 6
+	EntityFile            EntityType = 7
+	EntityOrg             EntityType = 8
+	EntityWorkspace       EntityType = 9
+	EntityGroup           EntityType = 10
+	EntityDM              EntityType = 11
+	EntityLegalHold       EntityType = 12
+	EntityAutomation      EntityType = 13
+	EntityExportJob       EntityType = 14
+	EntityScheduled       EntityType = 15
+	EntityEmoji           EntityType = 16
+	EntityChannelFolder   EntityType = 17
+	EntityAutomationRun   EntityType = 18
+	EntitySprint          EntityType = 19
+	EntityFieldDef        EntityType = 20
+	EntityWebhookDelivery EntityType = 21
 )
 
 // UserKind is user_account.kind (CC-5: agent covers all non-human principals).

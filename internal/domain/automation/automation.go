@@ -104,6 +104,11 @@ type Step struct {
 	// rule may only post into its own channel) and static content.
 	ChannelID int64  `json:"channel_id,omitempty"`
 	Content   string `json:"content,omitempty"`
+	// http_request (P-24): a STATIC destination (never templated) and ≤5
+	// optional custom headers. The step ENQUEUES a webhook_delivery; the send
+	// happens later in the delivery lane through the SSRF-guarded egress client.
+	URL     string            `json:"url,omitempty"`
+	Headers map[string]string `json:"headers,omitempty"`
 }
 
 // triggerVerbs is the v1 catalog — only verbs the log actually emits.
@@ -186,36 +191,55 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 	if len(def.Steps) == 0 || len(def.Steps) > maxSteps {
 		return def, apperr.Invalid(fmt.Sprintf("definition: 1..%d steps required", maxSteps))
 	}
+	httpSteps := 0
 	for i, st := range def.Steps {
-		if st.Kind != "post_message" {
+		switch st.Kind {
+		case stepPostMessage:
+			if st.URL != "" || len(st.Headers) > 0 {
+				return def, apperr.Invalid(fmt.Sprintf("definition: step %d: a post_message step takes no url or headers", i))
+			}
+			if st.Content == "" || len(st.Content) > maxContentLen {
+				return def, apperr.Invalid(fmt.Sprintf("definition: step %d: content 1..%d chars", i, maxContentLen))
+			}
+			if err := validateStepContent(i, st.Content); err != nil {
+				return def, err
+			}
+			switch scopeType {
+			case ScopeChannel:
+				// A channel-scope rule may not reach outside its channel.
+				if st.ChannelID != 0 && st.ChannelID != scopeID {
+					return def, apperr.Invalid(fmt.Sprintf("definition: step %d: a channel-scope rule posts only to its own channel", i))
+				}
+			case ScopeOrg:
+				if st.ChannelID == 0 {
+					return def, apperr.Invalid(fmt.Sprintf("definition: step %d: channel_id required for org scope", i))
+				}
+				var ok bool
+				if err := tx.QueryRow(ctx, `
+					SELECT EXISTS (SELECT 1 FROM channel
+					  WHERE id = $1 AND org_id = $2 AND archived_at IS NULL)`,
+					st.ChannelID, orgID).Scan(&ok); err != nil {
+					return def, apperr.Internal("channel lookup", err)
+				}
+				if !ok {
+					return def, apperr.NotFound(fmt.Sprintf("definition: step %d: channel not found", i))
+				}
+			}
+		case stepHTTPRequest:
+			// ≤3 outbound calls per rule, and a foreign field (content/channel)
+			// on an http step is a misconfiguration, never silently ignored.
+			httpSteps++
+			if httpSteps > maxHTTPSteps {
+				return def, apperr.Invalid(fmt.Sprintf("definition: at most %d http_request steps", maxHTTPSteps))
+			}
+			if st.Content != "" || st.ChannelID != 0 {
+				return def, apperr.Invalid(fmt.Sprintf("definition: step %d: an http_request step takes no content or channel_id", i))
+			}
+			if err := validateHTTPStep(i, st.URL, st.Headers); err != nil {
+				return def, err
+			}
+		default:
 			return def, apperr.Invalid(fmt.Sprintf("definition: step %d: unknown kind %q", i, st.Kind))
-		}
-		if st.Content == "" || len(st.Content) > maxContentLen {
-			return def, apperr.Invalid(fmt.Sprintf("definition: step %d: content 1..%d chars", i, maxContentLen))
-		}
-		if err := validateStepContent(i, st.Content); err != nil {
-			return def, err
-		}
-		switch scopeType {
-		case ScopeChannel:
-			// A channel-scope rule may not reach outside its channel.
-			if st.ChannelID != 0 && st.ChannelID != scopeID {
-				return def, apperr.Invalid(fmt.Sprintf("definition: step %d: a channel-scope rule posts only to its own channel", i))
-			}
-		case ScopeOrg:
-			if st.ChannelID == 0 {
-				return def, apperr.Invalid(fmt.Sprintf("definition: step %d: channel_id required for org scope", i))
-			}
-			var ok bool
-			if err := tx.QueryRow(ctx, `
-				SELECT EXISTS (SELECT 1 FROM channel
-				  WHERE id = $1 AND org_id = $2 AND archived_at IS NULL)`,
-				st.ChannelID, orgID).Scan(&ok); err != nil {
-				return def, apperr.Internal("channel lookup", err)
-			}
-			if !ok {
-				return def, apperr.NotFound(fmt.Sprintf("definition: step %d: channel not found", i))
-			}
 		}
 	}
 	return def, nil
@@ -433,8 +457,15 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 			if *p.Enabled && actorUserID != nil && consentAt == nil {
 				return apperr.Conflict("actor consent required before enabling")
 			}
-			if _, err := tx.Exec(ctx,
-				`UPDATE automation SET enabled = $2, updated_at = now() WHERE id = $1`,
+			// Enabling resets the delivery-health counter (AU-4): a self-serve
+			// re-enable after an auto-disable must get a fresh failure window,
+			// not insta-disable on the stale streak.
+			if _, err := tx.Exec(ctx, `
+				UPDATE automation
+				SET enabled = $2,
+				    delivery_failures = CASE WHEN $2 THEN 0 ELSE delivery_failures END,
+				    updated_at = now()
+				WHERE id = $1`,
 				id, *p.Enabled); err != nil {
 				return apperr.Internal("toggle automation", err)
 			}
@@ -606,6 +637,68 @@ func (s *Service) ListRuns(ctx context.Context, actor auth.Identity, automationI
 				return apperr.Internal("scan run", err)
 			}
 			out = append(out, r)
+		}
+		return rows.Err()
+	})
+	return out, err
+}
+
+// Delivery is one outbound-webhook attempt record (P-24), the AU-4 health
+// dashboard's row. Payload is intentionally omitted from the read model — the
+// dashboard shows delivery health, not the (potentially large) event snapshot.
+type Delivery struct {
+	ID             int64      `json:"delivery_id"`
+	AutomationID   int64      `json:"automation_id"`
+	RunID          int64      `json:"run_id"`
+	URL            string     `json:"url"`
+	Status         int16      `json:"status"`
+	Attempts       int32      `json:"attempts"`
+	NextAttemptAt  time.Time  `json:"next_attempt_at"`
+	LastStatusCode *int32     `json:"last_status_code,omitempty"`
+	LastError      string     `json:"last_error,omitempty"`
+	CreatedAt      time.Time  `json:"created_at"`
+	DeliveredAt    *time.Time `json:"delivered_at,omitempty"`
+}
+
+// ListDeliveries is the AU-4 delivery-health dashboard (P-24): a rule's
+// outbound webhook attempts, newest first, gated exactly like ListRuns. Rides
+// webhook_delivery_rule_idx (automation_id, id DESC).
+func (s *Service) ListDeliveries(ctx context.Context, actor auth.Identity, automationID int64, limit int) ([]Delivery, error) {
+	if limit <= 0 || limit > 100 {
+		limit = 50
+	}
+	out := []Delivery{}
+	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+		var scopeType int16
+		var scopeID int64
+		err := tx.QueryRow(ctx, `
+			SELECT scope_type, scope_id FROM automation
+			WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL`,
+			automationID, actor.OrgID).Scan(&scopeType, &scopeID)
+		if err != nil {
+			return apperr.NotFound("automation not found")
+		}
+		if err := s.requireScopeAdmin(ctx, tx, actor, scopeType, scopeID); err != nil {
+			return err
+		}
+		rows, err := tx.Query(ctx, `
+			SELECT id, automation_id, run_id, url, status, attempts, next_attempt_at,
+			       last_status_code, last_error, created_at, delivered_at
+			FROM webhook_delivery
+			WHERE automation_id = $1
+			ORDER BY id DESC LIMIT $2`, automationID, limit)
+		if err != nil {
+			return apperr.Internal("list deliveries", err)
+		}
+		defer rows.Close()
+		for rows.Next() {
+			var d Delivery
+			if err := rows.Scan(&d.ID, &d.AutomationID, &d.RunID, &d.URL, &d.Status,
+				&d.Attempts, &d.NextAttemptAt, &d.LastStatusCode, &d.LastError,
+				&d.CreatedAt, &d.DeliveredAt); err != nil {
+				return apperr.Internal("scan delivery", err)
+			}
+			out = append(out, d)
 		}
 		return rows.Err()
 	})

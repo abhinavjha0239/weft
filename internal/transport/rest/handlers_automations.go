@@ -114,6 +114,21 @@ func (a *api) handleListAutomationRuns(w http.ResponseWriter, r *http.Request, i
 	writeJSON(w, http.StatusOK, map[string]any{"runs": out})
 }
 
+func (a *api) handleListAutomationDeliveries(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	autoID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad automation id")
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	out, err := a.Automations.ListDeliveries(r.Context(), id, autoID, limit)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deliveries": out})
+}
+
 // handleSlash records a slash-command invocation (authed); the channel-send
 // gate in the domain authorizes it and multiple rules may fire it.
 func (a *api) handleSlash(w http.ResponseWriter, r *http.Request, id auth.Identity) {
