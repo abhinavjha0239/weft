@@ -526,6 +526,26 @@ func (s *Service) SendToThread(ctx context.Context, actor auth.Identity, threadI
 	return msgID, nil
 }
 
+// RequireChannelSend is the channel-send gate: send_message on the channel's
+// scope chain, live membership, and a non-archived channel — the exact
+// authorization posting into a channel requires. It is the channel branch of
+// requireThreadSend, exported so callers outside messaging (automation's
+// slash-command invocation) run the SAME access control rather than
+// duplicating it. Runs in the caller's transaction.
+func (s *Service) RequireChannelSend(ctx context.Context, tx pgx.Tx, actor auth.Identity, channelID int64) error {
+	chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, channelID)
+	if err != nil {
+		return err
+	}
+	if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
+		return err
+	}
+	if err := s.requireMember(ctx, tx, channelID, actor.UserID); err != nil {
+		return err
+	}
+	return s.requireLiveChannel(ctx, tx, actor.OrgID, channelID)
+}
+
 // requireThreadSend runs the full container gate for posting into a thread
 // and returns its containers — shared by the live send path and the
 // scheduled-delivery runner (which re-checks at fire time: access revoked
@@ -541,17 +561,7 @@ func (s *Service) requireThreadSend(ctx context.Context, tx pgx.Tx, actor auth.I
 	}
 	switch {
 	case channelID != nil:
-		chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, *channelID)
-		if err != nil {
-			return nil, nil, 0, err
-		}
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
-			return nil, nil, 0, err
-		}
-		if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
-			return nil, nil, 0, err
-		}
-		if err := s.requireLiveChannel(ctx, tx, actor.OrgID, *channelID); err != nil {
+		if err := s.RequireChannelSend(ctx, tx, actor, *channelID); err != nil {
 			return nil, nil, 0, err
 		}
 	case dmSpaceID != nil:
