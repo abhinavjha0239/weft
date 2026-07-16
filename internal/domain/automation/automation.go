@@ -153,6 +153,9 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 		if st.Content == "" || len(st.Content) > maxContentLen {
 			return def, apperr.Invalid(fmt.Sprintf("definition: step %d: content 1..%d chars", i, maxContentLen))
 		}
+		if err := validateStepContent(i, st.Content); err != nil {
+			return def, err
+		}
 		switch scopeType {
 		case ScopeChannel:
 			// A channel-scope rule may not reach outside its channel.

@@ -131,7 +131,9 @@ func (r *Runner) sweep(ctx context.Context) {
 	}
 }
 
-// rule is one enabled automation, definition pre-parsed for matching.
+// rule is one enabled automation, definition pre-parsed for matching. compiled
+// holds per-step templating state computed once at load (the literal-side
+// mention parse the guard needs) — never re-parsed per event.
 type rule struct {
 	ID               int64
 	ScopeType        int16
@@ -140,6 +142,7 @@ type rule struct {
 	AllowRuleTrigger bool
 	ActorUserID      *int64
 	Consented        bool
+	compiled         []compiledStep
 }
 
 // ProcessOrg drains the org's pending events, executing every matching
@@ -200,6 +203,7 @@ func (r *Runner) loadRules(ctx context.Context, orgID int64) ([]rule, error) {
 		if err := json.Unmarshal(raw, &rl.Def); err != nil {
 			continue // unparseable definition: skip, never wedge the org
 		}
+		rl.compiled = compileSteps(rl.Def)
 		out = append(out, rl)
 	}
 	return out, rows.Err()
@@ -303,7 +307,27 @@ func (r *Runner) execute(ctx context.Context, orgID int64, rl rule, ev eventlog.
 
 		traces := make([]stepTrace, 0, len(rl.Def.Steps))
 		status := statusSuccess
-		for _, st := range rl.Def.Steps {
+		var payloadRoot any
+		var payloadDecoded bool
+		for i, st := range rl.Def.Steps {
+			// Templated steps interpolate the payload and pass the mention
+			// guard before any write; a static step (every legacy step) posts
+			// its content verbatim. The payload is decoded once, lazily, so a
+			// non-templated rule carries zero added work.
+			body := st.Content
+			if rl.compiled[i].templated {
+				if !payloadDecoded {
+					payloadRoot = decodeUseNumber(ev.Payload)
+					payloadDecoded = true
+				}
+				rendered, rerr := renderStep(i, st.Content, rl.compiled[i].litLabels, payloadRoot)
+				if rerr != nil {
+					traces = append(traces, stepTrace{Kind: st.Kind, Status: "error", Error: rerr.Error()})
+					status = statusFailed
+					break
+				}
+				body = rendered
+			}
 			target := st.ChannelID
 			if target == 0 {
 				target = rl.ScopeID // channel-scope default: its own channel
@@ -313,7 +337,7 @@ func (r *Runner) execute(ctx context.Context, orgID int64, rl rule, ev eventlog.
 				return fmt.Errorf("automation: savepoint: %w", err)
 			}
 			msgID, err := r.msg.PostToChannelAsAutomation(ctx, sp,
-				orgID, *authorID, rl.ID, target, depth+1, st.Content)
+				orgID, *authorID, rl.ID, target, depth+1, body)
 			if err != nil {
 				_ = sp.Rollback(ctx)
 				traces = append(traces, stepTrace{Kind: st.Kind, Status: "error", Error: err.Error()})
