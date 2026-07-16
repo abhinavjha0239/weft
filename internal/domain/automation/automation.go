@@ -49,10 +49,13 @@ const (
 // Definition is the AU-3 canonical automations-as-code document. v1 is the
 // minimal honest vocabulary: one event-pattern trigger, post_message steps.
 // Conditions, templating, schedules, webhooks, LLM steps and approval gates
-// extend this format — they never replace it.
+// extend this format — they never replace it. Conditions is optional: a
+// definition without the key (every rule stored before P-22) stays valid
+// forever, DisallowUnknownFields notwithstanding.
 type Definition struct {
-	Trigger Trigger `json:"trigger"`
-	Steps   []Step  `json:"steps"`
+	Trigger    Trigger     `json:"trigger"`
+	Conditions []Condition `json:"conditions,omitempty"`
+	Steps      []Step      `json:"steps"`
 }
 
 type Trigger struct {
@@ -136,6 +139,9 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 	}
 	if !triggerVerbs[def.Trigger.Verb] {
 		return def, apperr.Invalid(fmt.Sprintf("definition: unknown trigger verb %q", def.Trigger.Verb))
+	}
+	if err := validateConditions(def.Conditions); err != nil {
+		return def, err
 	}
 	if len(def.Steps) == 0 || len(def.Steps) > maxSteps {
 		return def, apperr.Invalid(fmt.Sprintf("definition: 1..%d steps required", maxSteps))

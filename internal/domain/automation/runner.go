@@ -247,10 +247,12 @@ func match(rl rule, ev eventlog.Row) bool {
 	if rl.ActorUserID != nil && !rl.Consented {
 		return false
 	}
-	if rl.ScopeType == ScopeChannel {
-		return eventChannel(ev.Payload) == rl.ScopeID
+	if rl.ScopeType == ScopeChannel && eventChannel(ev.Payload) != rl.ScopeID {
+		return false
 	}
-	return true
+	// Conditions (AU-1 filters) are the last gate, evaluated in memory: a miss
+	// returns false so execute() is never reached and NO run row is written.
+	return matchConditions(rl.Def.Conditions, ev.Payload)
 }
 
 type stepTrace struct {
