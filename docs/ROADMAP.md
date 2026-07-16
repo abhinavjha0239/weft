@@ -1418,6 +1418,338 @@ link graph / blocked-by rollups; cross-space consent ceremony.
 
 ---
 
+### The automation cluster ships SERIALLY: P-22 → P-23 → P-24
+All three rewrite the SAME functions (`Definition`/`validateDefinition`
+in automation.go, `match`/`execute` in runner.go) — parallel branches
+would guarantee semantic merge conflicts in injection-sensitive code.
+Each slice branches off dev only AFTER the previous one has merged,
+and each spec assumes its predecessor is in the tree. Migration
+numbers are fixed by this order: P-23 = 0017, P-24 = 0018.
+
+### P-22 `automation: Conditions and templating.` — M — **SPEC-READY (serial 1/3; injection-sensitive — follow the guard design EXACTLY)**
+ZERO migrations: `automation.definition` is JSONB and the 0006 comment
+already reads "trigger → conditions → steps". Read automation.go
+(Definition/validateDefinition), runner.go (match/execute, how
+`ev.Payload` flows), content/parse.go + content.go (goldmark parse,
+`@**Full Name**` mention syntax, `NodeMention`, how labels render, the
+`MentionResolver` seam — a resolver returning ok=false still creates
+the mention NODE with its label), and the four trigger verbs' payload
+append sites (threads.go message.created; reactions.go;
+worktrack.go workitem.created/status_changed) first.
+**Design (decided):**
+- **Conditions** — Definition gains `Conditions []Condition` (optional;
+  absent = legacy definitions stay valid forever; DisallowUnknownFields
+  stays on). `Condition{Path, Op, Value}`; ≤10, ANDed. Path grammar:
+  `event.` + 1..5 dot segments of `[a-z0-9_]+`, resolved into the
+  trigger event's payload. Ops: `eq`/`ne` (number|string|bool,
+  same-JSON-type only), `gt`/`lt`/`gte`/`lte` (numbers only),
+  `contains` (string substring), `in` (array of ≤20 same-type scalars),
+  `exists`/`not_exists` (Value must be ABSENT — 400 otherwise).
+  validateDefinition 400s bad path syntax, unknown ops, and
+  type-invalid values per op.
+- **STRICT typing, no coercion ever**: `"42"` never equals `42`.
+  Decode `ev.Payload` ONCE per evaluation with
+  `json.Decoder.UseNumber()` — BIGINT ids exceed float64's 2^53, so
+  `eq`/`ne`/`in` on numbers compare the canonical `json.Number` string
+  when both sides are integers (no `.`/`e`), else via Float64;
+  `gt`/`lt`/`gte`/`lte` compare Float64. Missing path: only
+  `exists`/`not_exists` can pass; a present-but-null value counts as
+  absent (document in the code).
+- **Conditions evaluate inside `match()`** (in-memory, before any DB
+  work): a condition miss creates NO run row — deliberate at Slack
+  scale (an org-wide message.created rule with conditions must not
+  write one row per non-matching message). The AU-2 dry-run/expression
+  debugger is the recorded gap for "why didn't it fire".
+- **Templating** — `{{event.path}}` spans in `post_message` Content
+  only (same path grammar). validateDefinition scans content: every
+  `{{…}}` span must parse as a valid path (400 else); ≤20 spans; text
+  outside valid spans is untouched. At execute, per step: resolve
+  against the UseNumber-decoded payload — string verbatim,
+  `json.Number` verbatim, bool `true`/`false`, missing/null → `""`;
+  object/array → the step FAILS with trace error "path resolves to a
+  non-scalar". Post-expansion content must be 1..4000 chars, else the
+  step fails (never silently truncate).
+- **Mention-injection guard (the load-bearing security assertion).**
+  Payloads today carry no free text, but P-23 adds webhook bodies and
+  slash text — attacker-influenced values MUST NOT mint mentions
+  (`@**Name**` fans out real notifications via `doc.Mentions()`).
+  The guard is STRUCTURAL, not escaping: (1) at validate time, parse
+  the literal step content (no-op resolver) and 400 if any mention
+  node's LABEL contains a template span — authors may not template
+  inside mention syntax (the mention-a-variable-user feature is a
+  recorded gap; it returns later as an id-typed step field, which is
+  injection-free by construction); (2) at execute time, parse the
+  EXPANDED content (no-op resolver) and require its mention-label
+  MULTISET to equal the literal content's — any drift fails the step
+  with trace error "template expansion may not alter mentions".
+  Multiset equality (not node COUNT) is required: a crafted value can
+  backslash-suppress a literal mention while smuggling a new one for a
+  net-zero count. Formatting injection from values (bold/code spans)
+  is cosmetic and accepted — record it. The literal-side parse happens
+  once per rule load, not per event.
+**Edge cases:** legacy definitions (no `conditions` key, no spans)
+behave exactly as today; `{{` without a valid path inside → 400 at
+write, never a runtime surprise; unknown-at-runtime path → `""`;
+condition on a P-23 verb's nested field (`event.body.x`) works via the
+dot path; strict-type mismatch (string vs number) is simply false, not
+an error.
+**Tests (`TestAutomationConditions` + `TestAutomationTemplating`, real
+Postgres, end-to-end through the runner like `TestAutomationRunner`):**
+unit tables for the path parser, condition eval (every op, strict-type
+mismatches, integer-exact eq beyond 2^53, null-as-absent), and the
+template scanner. E2E: an eq condition on channel_id gates a rule (one
+channel fires, the other doesn't — and the non-matching event leaves
+NO run row, asserted); `in`/`exists`; a workitem.created rule posting
+"New item {{event.key}}" produces the real key; non-scalar path and
+post-expansion overflow both surface as failed runs with the trace
+error. **Mention smuggle e2e:** append a synthetic event via
+`eventlog.Append` in the test whose payload carries
+`"x": "@**<real member name>**"`, rule content `{{event.x}}` → the
+step FAILS, no message posts, no mention notification exists.
+RED/GREEN (pin in a comment): neuter the label-multiset comparison →
+the smuggled mention posts, `doc.Mentions()` fans out, and the
+no-notification assert goes red. Second pin: allow type coercion in
+`eq` → `"42"` matches `42` and the strict-typing assert goes red.
+**Gaps to record:** OR/if-else condition groups; query conditions
+(ADR-010 DSL); user/group conditions; for-each + `{{issue}}`-style
+rebinding (AU-1); dry-run + expression preview (AU-2); template
+filters/`{{json …}}`; mention-a-variable-user as an id-typed field;
+templating in step kinds beyond post_message.
+
+### P-23 `automation: Schedules, inbound webhooks, slash triggers.` — L — **SPEC-READY (serial 2/3; dispatch only after P-22 merges)**
+Migration `0017_automation_triggers.sql`: `ALTER TABLE automation ADD
+COLUMN schedule_next_at TIMESTAMPTZ, ADD COLUMN webhook_token TEXT;`
+plus `CREATE INDEX automation_schedule_due_idx ON automation
+(schedule_next_at) WHERE schedule_next_at IS NOT NULL AND enabled AND
+deleted_at IS NULL;` (the claim query's exact predicate). Read
+runner.go (Run/sweep/match/execute), automation.go (Create/Update —
+where enabled/definition transitions happen), messaging's scheduled
+loop (`RunScheduledLoop` — the claim pattern), the P-16 public
+endpoints + P-20 unsubscribe (the outside-withAuth precedent), and
+ratelimit usage in router.go first.
+**Design (decided):**
+- **Trigger kinds** — `Trigger{Kind, Verb, Schedule *Schedule,
+  Command}`. Kind absent = `"event"` (every stored definition stays
+  valid; normalize on load). `event` → Verb from triggerVerbs as
+  today. `schedule` → Schedule required. `webhook`/`slash` → no Verb.
+  The three internal verbs (`automation.schedule_due`,
+  `automation.webhook_received`, `automation.slash_invoked`) NEVER
+  enter triggerVerbs — they are not event-pattern-subscribable;
+  matching is targeted (below). P-22's conditions + templating apply
+  to ALL kinds (`{{event.body.x}}` on webhook, `{{event.text}}` on
+  slash — this is exactly why P-22's mention guard landed first).
+- **Schedule grammar** (structured; no cron dep — go.mod stays clean):
+  `{"every":"minutes","n":N≥5}` | `{"every":"hour","minute":0..59}` |
+  `{"every":"day","at":"HH:MM"}` | `{"every":"week","on":"mon".."sun",
+  "at":"HH:MM"}`, optional `"tz"` = IANA name validated via
+  `time.LoadLocation` (default UTC). `nextFire(sched, now, loc)` is a
+  pure function, unit-tested including DST transitions (a nonexistent
+  wall-clock time normalizes forward — assert the exact instants) and
+  week rollover. Cron-string grammar is a recorded gap.
+- **schedule_next_at lifecycle**: computed on enable (Update
+  enabled=true with a schedule trigger); NULLed on disable; recomputed
+  on definition change while enabled. Create stores rules DISABLED so
+  it never sets one. The F-13 arc composes: a definition edit on a
+  human-actor rule disables it, which NULLs schedule_next_at.
+- **Scheduler lane** (a goroutine in Runner.Run beside sweep, every
+  30s): one tx — `SELECT id, org_id, definition FROM automation WHERE
+  schedule_next_at <= now() AND enabled AND deleted_at IS NULL FOR
+  UPDATE SKIP LOCKED LIMIT 100`; per row compute + UPDATE the next
+  fire and `eventlog.Append` verb `automation.schedule_due`,
+  `ActorSystem`, EntityAutomation/rule id, payload `{automation_id,
+  scheduled_for}` — all in that tx. The existing consumer picks it up
+  (NOTIFY fires from Append). Idempotency is the existing
+  `(automation, trigger_event_id)` run key. Downtime: a missed slot
+  fires ONCE on recovery and the next fire computes FROM NOW — no
+  burst catch-up (document).
+- **Inbound webhook** — `POST /api/v1/hooks/rules/{id}/{token}`,
+  UNAUTHENTICATED, outside withAuth (unsubscribe precedent), behind
+  the per-IP authLimit AND a new per-RULE limiter (~1 rps burst 10 —
+  this is also the bound on external-service echo loops; over → 429).
+  Auth: load the rule (org-agnostic by id), require enabled AND
+  deleted_at IS NULL AND trigger kind webhook AND constant-time token
+  match (`subtle.ConstantTimeCompare` over sha256s of both) — EVERY
+  auth failure (absent id, wrong token, disabled, wrong kind) is one
+  indistinguishable 404. Then: body ≤64KB and `json.Valid` (else
+  400/413 — only AFTER auth passed), append verb
+  `automation.webhook_received`, `ActorSystem`, payload
+  `{automation_id, body: <raw json>}` → 202 `{"ok":true}`. Sender
+  retries create distinct runs (at-least-once from the sender's view;
+  a dedupe key is a recorded gap).
+- **webhook_token**: 32 bytes crypto/rand hex, minted when a
+  definition's trigger becomes kind webhook, NULLed when it stops
+  being one; surfaced to scope admins in List (that surface is already
+  requireScopeAdmin-gated — the capability-URL model, documented);
+  `POST /api/v1/automations/{id}/webhook-token` (scope-admin)
+  rotates + event `automation.webhook_token_rotated` (the token itself
+  NEVER appears in any event payload or log line).
+- **Slash trigger** — Definition: `{"kind":"slash","command":X}`,
+  command `^[a-z0-9][a-z0-9_-]{0,31}$`. Invocation:
+  `POST /api/v1/automations/slash {command, channel_id, text?}`,
+  authed. Gate = the channel SEND gate (VerbSendMessage + membership +
+  live channel): do this as a small PREP COMMIT exporting the existing
+  channel-send gate from messaging (requireThreadSend's channel
+  branch) so automation calls it — NEVER duplicate access control.
+  text ≤2000 runes, control chars stripped (the P-29 sanitizer
+  precedent). Append verb `automation.slash_invoked`, `ActorHuman` +
+  the caller's id, payload `{command, channel_id, user_id, text}` →
+  202. The response cannot know which rules fire (the runner is
+  async); runs are the debugger (AU-2). Multiple rules may match one
+  command — OQ-AU12 stays open, recorded.
+- **match() extension** — kind event: today's path + conditions. Kind
+  schedule/webhook: verb match AND `payload.automation_id == rl.ID`
+  (targeted — these events can never fire another rule). Kind slash:
+  verb match AND command equal AND scope covers `payload.channel_id`
+  (org scope: any channel; channel scope: equal). Depth: none of the
+  three carries an automation_depth hint → depth 0; cascades from
+  their runs inherit depth+1 exactly as today.
+**Edge cases:** disabled rules never claim (index predicate + WHERE,
+belt and braces); a schedule rule that is enabled but has a NULL
+next_at (crash between writes) is caught by recompute-on-enable — the
+claim never invents fires; webhook to a channel-scope rule still obeys
+"posts only its own channel" (validateDefinition already enforces);
+foreign-org ids in slash payloads impossible (actor-org-pinned send
+gate); two rules with the same slash command both fire.
+**Tests (`TestAutomationSchedules` / `TestAutomationWebhooks` /
+`TestAutomationSlash`, real Postgres):** nextFire unit table (all four
+grammars, DST skip, week rollover, n<5 and bad tz → 400). Schedules
+e2e: enable computes next_at; force next_at into the past, run the
+claim, exactly ONE run fires and next_at moves forward; a second claim
+fires nothing; disable NULLs. Webhooks e2e: happy 202 → run executes
+with `{{event.body.x}}` template flowing; wrong token / unknown id /
+disabled rule / non-webhook rule → four IDENTICAL 404s; oversize 413;
+invalid JSON 400; per-rule 429 after the burst. Slash e2e: a member
+fires the rule (text templated into the post); org-scope rule fires
+from any channel, channel-scope only from its own; a NON-member
+invoking against a private channel gets the send gate's oracle-free
+denial. RED/GREEN (pin in comments): (1) neuter the token comparison
+(accept any token) → the wrong-token 404 assert goes red — the
+load-bearing line; (2) drop the membership check from the slash gate
+→ the non-member denial assert goes red.
+**Gaps to record:** cron-string grammar; sender dedupe key;
+Slack-payload-compatible inbound posting (that's P-27's
+slack_incoming, a different feature); slash discovery/autocomplete +
+namespace collisions (OQ-AU12); per-org scheduler sharding at fleet
+scale; catch-up policy knobs.
+
+### P-24 `automation: Outbound HTTP steps + delivery health.` — L — **SPEC-READY (serial 3/3; dispatch only after P-23 merges; egress-sensitive — the P-15 guard is LAW)**
+Migration `0018_webhook_delivery.sql`: `CREATE TABLE webhook_delivery
+(id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, org_id BIGINT NOT
+NULL REFERENCES org (id), automation_id BIGINT NOT NULL REFERENCES
+automation (id), run_id BIGINT NOT NULL REFERENCES automation_run
+(id), url TEXT NOT NULL, payload JSONB NOT NULL, status SMALLINT NOT
+NULL DEFAULT 1, -- 1 pending · 2 delivered · 3 failed (terminal)
+attempts INT NOT NULL DEFAULT 0, next_attempt_at TIMESTAMPTZ NOT NULL
+DEFAULT now(), last_status_code INT, last_error TEXT NOT NULL DEFAULT
+'', created_at TIMESTAMPTZ NOT NULL DEFAULT now(), delivered_at
+TIMESTAMPTZ);` + `webhook_delivery_due_idx ON (next_attempt_at) WHERE
+status = 1` + `webhook_delivery_rule_idx ON (automation_id, id DESC)`
++ `ALTER TABLE automation ADD COLUMN delivery_failures INT NOT NULL
+DEFAULT 0;` (consecutive terminal failures — O(1) health state). Read
+internal/platform/egress/egress.go IN FULL (the P-15 guard: vetURL,
+vetAddr, the pinned dialer, AllowLoopbackForTests), its test harness,
+unfurl's runner (how egress wires + body caps), P-25's notifyFailure,
+and the P-22/P-23 definition code first.
+**Design (decided):**
+- **Step kind `http_request`**: `{kind, url, headers?}`. URL is STATIC
+  and vetURL-shape-checked at definition time (http/https, no
+  userinfo, standard ports) — **NO templating in URLs, ever**
+  (attacker-influenced text choosing the destination is the
+  SSRF-adjacent shape the guard exists to kill; 400 any `{{` in a
+  url). headers: ≤5, name `[A-Za-z0-9-]{1,64}` case-insensitively NOT
+  in {host, content-length, content-type, transfer-encoding,
+  connection, user-agent}, value ≤512 printable chars with CR/LF
+  rejected (header injection — validate at write for early feedback;
+  Authorization IS allowed — that's the auth use-case, and definition
+  visibility is already scope-admin-gated, the Jira model). Method:
+  POST only v1. ≤3 http steps per definition; Content/ChannelID must
+  be absent on http steps (400).
+- **NO author body templating v1** — the request body is a FIXED
+  server-marshaled envelope: `{"automation_id", "automation_name",
+  "run_id", "delivery_id", "attempt", "event": {"id", "verb",
+  "occurred_at", "payload"}}`. The receiver gets the whole trigger
+  event — strictly more than templates could extract — and the
+  JSON-injection + template-SSRF classes are deleted outright. Custom
+  body shapes are a recorded gap (they return with the template
+  grammar's maturity). Content-Type application/json; UA from egress
+  opts.
+- **execute() enqueues, never dials**: an http step INSERTs a
+  webhook_delivery row (payload = the event snapshot object) in the
+  run's own tx — atomic with the run — and traces
+  `{kind, status: "queued", delivery_id}`. A queued-only run finishes
+  success; delivery outcome is tracked on the delivery row (document:
+  run status = "did the steps dispatch", delivery status = "did the
+  endpoint accept"). This is why a slow endpoint can NEVER stall the
+  org's event cursor (AU-4 per-org-queue spirit).
+- **egress gains `Post(ctx, url, headers, body)`** beside Get — same
+  vetURL, same pinned dialer, same no-credential policy, and for POST
+  the CheckRedirect REFUSES (a 30x is a delivery failure: re-sending a
+  body cross-host after a redirect is a header/credential-leak shape;
+  unfurl's Get keeps its redirect budget untouched).
+- **Delivery lane** (Runner goroutine, every 15s): claim `SELECT …
+  FROM webhook_delivery WHERE status = 1 AND next_attempt_at <= now()
+  FOR UPDATE SKIP LOCKED LIMIT 50`, attempt WHILE HOLDING the row lock
+  (SKIP LOCKED means no other worker waits; a crash mid-send releases
+  the lock and the row retries = AT-LEAST-ONCE, the webhook industry
+  norm — receivers dedupe on `delivery_id`, document it; the mail
+  lane's mark-then-send at-most-once is the OPPOSITE trade and stays
+  as-is). 2xx → delivered. Failure → attempts++, next_attempt_at =
+  now + {1m, 5m, 30m}[attempt-1]; the 4th failure is TERMINAL (status
+  3). An `egress.ErrDisallowed` rejection is terminal IMMEDIATELY (the
+  destination will never become allowed — no retries). Response read
+  ≤64KB; record last_status_code + first 256 bytes into last_error on
+  failure.
+- **Health = alert-before-auto-disable (AU-4), O(1)**: on delivered →
+  `UPDATE automation SET delivery_failures = 0`; on TERMINAL failure →
+  `delivery_failures = delivery_failures + 1 RETURNING` — at exactly
+  5 and 15, notify the rule's write-gate holders (the P-25
+  recipients/dedupe machinery, kind 6; the 15 message is "disable
+  imminent"); at 20 → `enabled = false` + event
+  `automation.auto_disabled {automation_id, consecutive_failures}` +
+  a final notification. **Update(enabled=true) resets
+  delivery_failures to 0** — self-serve re-enable (AU-4) must get a
+  fresh window, not insta-disable on stale history. Success also
+  resets. Numbers are consts v1 (config knobs = gap).
+- **`GET /api/v1/automations/{id}/deliveries?limit`** — scope-admin
+  gated exactly like ListRuns, newest first: the AU-4 health dashboard
+  v1.
+**Edge cases:** a PUBLIC literal-IP url is allowed (same as unfurl —
+vetAddr at dial is the gate, not the shape); DNS rebinding is already
+dead (the P-15 pinned dialer — reuse its fake-resolver test harness);
+guard rejections count toward delivery_failures (a private-IP url IS a
+failing endpoint); 3xx = failure; timeout = retryable; the delivery
+lane is global across orgs v1 (batch 50 bounds per-tick starvation;
+per-org fairness = recorded gap); rule deleted with deliveries pending
+→ the claim skips them? No — deliveries execute regardless (the run
+already committed; a soft-deleted rule's queued deliveries drain,
+document) but auto-disable of a deleted rule is a no-op.
+**Tests (`TestAutomationHTTPSteps`, real Postgres + httptest with the
+egress AllowLoopbackForTests option, exactly like the P-15 tests):**
+happy path: rule fires → run success with queued trace → lane
+delivers → envelope body asserted (event payload, delivery_id,
+attempt) → status delivered + delivery_failures reset. Retry: endpoint
+500s twice then 200s → attempts=3, delivered (drive time by UPDATEing
+next_attempt_at, the fixture pattern). Terminal after 4 failures.
+**SSRF: a step url resolving to a private address (fake resolver) →
+delivery TERMINAL with ErrDisallowed and the endpoint proves it was
+NEVER dialed.** Health: drive 20 terminal failures → admins notified
+at 5 and 15, rule auto-disabled + event at 20; re-enable → next single
+failure does NOT insta-disable (counter reset asserted). Validation
+400s: templated url, bad header name/value, CR/LF value, >3 http
+steps, Content on an http step. RED/GREEN (pin in comments): (1)
+bypass the egress client (plain http.Client) for the send → the
+private-address delivery SUCCEEDS and the never-dialed assert goes
+red — the load-bearing line; (2) drop the counter reset from
+Update(enabled=true) → the re-enable test insta-disables and goes
+red.
+**Gaps to record:** custom body templating; non-POST methods; HMAC
+request signing; per-endpoint (vs per-rule) health; delivery-row
+retention/purge lane (compliance janitor candidate); config-able
+thresholds/backoff; per-org delivery fairness; redirect-following
+opt-in.
+
+---
+
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
 (Each needs a final-spec pass by the strongest model; the bullets below
 record the scope and the known design questions so nothing is lost.)
@@ -1444,15 +1776,17 @@ record the scope and the known design questions so nothing is lost.)
 - **P-20** — **promoted to Tier 1** (full spec above).
 - **P-21 `notification: Push medium.`** L — NEEDS-DESIGN: web-push
   (VAPID) vs FCM seam; device registration table (needs migration).
-- **P-22 `automation: Conditions and templating.`** M — field-compare
-  conditions + `{{event.*}}` substitution in post_message. OPEN: exact
-  template grammar + escaping rules (spec carefully — injection).
-- **P-23 `automation: Schedules, inbound webhooks, slash triggers.`** L
-  — cron triggers (due-runner exists as pattern), signed inbound
-  webhook endpoint, slash-command trigger. OPEN: webhook auth model.
-- **P-24 `automation: Outbound HTTP steps + delivery health.`** L —
-  NEEDS-DESIGN: SSRF guard (shares P-15's egress design), retry/backoff,
-  alert-before-auto-disable (AU-4).
+- **P-22** — **promoted to Tier 1** (full spec above; zero migrations —
+  pure definition-format extension; mention-injection guard decided:
+  structural label-multiset comparison, not escaping).
+- **P-23** — **promoted to Tier 1** (full spec above; migration 0017;
+  webhook auth model decided: capability token in path, constant-time
+  compare, oracle-free 404; schedule grammar structured, no cron dep).
+- **P-24** — **promoted to Tier 1** (full spec above; migration 0018;
+  designs decided: async delivery lane behind the P-15 egress guard,
+  static URLs + fixed envelope [no body templating v1], O(1)
+  consecutive-failure health with alert at 5/15 and auto-disable at
+  20, reset on re-enable).
 - **P-25** — **promoted to Tier 1** (full spec above).
 - **P-26 `automation: LLM steps + budgets + approval gates.`** XL —
   NEEDS-DESIGN: model gateway seam, budget metering, run status 8 flow.
