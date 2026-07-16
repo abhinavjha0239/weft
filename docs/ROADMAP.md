@@ -1426,7 +1426,7 @@ Each slice branches off dev only AFTER the previous one has merged,
 and each spec assumes its predecessor is in the tree. Migration
 numbers are fixed by this order: P-23 = 0017, P-24 = 0018.
 
-### P-22 `automation: Conditions and templating.` — M — **SPEC-READY (serial 1/3; injection-sensitive — follow the guard design EXACTLY)**
+### P-22 `automation: Conditions and templating.` — M — **[x] shipped #97** (Opus-executed; mention-multiset guard + strict-eq-typing red/green-proven)
 ZERO migrations: `automation.definition` is JSONB and the 0006 comment
 already reads "trigger → conditions → steps". Read automation.go
 (Definition/validateDefinition), runner.go (match/execute, how
@@ -1516,7 +1516,7 @@ rebinding (AU-1); dry-run + expression preview (AU-2); template
 filters/`{{json …}}`; mention-a-variable-user as an id-typed field;
 templating in step kinds beyond post_message.
 
-### P-23 `automation: Schedules, inbound webhooks, slash triggers.` — L — **SPEC-READY (serial 2/3; dispatch only after P-22 merges)**
+### P-23 `automation: Schedules, inbound webhooks, slash triggers.` — L — **[x] shipped #98** (Opus-executed; webhook-token + slash-membership red/green-proven; review folded in a scheduler busy-loop fix + a DST-gap past-fire fix)
 Migration `0017_automation_triggers.sql`: `ALTER TABLE automation ADD
 COLUMN schedule_next_at TIMESTAMPTZ, ADD COLUMN webhook_token TEXT;`
 plus `CREATE INDEX automation_schedule_due_idx ON automation
@@ -1632,7 +1632,7 @@ slack_incoming, a different feature); slash discovery/autocomplete +
 namespace collisions (OQ-AU12); per-org scheduler sharding at fleet
 scale; catch-up policy knobs.
 
-### P-24 `automation: Outbound HTTP steps + delivery health.` — L — **SPEC-READY (serial 3/3; dispatch only after P-23 merges; egress-sensitive — the P-15 guard is LAW)**
+### P-24 `automation: Outbound HTTP steps + delivery health.` — L — **[x] shipped #99** (egress-sensitive; executor drafted then hit its session limit, reviewer-completed; egress-bypass + reset-drop red/green-proven — the security/compliance-grade review standard)
 Migration `0018_webhook_delivery.sql`: `CREATE TABLE webhook_delivery
 (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY KEY, org_id BIGINT NOT
 NULL REFERENCES org (id), automation_id BIGINT NOT NULL REFERENCES
@@ -1776,17 +1776,15 @@ record the scope and the known design questions so nothing is lost.)
 - **P-20** — **promoted to Tier 1** (full spec above).
 - **P-21 `notification: Push medium.`** L — NEEDS-DESIGN: web-push
   (VAPID) vs FCM seam; device registration table (needs migration).
-- **P-22** — **promoted to Tier 1** (full spec above; zero migrations —
-  pure definition-format extension; mention-injection guard decided:
-  structural label-multiset comparison, not escaping).
-- **P-23** — **promoted to Tier 1** (full spec above; migration 0017;
-  webhook auth model decided: capability token in path, constant-time
-  compare, oracle-free 404; schedule grammar structured, no cron dep).
-- **P-24** — **promoted to Tier 1** (full spec above; migration 0018;
-  designs decided: async delivery lane behind the P-15 egress guard,
-  static URLs + fixed envelope [no body templating v1], O(1)
-  consecutive-failure health with alert at 5/15 and auto-disable at
-  20, reset on re-enable).
+- **P-22** — **[x] shipped #97** (mention-injection guard is the
+  structural label-multiset comparison, not escaping, as decided).
+- **P-23** — **[x] shipped #98** (migration 0017; capability-token
+  webhooks, constant-time compare, oracle-free 404; structured
+  schedule grammar, no cron dep).
+- **P-24** — **[x] shipped #99** (migration 0018; async delivery lane
+  behind the P-15 egress guard, static URLs + fixed envelope, O(1)
+  health with alert at 5/15 and auto-disable at 20, reset on
+  re-enable). Closes the automation cluster.
 - **P-25** — **promoted to Tier 1** (full spec above).
 - **P-26 `automation: LLM steps + budgets + approval gates.`** XL —
   NEEDS-DESIGN: model gateway seam, budget metering, run status 8 flow.
