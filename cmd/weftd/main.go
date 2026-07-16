@@ -170,6 +170,8 @@ func serve(ctx context.Context, cfg config.Config) error {
 	identitySvc := identity.New(pool, permsSvc)
 	identitySvc.SetMailer(sender) // P-35 password-reset mail via the mail seam
 	msgSvc := messaging.New(pool, permsSvc)
+	autoSvc := automation.New(pool, permsSvc)
+	autoSvc.SetMessaging(msgSvc) // the slash-command channel-send gate
 	go automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log).Run(ctx)
 	go msgSvc.RunScheduledLoop(ctx, log)
 	filesSvc := files.New(pool, store)
@@ -199,7 +201,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		Notifications: notifSvc,
 		Files:         filesSvc,
 		Compliance:    complianceSvc,
-		Automations:   automation.New(pool, permsSvc),
+		Automations:   autoSvc,
 		Unfurl:        unfurlSvc,
 	})
 	ui, err := webui.Handler()

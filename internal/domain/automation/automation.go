@@ -24,6 +24,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
@@ -33,11 +34,17 @@ import (
 type Service struct {
 	pool  *pgxpool.Pool
 	perms *perms.Service
+	// msg backs the slash-command invocation's channel-send gate; wired via
+	// SetMessaging so access control lives in messaging, never duplicated here.
+	msg *messaging.Service
 }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
 	return &Service{pool: pool, perms: p}
 }
+
+// SetMessaging wires the messaging service used by the slash-command gate.
+func (s *Service) SetMessaging(m *messaging.Service) { s.msg = m }
 
 // Automation scope types (automation.scope_type). Like retention scopes,
 // only the rungs with real gates exist: org (manage_org) and channel

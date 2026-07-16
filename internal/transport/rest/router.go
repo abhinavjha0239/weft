@@ -248,6 +248,7 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/automations/{id}/runs", a.withAuth(a.handleListAutomationRuns))
 	// P-23 slash + webhook triggers. The slash invocation is authed; the
 	// webhook-token rotation is scope-admin (gated in the domain).
+	mux.HandleFunc("POST /api/v1/automations/slash", a.withAuth(a.handleSlash))
 	mux.HandleFunc("POST /api/v1/automations/{id}/webhook-token", a.withAuth(a.handleRotateWebhookToken))
 	// The inbound webhook is UNAUTHENTICATED (the token in the path IS the
 	// capability), so it sits OUTSIDE withAuth behind only the per-IP authLimit

@@ -114,6 +114,25 @@ func (a *api) handleListAutomationRuns(w http.ResponseWriter, r *http.Request, i
 	writeJSON(w, http.StatusOK, map[string]any{"runs": out})
 }
 
+// handleSlash records a slash-command invocation (authed); the channel-send
+// gate in the domain authorizes it and multiple rules may fire it.
+func (a *api) handleSlash(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	type req struct {
+		Command   string `json:"command"`
+		ChannelID int64  `json:"channel_id"`
+		Text      string `json:"text"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Automations.Slash(r.Context(), id, in.Command, in.ChannelID, in.Text); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusAccepted, map[string]bool{"ok": true})
+}
+
 // handleRotateWebhookToken mints a fresh capability token for a webhook rule
 // (scope-admin gated) and returns it — the only surface, besides List, that
 // reveals the token.
