@@ -1759,7 +1759,7 @@ collide: P-21 = 0019, P-30 = 0020; P-18 and P-34 are zero-migration.
 If merge order differs from the numbers, the reviewer renumbers at
 merge.
 
-### P-18 `files: Image thumbnails + inline rendering allowlist.` — M — **SPEC-READY (parallel quartet; decompression-bomb cap is the security pin)**
+### P-18 `files: Image thumbnails + inline rendering allowlist.` — M — **[x] shipped #102** (Opus-executed; decompression-bomb cap red/green-proven; thumb key deviated to a `.thumb/` sibling — reviewer-verified)
 ZERO migrations. A thumbnail is a DERIVED BLOB, not a File: it lives
 at a deterministic key derived from the ORIGINAL's content hash
 (`StorageKey(org, sha) + "/thumb/w480.jpg"`), so org dedup rides free,
@@ -1838,7 +1838,7 @@ queryable column; full-size validated-inline lightbox path; EXIF
 orientation (v1 ignores it — document); libvips behind the seam if
 fleet-scale demands.
 
-### P-34 `channels: Private-channel existence masking.` — S — **SPEC-READY (parallel quartet; zero migrations)**
+### P-34 `channels: Private-channel existence masking.` — S — **[x] shipped #103** (Opus-executed; oracle-indistinguishability red/green-proven; PromoteThread residual leak recorded as a follow-up, not folded in)
 Semantics survey DONE, decision made: private channels 404 like DMs.
 Today is INTERNALLY INCONSISTENT — single-message Get already masks
 (web_public_test.go asserts non-member private Get = 404, the P-33
@@ -1908,7 +1908,7 @@ red (a 403 distinguishes denied-from-absent — the oracle reopens).
 need an invite" hint would re-open the oracle — deliberately NOT
 doing it); P-16's anonymous surface already masks (no change).
 
-### P-21 `notification: Push medium.` — L — **SPEC-READY (parallel quartet; migration 0019; endpoints are user-registered URLs → every send rides the egress guard)**
+### P-21 `notification: Push medium.` — L — **[x] shipped #105** (migration 0019; executor stalled twice, reviewer-completed; RFC 8291 Appendix A vector + egress-bypass + seen-claim red/green-proven)
 Migration `0019_push_subscriptions.sql`: `CREATE TABLE
 push_subscription (id BIGINT GENERATED ALWAYS AS IDENTITY PRIMARY
 KEY, org_id BIGINT NOT NULL REFERENCES org (id), user_id BIGINT NOT
@@ -2017,7 +2017,7 @@ notif_push tri-state override; delivery receipts/collapse keys; rate
 limiting per endpoint origin; push for web-public anonymous (never);
 subscription pruning by age; the client service-worker (client-era).
 
-### P-30 `identity: OIDC login.` — L — **SPEC-READY (parallel quartet; migration 0020; THE new-dependency slice — go-oidc; invite remains the authorization)**
+### P-30 `identity: OIDC login.` — L — **[x] shipped #104** (migration 0020; go-oidc/v3 + x/oauth2; verified-email linking + single-use state both red/green-proven; every IdP dial rides the egress guard)
 Migration `0020_oidc.sql`: `CREATE TABLE auth_provider (id BIGINT
 GENERATED ALWAYS AS IDENTITY PRIMARY KEY, org_id BIGINT NOT NULL
 REFERENCES org (id), name TEXT NOT NULL, -- url-safe slug, unique per
@@ -2151,16 +2151,14 @@ record the scope and the known design questions so nothing is lost.)
 - **P-17** — **promoted to Tier 1** (full spec above; strongest-model
   execution; archive shape decided = in-place tombstone; restore API
   deferred as a recorded gap).
-- **P-18** — **promoted to Tier 1** (full spec above; zero migrations —
-  thumbs are derived blobs keyed off the original's sha; pure-Go
-  imaging via golang.org/x/image behind a seam, no libvips/cgo;
-  decompression-bomb cap is the security pin).
+- **P-18** — **[x] shipped #102** (zero migrations; pure-Go x/image
+  behind a seam, thumbs as derived blobs; bomb-cap pin proven).
+  Opens the mixed quartet.
 - **P-19** — **promoted to Tier 1** (full spec above).
 - **P-20** — **promoted to Tier 1** (full spec above).
-- **P-21** — **promoted to Tier 1** (full spec above; migration 0019;
-  Web Push/VAPID in-house against the RFC 8291 Appendix A vector —
-  no new dep; FCM is a later Sender behind the seam; every send
-  rides the egress guard since endpoints are user-registered URLs).
+- **P-21** — **[x] shipped #105** (migration 0019; in-house Web Push
+  proven against RFC 8291 Appendix A, no new dep; every send through
+  the egress guard; reviewer-completed after the executor stalled).
 - **P-22** — **[x] shipped #97** (mention-injection guard is the
   structural label-multiset comparison, not escaping, as decided).
 - **P-23** — **[x] shipped #98** (migration 0017; capability-token
@@ -2178,19 +2176,18 @@ record the scope and the known design questions so nothing is lost.)
 - **P-28 `importer: Jira.`** XL — deliberately last (M3 exit).
 - **P-29** — **promoted to Tier 1** (full spec above; password RESET
   split out as P-35 — it depends on P-20's mail plumbing).
-- **P-30** — **promoted to Tier 1** (full spec above; migration 0020;
-  library decided: coreos/go-oidc/v3 + x/oauth2 — THE deliberate
-  new-dependency exception; linking = (provider,subject) then
-  verified-email to a live human; NO JIT — the invite remains the
-  authorization).
+- **P-30** — **[x] shipped #104** (migration 0020; go-oidc/v3 +
+  x/oauth2, the deliberate dep exception; verified-email linking, no
+  JIT; single-use state + IdP dials through the egress guard).
 - **P-31** — **promoted to Tier 1** (full spec above).
 - **P-32** — **promoted to Tier 1** (full spec above; raw zip bundle —
   the eDiscovery/partner manifest FORMAT stays here as a later
   refinement).
-- **P-34** — **promoted to Tier 1** (full spec above; zero migrations;
-  decided: private 404s like DMs — messaging was already internally
-  inconsistent (Get masks, lists don't); public keeps 403 (listable),
-  web-public untouched).
+- **P-34** — **[x] shipped #103** (zero migrations; private channels
+  404 like DMs, public keeps 403; oracle-indistinguishability pin
+  proven. Closes the mixed quartet. FOLLOW-UP: worktrack.PromoteThread
+  still 403s a private non-member — a narrow residual oracle to close
+  in a later slice).
 - **P-35** — **promoted to Tier 1** (full spec above; token storage
   decided: DB rows — single-use + revoke-on-change require server
   state).
