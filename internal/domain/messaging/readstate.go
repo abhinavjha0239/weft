@@ -38,7 +38,7 @@ func (s *Service) MarkRead(ctx context.Context, actor auth.Identity, threadID, u
 		}
 		switch {
 		case channelID != nil:
-			if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+			if err := s.requireMember(ctx, tx, actor.OrgID, *channelID, actor.UserID); err != nil {
 				return err
 			}
 		case dmSpaceID != nil:

@@ -154,9 +154,12 @@ func TestAutomationSlash(t *testing.T) {
 		t.Fatalf("note nope posted %d times, want 0 (channel-scope must not fire from another channel)", n)
 	}
 
-	// A non-member invoking against a channel they cannot post to is denied by
-	// the send gate (RED/GREEN pin: dropping requireMember makes this a 202).
-	if code := slash(bobTok, "deploy", secret.ChannelID, "sneaky"); code != http.StatusForbidden {
-		t.Fatalf("non-member slash against a private channel = %d, want 403", code)
+	// A non-member invoking against a PRIVATE channel is denied by the send
+	// gate — now the oracle-free 404 (P-34: the slash rides RequireChannelSend →
+	// requireMember, so a stranger gets the SAME masked denial a send would; a
+	// public channel would still 403). RED/GREEN pin: dropping requireMember
+	// makes this a 202.
+	if code := slash(bobTok, "deploy", secret.ChannelID, "sneaky"); code != http.StatusNotFound {
+		t.Fatalf("non-member slash against a private channel = %d, want 404", code)
 	}
 }

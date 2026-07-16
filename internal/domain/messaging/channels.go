@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 	"strings"
 
 	"github.com/jackc/pgx/v5"
@@ -246,11 +247,32 @@ func (s *Service) ListChannels(ctx context.Context, actor auth.Identity) ([]Chan
 func (s *Service) JoinChannel(ctx context.Context, actor auth.Identity, channelID int64) error {
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		var visibility int16
-		err := tx.QueryRow(ctx,
-			`SELECT visibility FROM channel
-			 WHERE id = $1 AND org_id = $2 AND archived_at IS NULL`,
-			channelID, actor.OrgID).Scan(&visibility)
+		var archived, member bool
+		err := tx.QueryRow(ctx, `
+			SELECT c.visibility, c.archived_at IS NOT NULL,
+			       EXISTS (SELECT 1 FROM channel_member cm
+			               WHERE cm.channel_id = c.id AND cm.user_id = $3
+			                 AND cm.unsubscribed_at IS NULL)
+			FROM channel c
+			WHERE c.id = $1 AND c.org_id = $2`,
+			channelID, actor.OrgID, actor.UserID).Scan(&visibility, &archived, &member)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return apperr.NotFound("channel not found")
+		}
 		if err != nil {
+			return apperr.Internal("join lookup", err)
+		}
+		// P-34: a private channel the caller is not in is masked exactly like an
+		// absent one — a non-member self-join is the oracle-free NotFound, never
+		// the "by invitation" 403 that would confirm the channel exists. A
+		// member falls through to that 403 (self-join is for public/web-public;
+		// a private membership arrives by invitation).
+		if visibility == visibilityPrivate && !member {
+			return apperr.NotFound("channel not found")
+		}
+		// An archived channel is not joinable — the oracle-free NotFound for
+		// everyone, preserving the pre-P-34 archived-filter behavior.
+		if archived {
 			return apperr.NotFound("channel not found")
 		}
 		if visibility != visibilityPublic && visibility != visibilityWebPublic {

@@ -101,10 +101,11 @@ func TestChannelCRUD(t *testing.T) {
 		t.Fatalf("send after join: %d, want 201", code)
 	}
 
-	// Private channels reject self-join.
+	// P-34: a private channel a non-member cannot see masks its existence — a
+	// self-join is the oracle-free 404, not a 403 that would confirm #secrets.
 	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/channels/%d/join", ts.URL, priv.ChannelID),
-		memberTok, map[string]any{}); code != http.StatusForbidden {
-		t.Fatalf("join private: %d, want 403", code)
+		memberTok, map[string]any{}); code != http.StatusNotFound {
+		t.Fatalf("join private: %d, want 404", code)
 	}
 
 	// Leave → membership revoked (send 403 again); re-join restores.

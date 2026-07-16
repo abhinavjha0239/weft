@@ -156,11 +156,12 @@ func TestWebPublicChannels(t *testing.T) {
 		t.Fatalf("non-member web_public POST = %d, want 403", code)
 	}
 
-	// Private stays closed to non-members: 403 on the list, oracle-free 404
-	// on Get.
+	// P-34: a private channel masks its existence from non-members — the thread
+	// list is now the SAME oracle-free 404 as the single-message Get, so a
+	// stranger cannot tell #vault apart from an absent channel.
 	if code := getJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, vault.ChannelID),
-		caseyTok, nil); code != http.StatusForbidden {
-		t.Fatalf("non-member private threads = %d, want 403", code)
+		caseyTok, nil); code != http.StatusNotFound {
+		t.Fatalf("non-member private threads = %d, want 404", code)
 	}
 	if code := getJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, secret.MessageID),
 		caseyTok, nil); code != http.StatusNotFound {
@@ -211,9 +212,11 @@ func TestWebPublicChannels(t *testing.T) {
 	if code := postJSONStatus(t, msgURL, caseyTok, map[string]any{"content": "hi"}); code != http.StatusCreated {
 		t.Fatalf("send after join: want 201")
 	}
+	// P-34: joining a private channel a non-member cannot see is the oracle-free
+	// 404 (masked like an absent channel), not the "by invitation" 403.
 	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/channels/%d/join", ts.URL, vault.ChannelID),
-		caseyTok, map[string]any{}); code != http.StatusForbidden {
-		t.Fatalf("join private = %d, want 403", code)
+		caseyTok, map[string]any{}); code != http.StatusNotFound {
+		t.Fatalf("join private = %d, want 404", code)
 	}
 
 	// The channel.created payload carries both spellings.
@@ -576,8 +579,10 @@ func TestProtectedHistory(t *testing.T) {
 		mia.Token, map[string]any{}); code != http.StatusOK {
 		t.Fatalf("mia leave = %d", code)
 	}
-	if code := getJSON(t, msgsURL, mia.Token, nil); code != http.StatusForbidden {
-		t.Fatalf("mia after leave = %d, want 403", code)
+	// P-34: ledger is protected ⟹ private, so after leaving mia is a non-member
+	// of a private channel — the read is masked to an oracle-free 404.
+	if code := getJSON(t, msgsURL, mia.Token, nil); code != http.StatusNotFound {
+		t.Fatalf("mia after leave = %d, want 404", code)
 	}
 	if err := pool.QueryRow(ctx, `
 		SELECT history_from FROM channel_member
