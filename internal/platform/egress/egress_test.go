@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"net/netip"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -196,5 +198,87 @@ func TestRedirectLoopCapped(t *testing.T) {
 	_, err := c.Get(context.Background(), ts.URL)
 	if err == nil || !strings.Contains(err.Error(), "too many redirects") {
 		t.Fatalf("redirect loop = %v, want too-many-redirects", err)
+	}
+}
+
+// TestPostReachesAllowedTarget: Post sends the body with a POST method, the
+// configured UA, a fixed application/json Content-Type, and the caller's
+// validated headers (Authorization included — the outbound-webhook auth case),
+// ignoring env proxies exactly as Get does.
+func TestPostReachesAllowedTarget(t *testing.T) {
+	var gotMethod, gotUA, gotCT, gotCustom, gotAuth, gotBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotUA = r.UserAgent()
+		gotCT = r.Header.Get("Content-Type")
+		gotCustom = r.Header.Get("X-Custom-Test")
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer ts.Close()
+	t.Setenv("HTTP_PROXY", "http://127.0.0.1:1")
+	t.Setenv("http_proxy", "http://127.0.0.1:1")
+
+	c := New(Options{UserAgent: "weftbot-test/1.0", AllowLoopbackForTests: true})
+	body := []byte(`{"hello":"world"}`)
+	resp, err := c.Post(context.Background(), ts.URL,
+		map[string]string{"X-Custom-Test": "yes", "Authorization": "Bearer tok"}, body)
+	if err != nil {
+		t.Fatalf("Post(httptest) = %v", err)
+	}
+	resp.Body.Close()
+	if gotMethod != http.MethodPost || gotUA != "weftbot-test/1.0" ||
+		gotCT != "application/json" || gotCustom != "yes" ||
+		gotAuth != "Bearer tok" || gotBody != string(body) {
+		t.Fatalf("method %q UA %q CT %q custom %q auth %q body %q",
+			gotMethod, gotUA, gotCT, gotCustom, gotAuth, gotBody)
+	}
+}
+
+// TestPostDoesNotFollowRedirect: a POST that gets a 30x is handed the 3xx
+// response WITHOUT following it — re-POSTing the body cross-host after a
+// redirect is a leak shape. The redirect target is proven never requested.
+func TestPostDoesNotFollowRedirect(t *testing.T) {
+	var landingHits atomic.Int64
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/landing" {
+			landingHits.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		http.Redirect(w, r, "/landing", http.StatusFound)
+	}))
+	defer ts.Close()
+	c := New(Options{UserAgent: "test", AllowLoopbackForTests: true})
+	resp, err := c.Post(context.Background(), ts.URL, nil, []byte(`{}`))
+	if err != nil {
+		t.Fatalf("Post(redirect) = %v, want the 3xx handed back", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusFound {
+		t.Fatalf("status = %d, want 302 (redirect not followed)", resp.StatusCode)
+	}
+	if n := landingHits.Load(); n != 0 {
+		t.Fatalf("redirect target hit %d times, want 0 (POST must not follow)", n)
+	}
+}
+
+// TestPostBlocksPrivateResolution: a hostname resolving to an internal address
+// is rejected by the guard BEFORE any dial, exactly like Get.
+func TestPostBlocksPrivateResolution(t *testing.T) {
+	c := New(Options{
+		UserAgent: "test",
+		LookupIP: fakeLookup(map[string][]string{
+			"internal.test": {"10.0.0.7"},
+		}),
+	})
+	if _, err := c.Post(context.Background(), "http://internal.test/hook", nil, []byte(`{}`)); !errors.Is(err, ErrDisallowed) {
+		t.Fatalf("Post(internal) = %v, want ErrDisallowed", err)
+	}
+	// A bad URL shape (userinfo) is refused before any network work too.
+	if _, err := c.Post(context.Background(), "http://user:pass@example.com/", nil, []byte(`{}`)); !errors.Is(err, ErrDisallowed) {
+		t.Fatalf("Post(userinfo) = %v, want ErrDisallowed", err)
 	}
 }
