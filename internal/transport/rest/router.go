@@ -193,6 +193,11 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("POST /api/v1/notifications/seen", a.withAuth(a.handleMarkNotificationsSeen))
 	mux.HandleFunc("GET /api/v1/notification-prefs", a.withAuth(a.handleListNotificationPrefs))
 	mux.HandleFunc("PUT /api/v1/notification-prefs", a.withAuth(a.handleSetNotificationPref))
+	// P-21 push subscriptions (self-scoped) + VAPID public-key discovery.
+	mux.HandleFunc("POST /api/v1/me/push-subscriptions", a.withAuth(a.handleCreatePushSubscription))
+	mux.HandleFunc("GET /api/v1/me/push-subscriptions", a.withAuth(a.handleListPushSubscriptions))
+	mux.HandleFunc("DELETE /api/v1/me/push-subscriptions/{id}", a.withAuth(a.handleDeletePushSubscription))
+	mux.HandleFunc("GET /api/v1/push/vapid-key", a.withAuth(a.handlePushVAPIDKey))
 	mux.HandleFunc("GET /api/v1/alert-words", a.withAuth(a.handleListAlertWords))
 	mux.HandleFunc("PUT /api/v1/alert-words", a.withAuth(a.handleSetAlertWords))
 	mux.HandleFunc("GET /api/v1/dnd", a.withAuth(a.handleGetDND))

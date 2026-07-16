@@ -32,6 +32,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
 	"github.com/abhinavjha0239/weft/internal/platform/mail"
+	"github.com/abhinavjha0239/weft/internal/platform/webpush"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
 	"github.com/abhinavjha0239/weft/migrations"
@@ -61,10 +62,25 @@ func main() {
 		run(serve)
 	case "import-zulip":
 		run(importZulip)
+	case "gen-vapid-keys":
+		genVAPIDKeys()
 	default:
 		fmt.Printf("%s v%s — %s\n", brand.Name, version, brand.Tagline)
-		fmt.Println("usage: serve | migrate | import-zulip | version")
+		fmt.Println("usage: serve | migrate | import-zulip | gen-vapid-keys | version")
 	}
+}
+
+// genVAPIDKeys prints a fresh Web Push VAPID key pair (P-21) as the two env
+// assignments an operator drops into their config. No DB or config needed —
+// it is a pure key generator, like an ssh-keygen for push.
+func genVAPIDKeys() {
+	pub, priv, err := webpush.GenerateVAPIDKeys()
+	if err != nil {
+		slog.Error("gen-vapid-keys", "err", err)
+		os.Exit(1)
+	}
+	fmt.Printf("%sVAPID_PUBLIC_KEY=%s\n", brand.EnvPrefix, pub)
+	fmt.Printf("%sVAPID_PRIVATE_KEY=%s\n", brand.EnvPrefix, priv)
 }
 
 func run(fn func(context.Context, config.Config) error) {
@@ -166,6 +182,23 @@ func serve(ctx context.Context, cfg config.Config) error {
 	notifSvc := notification.New(pool)
 	notifSvc.SetFanout(hub)
 	notifSvc.SetUnsubscribe(cfg.SigningSecret)
+	// P-21: Web Push. Configured VAPID keys wake the medium — the subscription
+	// API accepts registrations and the lane delivers through the SAME
+	// SSRF-guarded egress client as link previews and webhooks (endpoints are
+	// user-registered URLs). Any of the three set means push is intended, so a
+	// malformed/half-set trio fails fast rather than silently disabling; all
+	// unset → push stays a structural no-op (subscribe 409s). No test options
+	// on the egress client (production never allows loopback).
+	if cfg.VAPIDPublicKey != "" || cfg.VAPIDPrivateKey != "" || cfg.PushSubject != "" {
+		pushSender, err := webpush.NewSender(cfg.VAPIDPublicKey, cfg.VAPIDPrivateKey, cfg.PushSubject)
+		if err != nil {
+			return err
+		}
+		notifSvc.SetPush(pushSender)
+		pushWorker := notification.NewPushWorker(pool, pushSender,
+			egress.New(egress.Options{UserAgent: brand.Name + "Bot/1.0 (+push)"}), log)
+		go pushWorker.Run(ctx)
+	}
 	permsSvc := perms.New(pool)
 	identitySvc := identity.New(pool, permsSvc)
 	identitySvc.SetMailer(sender) // P-35 password-reset mail via the mail seam

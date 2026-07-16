@@ -9,11 +9,13 @@ import (
 
 // Mediums (notification_medium_pref.medium). In-app is structural — the
 // row IS the badge and always lands (N-4: the badge accrues even when
-// delivery is suppressed); prefs govern the mediums BEYOND it. Push is
-// reserved until a push lane exists (the honest-rungs rule).
+// delivery is suppressed); prefs govern the mediums BEYOND it. Push became
+// settable with the P-21 lane (the honest-rungs rule: it was reserved only
+// until the lane existed).
 const (
 	MediumInApp int16 = 1
 	MediumEmail int16 = 2
+	MediumPush  int16 = 3
 )
 
 // defaultEmailEnabled is the zero-rows matrix: email for DMs, mentions,
@@ -65,11 +67,12 @@ func (s *Service) ListMediumPrefs(ctx context.Context, actor auth.Identity) ([]M
 	return out, nil
 }
 
-// SetMediumPref upserts one (kind, medium) knob for the actor. Only the
-// email medium is settable in v1.
+// SetMediumPref upserts one (kind, medium) knob for the actor. The email (2)
+// and push (3) mediums are settable; in-app (1) is structural (the badge
+// always lands). A medium-3 row overrides the push lane's zero-rows default.
 func (s *Service) SetMediumPref(ctx context.Context, actor auth.Identity, kind, medium int16, enabled bool) error {
-	if medium != MediumEmail {
-		return apperr.Invalid("only the email medium (2) is settable — in-app is structural, push is reserved")
+	if medium != MediumEmail && medium != MediumPush {
+		return apperr.Invalid("only the email (2) and push (3) mediums are settable — in-app is structural")
 	}
 	valid := false
 	for _, k := range prefKinds {
