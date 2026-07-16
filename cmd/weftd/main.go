@@ -169,6 +169,12 @@ func serve(ctx context.Context, cfg config.Config) error {
 	permsSvc := perms.New(pool)
 	identitySvc := identity.New(pool, permsSvc)
 	identitySvc.SetMailer(sender) // P-35 password-reset mail via the mail seam
+	// P-30: OIDC discovery, JWKS, and token exchange ride the SSRF-guarded
+	// egress client — the ONLY path the IdP endpoints may be dialed. No test
+	// options (production wiring). baseURL builds the absolute redirect_uri.
+	identitySvc.SetOIDC(egress.New(egress.Options{
+		UserAgent: brand.Name + "Bot/1.0 (+oidc)",
+	}), cfg.BaseURL)
 	msgSvc := messaging.New(pool, permsSvc)
 	autoSvc := automation.New(pool, permsSvc)
 	autoSvc.SetMessaging(msgSvc) // the slash-command channel-send gate

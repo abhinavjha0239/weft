@@ -21,6 +21,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
+	"github.com/abhinavjha0239/weft/internal/platform/egress"
 	"github.com/abhinavjha0239/weft/internal/platform/mail"
 )
 
@@ -33,6 +34,12 @@ type Service struct {
 	// warning once via noMailerWarn.
 	mailer       mail.Sender
 	noMailerWarn sync.Once
+	// oidcEgress is the SSRF-guarded client the P-30 login flow dials the IdP
+	// through (discovery, JWKS, token exchange); oidcBaseURL is the public
+	// origin the absolute redirect_uri is built from. Both wired via SetOIDC;
+	// nil/"" in tests and configs that never touch the OIDC endpoints.
+	oidcEgress  *egress.Client
+	oidcBaseURL string
 }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {

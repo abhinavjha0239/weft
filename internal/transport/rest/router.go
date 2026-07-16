@@ -106,6 +106,10 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	// is the capability, so no Authorization is read.
 	mux.Handle("POST /api/v1/password-reset/request", preAuth(http.HandlerFunc(a.handlePasswordResetRequest)))
 	mux.Handle("POST /api/v1/password-reset/confirm", preAuth(http.HandlerFunc(a.handlePasswordResetConfirm)))
+	// P-30 OIDC login: pre-auth (IP-limited like login), OUTSIDE withAuth — the
+	// IdP-issued code+state are the capability, no Authorization is read.
+	mux.Handle("GET /api/v1/auth/oidc/{org_slug}/{provider}/start", preAuth(http.HandlerFunc(a.handleOIDCStart)))
+	mux.Handle("GET /api/v1/auth/oidc/{org_slug}/{provider}/callback", preAuth(http.HandlerFunc(a.handleOIDCCallback)))
 	mux.HandleFunc("POST /api/v1/invites", a.withAuth(a.handleCreateInvite))
 	mux.HandleFunc("GET /api/v1/invites", a.withAuth(a.handleListInvites))
 	mux.HandleFunc("DELETE /api/v1/invites/{id}", a.withAuth(a.handleRevokeInvite))
@@ -243,6 +247,12 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	// P-15: org link-preview toggle (manage_org in the domain).
 	mux.HandleFunc("GET /api/v1/admin/link-previews", a.withAuth(a.handleGetLinkPreviews))
 	mux.HandleFunc("PUT /api/v1/admin/link-previews", a.withAuth(a.handleSetLinkPreviews))
+	// P-30: OIDC auth-provider CRUD (manage_org in the domain). client_secret
+	// is write-only; enabling requires a live discovery probe.
+	mux.HandleFunc("POST /api/v1/admin/auth-providers", a.withAuth(a.handleCreateAuthProvider))
+	mux.HandleFunc("GET /api/v1/admin/auth-providers", a.withAuth(a.handleListAuthProviders))
+	mux.HandleFunc("PATCH /api/v1/admin/auth-providers/{id}", a.withAuth(a.handleUpdateAuthProvider))
+	mux.HandleFunc("DELETE /api/v1/admin/auth-providers/{id}", a.withAuth(a.handleDeleteAuthProvider))
 	mux.HandleFunc("POST /api/v1/automations", a.withAuth(a.handleCreateAutomation))
 	mux.HandleFunc("GET /api/v1/automations", a.withAuth(a.handleListAutomations))
 	mux.HandleFunc("PATCH /api/v1/automations/{id}", a.withAuth(a.handleUpdateAutomation))
