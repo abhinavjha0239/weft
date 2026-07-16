@@ -13,6 +13,7 @@ package worktrack
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 
@@ -126,6 +127,22 @@ func (s *Service) CreateSpace(ctx context.Context, actor auth.Identity, p Create
 			actor.OrgID, key); err != nil {
 			return apperr.Internal("rank context", err)
 		}
+		// System link types are per-org (UNIQUE(org_id, outward)); seed them
+		// alongside a space's workflow, mirroring the status/item_type loops.
+		// ON CONFLICT keeps this idempotent: CreateSpace runs once per space,
+		// but these rows live once per org (blocks + relates to).
+		for _, lt := range []struct{ outward, inward string }{
+			{"blocks", "is blocked by"},
+			{"relates to", "relates to"},
+		} {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO link_type (org_id, outward, inward, is_system)
+				VALUES ($1, $2, $3, true)
+				ON CONFLICT (org_id, outward) DO NOTHING`,
+				actor.OrgID, lt.outward, lt.inward); err != nil {
+				return apperr.Internal("seed link type", err)
+			}
+		}
 		out.Key, out.Name = key, strings.TrimSpace(p.Name)
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
@@ -168,19 +185,23 @@ type CreateItemParams struct {
 	Title       string
 	Description string // becomes the root message of the item's thread
 	Type        string // "", "Task", "Bug", "Epic"
+	// Fields are custom-field values validated against the space's field_defs
+	// (P-13); unknown keys and wrong-typed values 400.
+	Fields map[string]any
 }
 
 type Item struct {
-	ID             int64  `json:"id"`
-	Key            string `json:"key"`
-	Title          string `json:"title"`
-	Type           string `json:"type"`
-	Status         string `json:"status"`
-	StatusID       int64  `json:"status_id"`
-	StatusCategory int    `json:"status_category"`
-	AssigneeID     *int64 `json:"assignee_id,omitempty"`
-	ThreadID       int64  `json:"thread_id"`
-	Resolved       bool   `json:"resolved"`
+	ID             int64          `json:"id"`
+	Key            string         `json:"key"`
+	Title          string         `json:"title"`
+	Type           string         `json:"type"`
+	Status         string         `json:"status"`
+	StatusID       int64          `json:"status_id"`
+	StatusCategory int            `json:"status_category"`
+	AssigneeID     *int64         `json:"assignee_id,omitempty"`
+	ThreadID       int64          `json:"thread_id"`
+	Resolved       bool           `json:"resolved"`
+	Fields         map[string]any `json:"fields,omitempty"`
 }
 
 // CreateItem: the D2 fusion forward direction — the item is born owning a
@@ -216,6 +237,13 @@ func (s *Service) CreateItem(ctx context.Context, actor auth.Identity, p CreateI
 			return apperr.Internal("initial status", err)
 		}
 
+		// Validate custom-field values against the space's defs BEFORE any row
+		// is created, so a bad value 400s without leaving a dangling thread.
+		fieldsJSON, storedFields, err := buildItemFields(ctx, tx, p.SpaceID, p.Fields)
+		if err != nil {
+			return err
+		}
+
 		// Per-space key_no assignment is serialized with an advisory lock —
 		// MAX+1 would race under concurrent creates (unique violation aborts
 		// the tx). Per-space serialization of item creation is the accepted
@@ -242,13 +270,13 @@ func (s *Service) CreateItem(ctx context.Context, actor auth.Identity, p CreateI
 		rank := fmt.Sprintf("m%08d", keyNo)
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO work_item (org_id, space_id, key_no, type_id, status_id,
-				title, thread_id, reporter_id, rank, rank_context_id)
+				title, thread_id, reporter_id, rank, rank_context_id, fields)
 			VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,
-			        (SELECT id FROM rank_context WHERE org_id = $1 AND name = $10))
+			        (SELECT id FROM rank_context WHERE org_id = $1 AND name = $10), $11)
 			RETURNING id`,
 			actor.OrgID, p.SpaceID, keyNo, typeID, statusID,
 			strings.TrimSpace(p.Title), threadID, actor.UserID, rank,
-			sp.key).Scan(&out.ID); err != nil {
+			sp.key, fieldsJSON).Scan(&out.ID); err != nil {
 			return apperr.Internal("create item", err)
 		}
 		if strings.TrimSpace(p.Description) != "" {
@@ -260,6 +288,7 @@ func (s *Service) CreateItem(ctx context.Context, actor auth.Identity, p CreateI
 		out.Key = fmt.Sprintf("%s-%d", sp.key, keyNo)
 		out.Title, out.Type, out.Status = strings.TrimSpace(p.Title), p.Type, "To Do"
 		out.StatusID, out.StatusCategory, out.ThreadID = statusID, catTodo, threadID
+		out.Fields = storedFields
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 			EntityType: enum.EntityWorkItem, EntityID: out.ID, Verb: "workitem.created",
@@ -390,14 +419,15 @@ func (s *Service) PromoteThread(ctx context.Context, actor auth.Identity, thread
 type UpdateItemParams struct {
 	Title      *string
 	StatusID   *int64
-	AssigneeID *int64 // 0 clears
-	SprintID   *int64 // 0 clears (the AssigneeID precedent)
+	AssigneeID *int64         // 0 clears
+	SprintID   *int64         // 0 clears (the AssigneeID precedent)
+	Fields     map[string]any // custom-field merge (P-13): explicit null clears a key
 }
 
 // UpdateItem edits fields and transitions status. Resolution is DERIVED:
 // entering a done-category status sets resolved_at; leaving clears it (W-3).
 func (s *Service) UpdateItem(ctx context.Context, actor auth.Identity, itemID int64, p UpdateItemParams) error {
-	if p.Title == nil && p.StatusID == nil && p.AssigneeID == nil && p.SprintID == nil {
+	if p.Title == nil && p.StatusID == nil && p.AssigneeID == nil && p.SprintID == nil && p.Fields == nil {
 		return apperr.Invalid("nothing to update")
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
@@ -484,12 +514,21 @@ func (s *Service) UpdateItem(ctx context.Context, actor auth.Identity, itemID in
 				return apperr.Internal("append event", err)
 			}
 		}
-		if p.Title != nil || p.AssigneeID != nil || p.SprintID != nil {
+		// Merge custom-field values (absent key = leave, explicit null = clear);
+		// the changed KEYS ride the workitem.updated payload, never the values.
+		changedFieldKeys, err := mergeItemFields(ctx, tx, spaceID, itemID, p.Fields)
+		if err != nil {
+			return err
+		}
+		if p.Title != nil || p.AssigneeID != nil || p.SprintID != nil || len(changedFieldKeys) > 0 {
+			payload := map[string]any{"item_id": itemID, "space_id": spaceID}
+			if len(changedFieldKeys) > 0 {
+				payload["fields"] = changedFieldKeys
+			}
 			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 				OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 				EntityType: enum.EntityWorkItem, EntityID: itemID, Verb: "workitem.updated",
-				Payload: eventlog.MustPayload(map[string]any{
-					"item_id": itemID, "space_id": spaceID}),
+				Payload: eventlog.MustPayload(payload),
 			}); err != nil {
 				return apperr.Internal("append event", err)
 			}
@@ -504,7 +543,7 @@ func (s *Service) ListItems(ctx context.Context, actor auth.Identity, spaceID in
 	rows, err := s.pool.Query(ctx, `
 		SELECT w.id, sp.key || '-' || w.key_no, w.title, it.name,
 		       st.name, st.id, st.category, w.assignee_id, w.thread_id,
-		       w.resolved_at IS NOT NULL
+		       w.resolved_at IS NOT NULL, w.fields
 		FROM work_item w
 		JOIN space sp ON sp.id = w.space_id
 		JOIN item_type it ON it.id = w.type_id
@@ -518,10 +557,20 @@ func (s *Service) ListItems(ctx context.Context, actor auth.Identity, spaceID in
 	var out []Item
 	for rows.Next() {
 		var it Item
+		var fieldsRaw []byte
 		if err := rows.Scan(&it.ID, &it.Key, &it.Title, &it.Type, &it.Status,
 			&it.StatusID, &it.StatusCategory, &it.AssigneeID, &it.ThreadID,
-			&it.Resolved); err != nil {
+			&it.Resolved, &fieldsRaw); err != nil {
 			return nil, apperr.Internal("scan item", err)
+		}
+		if len(fieldsRaw) > 0 {
+			m := map[string]any{}
+			if err := json.Unmarshal(fieldsRaw, &m); err != nil {
+				return nil, apperr.Internal("decode fields", err)
+			}
+			if len(m) > 0 {
+				it.Fields = m
+			}
 		}
 		out = append(out, it)
 	}

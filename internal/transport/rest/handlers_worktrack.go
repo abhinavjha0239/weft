@@ -48,9 +48,10 @@ func (a *api) handleCreateItem(w http.ResponseWriter, r *http.Request, id auth.I
 		return
 	}
 	type req struct {
-		Title       string `json:"title"`
-		Description string `json:"description"`
-		Type        string `json:"type"`
+		Title       string         `json:"title"`
+		Description string         `json:"description"`
+		Type        string         `json:"type"`
+		Fields      map[string]any `json:"fields"`
 	}
 	in, ok := decode[req](w, r)
 	if !ok {
@@ -58,6 +59,7 @@ func (a *api) handleCreateItem(w http.ResponseWriter, r *http.Request, id auth.I
 	}
 	out, err := a.Worktrack.CreateItem(r.Context(), id, worktrack.CreateItemParams{
 		SpaceID: spaceID, Title: in.Title, Description: in.Description, Type: in.Type,
+		Fields: in.Fields,
 	})
 	if err != nil {
 		writeDomainError(w, a.Log, r, err)
@@ -104,10 +106,11 @@ func (a *api) handleUpdateItem(w http.ResponseWriter, r *http.Request, id auth.I
 		return
 	}
 	type req struct {
-		Title      *string `json:"title"`
-		StatusID   *int64  `json:"status_id"`
-		AssigneeID *int64  `json:"assignee_id"`
-		SprintID   *int64  `json:"sprint_id"`
+		Title      *string        `json:"title"`
+		StatusID   *int64         `json:"status_id"`
+		AssigneeID *int64         `json:"assignee_id"`
+		SprintID   *int64         `json:"sprint_id"`
+		Fields     map[string]any `json:"fields"`
 	}
 	in, ok := decode[req](w, r)
 	if !ok {
@@ -115,7 +118,7 @@ func (a *api) handleUpdateItem(w http.ResponseWriter, r *http.Request, id auth.I
 	}
 	if err := a.Worktrack.UpdateItem(r.Context(), id, itemID, worktrack.UpdateItemParams{
 		Title: in.Title, StatusID: in.StatusID, AssigneeID: in.AssigneeID,
-		SprintID: in.SprintID,
+		SprintID: in.SprintID, Fields: in.Fields,
 	}); err != nil {
 		writeDomainError(w, a.Log, r, err)
 		return
@@ -357,6 +360,147 @@ func (a *api) handleDeleteView(w http.ResponseWriter, r *http.Request, id auth.I
 		return
 	}
 	if err := a.Worktrack.DeleteView(r.Context(), id, viewID); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *api) handleCreateFieldDef(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	spaceID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad space id")
+		return
+	}
+	type req struct {
+		Key       string                 `json:"key"`
+		Name      string                 `json:"name"`
+		FieldType string                 `json:"field_type"`
+		AppliesTo []int64                `json:"applies_to"`
+		Required  bool                   `json:"required"`
+		Options   worktrack.FieldOptions `json:"options"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	out, err := a.Worktrack.CreateFieldDef(r.Context(), id, spaceID, worktrack.CreateFieldDefParams{
+		Key: in.Key, Name: in.Name, FieldType: in.FieldType,
+		AppliesTo: in.AppliesTo, Required: in.Required, Options: in.Options,
+	})
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (a *api) handleListFieldDefs(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	spaceID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad space id")
+		return
+	}
+	defs, err := a.Worktrack.ListFieldDefs(r.Context(), id, spaceID)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	if defs == nil {
+		defs = []worktrack.FieldDef{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"field_defs": defs})
+}
+
+func (a *api) handleUpdateFieldDef(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	defID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad field def id")
+		return
+	}
+	type req struct {
+		Name     *string                 `json:"name"`
+		Required *bool                   `json:"required"`
+		Options  *worktrack.FieldOptions `json:"options"`
+		Position *int                    `json:"position"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	if err := a.Worktrack.UpdateFieldDef(r.Context(), id, defID, worktrack.UpdateFieldDefParams{
+		Name: in.Name, Required: in.Required, Options: in.Options, Position: in.Position,
+	}); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *api) handleDeleteFieldDef(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	defID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad field def id")
+		return
+	}
+	if err := a.Worktrack.DeleteFieldDef(r.Context(), id, defID); err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (a *api) handleCreateLink(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	itemID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad item id")
+		return
+	}
+	type req struct {
+		ToItemID   int64 `json:"to_item_id"`
+		LinkTypeID int64 `json:"link_type_id"`
+	}
+	in, ok := decode[req](w, r)
+	if !ok {
+		return
+	}
+	out, err := a.Worktrack.CreateLink(r.Context(), id, itemID, in.ToItemID, in.LinkTypeID)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	writeJSON(w, http.StatusCreated, out)
+}
+
+func (a *api) handleListLinks(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	itemID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad item id")
+		return
+	}
+	links, err := a.Worktrack.ListLinks(r.Context(), id, itemID)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	if links == nil {
+		links = []worktrack.LinkView{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"links": links})
+}
+
+func (a *api) handleDeleteLink(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	itemID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad item id")
+		return
+	}
+	linkID, err := strconv.ParseInt(r.PathValue("link_id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad link id")
+		return
+	}
+	if err := a.Worktrack.DeleteLink(r.Context(), id, itemID, linkID); err != nil {
 		writeDomainError(w, a.Log, r, err)
 		return
 	}
