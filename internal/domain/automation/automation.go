@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
@@ -32,11 +34,17 @@ import (
 type Service struct {
 	pool  *pgxpool.Pool
 	perms *perms.Service
+	// msg backs the slash-command invocation's channel-send gate; wired via
+	// SetMessaging so access control lives in messaging, never duplicated here.
+	msg *messaging.Service
 }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
 	return &Service{pool: pool, perms: p}
 }
+
+// SetMessaging wires the messaging service used by the slash-command gate.
+func (s *Service) SetMessaging(m *messaging.Service) { s.msg = m }
 
 // Automation scope types (automation.scope_type). Like retention scopes,
 // only the rungs with real gates exist: org (manage_org) and channel
@@ -58,9 +66,37 @@ type Definition struct {
 	Steps      []Step      `json:"steps"`
 }
 
+// Trigger selects what fires a rule. Kind absent = "event" (every definition
+// stored before P-23 stays valid; normalized at validate and on load). Each
+// kind reads only its own fields — a field foreign to the kind must be absent.
 type Trigger struct {
-	Verb string `json:"verb"`
+	Kind     string    `json:"kind,omitempty"`
+	Verb     string    `json:"verb,omitempty"`     // event: an event-log verb from triggerVerbs
+	Schedule *Schedule `json:"schedule,omitempty"` // schedule: the cadence (required)
+	Command  string    `json:"command,omitempty"`  // slash: the command name (required)
 }
+
+// Trigger kinds (Definition.Trigger.Kind).
+const (
+	kindEvent    = "event"
+	kindSchedule = "schedule"
+	kindWebhook  = "webhook"
+	kindSlash    = "slash"
+)
+
+// The internal verbs the schedule/webhook/slash lanes append. They are
+// deliberately NOT in triggerVerbs: they are not event-pattern-subscribable,
+// so matching them is TARGETED (schedule/webhook by payload.automation_id,
+// slash by command + scope coverage) rather than by open verb subscription.
+const (
+	verbScheduleDue     = "automation.schedule_due"
+	verbWebhookReceived = "automation.webhook_received"
+	verbSlashInvoked    = "automation.slash_invoked"
+)
+
+// slashCommandRe bounds a slash command name — shared by the definition and
+// the invocation path.
+var slashCommandRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 type Step struct {
 	Kind string `json:"kind"`
@@ -95,8 +131,12 @@ type Automation struct {
 	ActorUserID      *int64          `json:"actor_user_id,omitempty"`
 	ActorConsented   bool            `json:"actor_consented"`
 	AllowRuleTrigger bool            `json:"allow_rule_trigger"`
-	CreatedBy        int64           `json:"created_by"`
-	CreatedAt        time.Time       `json:"created_at"`
+	// WebhookToken is the capability token for a webhook rule, surfaced only to
+	// scope admins (Create and List are requireScopeAdmin-gated). Nil for every
+	// non-webhook rule.
+	WebhookToken *string   `json:"webhook_token,omitempty"`
+	CreatedBy    int64     `json:"created_by"`
+	CreatedAt    time.Time `json:"created_at"`
 }
 
 type CreateParams struct {
@@ -137,8 +177,8 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 	if err := dec.Decode(&def); err != nil {
 		return def, apperr.Invalid("definition: " + err.Error())
 	}
-	if !triggerVerbs[def.Trigger.Verb] {
-		return def, apperr.Invalid(fmt.Sprintf("definition: unknown trigger verb %q", def.Trigger.Verb))
+	if err := validateTrigger(&def.Trigger); err != nil {
+		return def, err
 	}
 	if err := validateConditions(def.Conditions); err != nil {
 		return def, err
@@ -181,6 +221,47 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 	return def, nil
 }
 
+// validateTrigger normalizes the kind (absent = event) and enforces the
+// per-kind shape: an "event" trigger names a verb from triggerVerbs;
+// "schedule" carries a valid schedule; "webhook" carries nothing more;
+// "slash" names a valid command. A field foreign to the kind must be ABSENT —
+// a stray verb on a webhook rule is a misconfiguration, never silently ignored.
+func validateTrigger(t *Trigger) error {
+	if t.Kind == "" {
+		t.Kind = kindEvent
+	}
+	switch t.Kind {
+	case kindEvent:
+		if !triggerVerbs[t.Verb] {
+			return apperr.Invalid(fmt.Sprintf("definition: unknown trigger verb %q", t.Verb))
+		}
+		if t.Schedule != nil || t.Command != "" {
+			return apperr.Invalid("definition: an event trigger takes only a verb")
+		}
+	case kindSchedule:
+		if t.Verb != "" || t.Command != "" {
+			return apperr.Invalid("definition: a schedule trigger takes only a schedule")
+		}
+		if err := validateSchedule(t.Schedule); err != nil {
+			return err
+		}
+	case kindWebhook:
+		if t.Verb != "" || t.Schedule != nil || t.Command != "" {
+			return apperr.Invalid("definition: a webhook trigger takes no verb, schedule, or command")
+		}
+	case kindSlash:
+		if t.Verb != "" || t.Schedule != nil {
+			return apperr.Invalid("definition: a slash trigger takes only a command")
+		}
+		if !slashCommandRe.MatchString(t.Command) {
+			return apperr.Invalid("definition: slash command must match ^[a-z0-9][a-z0-9_-]{0,31}$")
+		}
+	default:
+		return apperr.Invalid(fmt.Sprintf("definition: unknown trigger kind %q", t.Kind))
+	}
+	return nil
+}
+
 // Create stores a rule DISABLED — create, review, then enable. A human
 // actor_user_id needs that human's consent: naming yourself consents
 // immediately; naming someone else leaves the rule unconsentable to enable
@@ -194,8 +275,19 @@ func (s *Service) Create(ctx context.Context, actor auth.Identity, p CreateParam
 		if err := s.requireScopeAdmin(ctx, tx, actor, p.ScopeType, p.ScopeID); err != nil {
 			return err
 		}
-		if _, err := s.validateDefinition(ctx, tx, actor.OrgID, p.ScopeType, p.ScopeID, p.Definition); err != nil {
+		def, err := s.validateDefinition(ctx, tx, actor.OrgID, p.ScopeType, p.ScopeID, p.Definition)
+		if err != nil {
 			return err
+		}
+		// A webhook trigger mints its capability token at birth (Create stores
+		// the rule disabled, so no schedule fire time is ever set here).
+		var webhookToken *string
+		if def.Trigger.Kind == kindWebhook {
+			tok, terr := newWebhookToken()
+			if terr != nil {
+				return terr
+			}
+			webhookToken = &tok
 		}
 		var consentAt *time.Time
 		if p.ActorUserID != nil {
@@ -216,18 +308,19 @@ func (s *Service) Create(ctx context.Context, actor auth.Identity, p CreateParam
 		}
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO automation (org_id, scope_type, scope_id, name, definition,
-				actor_user_id, actor_consent_at, created_by)
-			VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+				actor_user_id, actor_consent_at, created_by, webhook_token)
+			VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
 			RETURNING id, version, created_at`,
 			actor.OrgID, p.ScopeType, p.ScopeID, p.Name, p.Definition,
-			p.ActorUserID, consentAt, actor.UserID).Scan(&out.ID, &out.Version, &out.CreatedAt); err != nil {
+			p.ActorUserID, consentAt, actor.UserID, webhookToken).Scan(&out.ID, &out.Version, &out.CreatedAt); err != nil {
 			return apperr.Internal("create automation", err)
 		}
 		out.ScopeType, out.ScopeID, out.Name = p.ScopeType, p.ScopeID, p.Name
 		out.Definition, out.ActorUserID = p.Definition, p.ActorUserID
 		out.ActorConsented = consentAt != nil
+		out.WebhookToken = webhookToken
 		out.CreatedBy = actor.UserID
-		_, err := eventlog.Append(ctx, tx, eventlog.Event{
+		_, err = eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 			EntityType: enum.EntityAutomation, EntityID: out.ID, Verb: "automation.created",
 			Payload: eventlog.MustPayload(map[string]any{
@@ -260,11 +353,15 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 		var actorUserID *int64
 		var consentAt *time.Time
 		var enabled bool
+		var storedDef json.RawMessage
+		var webhookToken *string
 		err := tx.QueryRow(ctx, `
-			SELECT scope_type, scope_id, actor_user_id, actor_consent_at, enabled
+			SELECT scope_type, scope_id, actor_user_id, actor_consent_at, enabled,
+			       definition, webhook_token
 			FROM automation
 			WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL FOR UPDATE`,
-			id, actor.OrgID).Scan(&scopeType, &scopeID, &actorUserID, &consentAt, &enabled)
+			id, actor.OrgID).Scan(&scopeType, &scopeID, &actorUserID, &consentAt,
+			&enabled, &storedDef, &webhookToken)
 		if err != nil {
 			return apperr.NotFound("automation not found")
 		}
@@ -284,8 +381,29 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 			changed["name"] = *p.Name
 		}
 		if p.Definition != nil {
-			if _, err := s.validateDefinition(ctx, tx, actor.OrgID, scopeType, scopeID, p.Definition); err != nil {
+			newDef, err := s.validateDefinition(ctx, tx, actor.OrgID, scopeType, scopeID, p.Definition)
+			if err != nil {
 				return err
+			}
+			// webhook_token lifecycle: mint when the trigger becomes a webhook
+			// (keeping any existing token so a URL already handed out survives
+			// unrelated edits), NULL when it stops being one. Rotation is a
+			// separate, explicit action.
+			var nextToken *string
+			if newDef.Trigger.Kind == kindWebhook {
+				if webhookToken != nil {
+					nextToken = webhookToken
+				} else {
+					tok, terr := newWebhookToken()
+					if terr != nil {
+						return terr
+					}
+					nextToken = &tok
+				}
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE automation SET webhook_token = $2 WHERE id = $1`, id, nextToken); err != nil {
+				return apperr.Internal("update webhook token", err)
 			}
 			clearConsent := actorUserID != nil
 			if _, err := tx.Exec(ctx, `
@@ -320,7 +438,26 @@ func (s *Service) Update(ctx context.Context, actor auth.Identity, id int64, p U
 				id, *p.Enabled); err != nil {
 				return apperr.Internal("toggle automation", err)
 			}
+			enabled = *p.Enabled
 			changed["enabled"] = *p.Enabled
+		}
+		// Schedule lifecycle: recompute schedule_next_at whenever enablement or
+		// the definition changed. An enabled schedule rule carries its next
+		// fire; a disabled rule or a non-schedule trigger carries NULL. Renames
+		// and the loop-flag toggle leave it alone, so a schedule never drifts
+		// on an unrelated edit. This also composes the F-13 arc: a definition
+		// edit that disables a human-actor rule lands here with enabled=false
+		// and NULLs the fire time.
+		if p.Enabled != nil || p.Definition != nil {
+			effectiveDef := storedDef
+			if p.Definition != nil {
+				effectiveDef = p.Definition
+			}
+			if _, err := tx.Exec(ctx,
+				`UPDATE automation SET schedule_next_at = $2 WHERE id = $1`,
+				id, scheduleNextAt(enabled, effectiveDef)); err != nil {
+				return apperr.Internal("update schedule fire", err)
+			}
 		}
 		_, err = eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
@@ -401,7 +538,7 @@ func (s *Service) List(ctx context.Context, actor auth.Identity, scopeType int16
 		rows, err := tx.Query(ctx, `
 			SELECT id, scope_type, scope_id, name, enabled, definition, version,
 			       actor_user_id, actor_consent_at IS NOT NULL, allow_rule_trigger,
-			       created_by, created_at
+			       created_by, created_at, webhook_token
 			FROM automation
 			WHERE org_id = $1 AND scope_type = $2 AND scope_id = $3 AND deleted_at IS NULL
 			ORDER BY id`, actor.OrgID, scopeType, scopeID)
@@ -413,7 +550,7 @@ func (s *Service) List(ctx context.Context, actor auth.Identity, scopeType int16
 			var a Automation
 			if err := rows.Scan(&a.ID, &a.ScopeType, &a.ScopeID, &a.Name, &a.Enabled,
 				&a.Definition, &a.Version, &a.ActorUserID, &a.ActorConsented,
-				&a.AllowRuleTrigger, &a.CreatedBy, &a.CreatedAt); err != nil {
+				&a.AllowRuleTrigger, &a.CreatedBy, &a.CreatedAt, &a.WebhookToken); err != nil {
 				return apperr.Internal("scan automation", err)
 			}
 			out = append(out, a)

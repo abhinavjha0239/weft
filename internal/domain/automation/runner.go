@@ -23,6 +23,10 @@ const (
 	consumerName  = "automations"
 	sweepInterval = 5 * time.Second
 	batchSize     = 500
+	// scheduleInterval is how often the scheduler lane claims due schedules;
+	// scheduleClaimSize caps one claim's batch.
+	scheduleInterval  = 30 * time.Second
+	scheduleClaimSize = 100
 	// maxChainDepth caps rule→rule cascades (AU-4): an automation-caused
 	// event carries its depth in the event hint; a rule that would exceed
 	// the cap records a THROTTLED run instead of executing — visible in the
@@ -74,6 +78,7 @@ func NewRunner(pool *pgxpool.Pool, msg *messaging.Service, p *perms.Service, not
 // signalled org; a sweep catches anything a missed NOTIFY left behind.
 func (r *Runner) Run(ctx context.Context) {
 	go r.sweep(ctx)
+	go r.scheduleLane(ctx)
 	for ctx.Err() == nil {
 		if err := r.listenLoop(ctx); err != nil && ctx.Err() == nil {
 			r.log.Warn("automation: listen loop restarting", "err", err)
@@ -233,11 +238,12 @@ func eventDepth(hint json.RawMessage) int {
 }
 
 func match(rl rule, ev eventlog.Row) bool {
-	if rl.Def.Trigger.Verb != ev.Verb {
+	if !triggerMatches(rl, ev) {
 		return false
 	}
 	// Loop guard (AU-4): never self-trigger; other rules' events only with
-	// the explicit opt-in.
+	// the explicit opt-in. Only automation-authored events carry this risk;
+	// the schedule/webhook/slash lane events are system- or human-actored.
 	if ev.ActorKind == enum.ActorAutomation {
 		if ev.ActorID != nil && *ev.ActorID == rl.ID {
 			return false
@@ -251,12 +257,59 @@ func match(rl rule, ev eventlog.Row) bool {
 	if rl.ActorUserID != nil && !rl.Consented {
 		return false
 	}
-	if rl.ScopeType == ScopeChannel && eventChannel(ev.Payload) != rl.ScopeID {
-		return false
+	// Channel-scope coverage applies to event and slash triggers (both carry a
+	// channel_id in payload): a channel-scope rule fires only for its own
+	// channel, an org-scope rule for any. Schedule/webhook triggers are
+	// targeted by automation_id and carry no channel, so the filter neither
+	// applies nor makes sense for them.
+	switch rl.Def.Trigger.Kind {
+	case kindSchedule, kindWebhook:
+	default:
+		if rl.ScopeType == ScopeChannel && eventChannel(ev.Payload) != rl.ScopeID {
+			return false
+		}
 	}
 	// Conditions (AU-1 filters) are the last gate, evaluated in memory: a miss
 	// returns false so execute() is never reached and NO run row is written.
 	return matchConditions(rl.Def.Conditions, ev.Payload)
+}
+
+// triggerMatches reports whether the event fires this rule's trigger, by kind.
+// event: the subscribed verb. schedule/webhook: the lane's internal verb AND
+// the event targets THIS rule (payload.automation_id) — these events can never
+// fire another rule. slash: the invocation verb AND the command matches (scope
+// coverage rides match's channel-scope filter). A legacy definition (no kind)
+// normalizes to event via the default arm.
+func triggerMatches(rl rule, ev eventlog.Row) bool {
+	switch rl.Def.Trigger.Kind {
+	case kindSchedule:
+		return ev.Verb == verbScheduleDue && eventAutomationID(ev.Payload) == rl.ID
+	case kindWebhook:
+		return ev.Verb == verbWebhookReceived && eventAutomationID(ev.Payload) == rl.ID
+	case kindSlash:
+		return ev.Verb == verbSlashInvoked && rl.Def.Trigger.Command == eventCommand(ev.Payload)
+	default:
+		return ev.Verb == rl.Def.Trigger.Verb
+	}
+}
+
+// eventAutomationID reads the target rule id from a targeted lane event's
+// payload (zero when absent).
+func eventAutomationID(payload json.RawMessage) int64 {
+	var p struct {
+		AutomationID int64 `json:"automation_id"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	return p.AutomationID
+}
+
+// eventCommand reads the invoked command from a slash event's payload.
+func eventCommand(payload json.RawMessage) string {
+	var p struct {
+		Command string `json:"command"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	return p.Command
 }
 
 type stepTrace struct {
@@ -452,4 +505,103 @@ func automationPrincipal(ctx context.Context, tx pgx.Tx, orgID int64) (int64, er
 		return 0, fmt.Errorf("automation: principal lookup: %w", err)
 	}
 	return id, nil
+}
+
+// scheduleLane fires due schedules on a fixed tick, beside sweep. Each
+// appended event's NOTIFY wakes the consumer to run the rule.
+func (r *Runner) scheduleLane(ctx context.Context) {
+	t := time.NewTicker(scheduleInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if _, err := r.RunDueSchedules(ctx, time.Now()); err != nil && ctx.Err() == nil {
+				r.log.Warn("automation: schedule lane", "err", err)
+			}
+		}
+	}
+}
+
+// RunDueSchedules is the scheduler lane's claim, CAS-shaped: in ONE
+// transaction it locks up to scheduleClaimSize due schedule rules (FOR UPDATE
+// SKIP LOCKED, so concurrent runners never double-claim), and for each
+// advances schedule_next_at to the next fire computed FROM NOW and appends an
+// automation.schedule_due event — all atomic. Computing from now means a slot
+// missed during downtime fires exactly ONCE on recovery, with no burst
+// catch-up; idempotency across redelivery is the consumer's existing
+// (automation, trigger_event_id) run key. Clock-injected for tests; the lane
+// passes time.Now(). Returns the number of schedules fired.
+func (r *Runner) RunDueSchedules(ctx context.Context, now time.Time) (int, error) {
+	var fired int
+	err := db.WithTx(ctx, r.pool, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			SELECT id, org_id, definition, schedule_next_at
+			FROM automation
+			WHERE schedule_next_at <= $1 AND enabled AND deleted_at IS NULL
+			ORDER BY schedule_next_at
+			FOR UPDATE SKIP LOCKED
+			LIMIT $2`, now, scheduleClaimSize)
+		if err != nil {
+			return fmt.Errorf("automation: claim schedules: %w", err)
+		}
+		type claim struct {
+			id, orgID    int64
+			def          Definition
+			scheduledFor time.Time
+		}
+		var claims []claim
+		for rows.Next() {
+			var c claim
+			var raw []byte
+			if err := rows.Scan(&c.id, &c.orgID, &raw, &c.scheduledFor); err != nil {
+				rows.Close()
+				return fmt.Errorf("automation: scan schedule: %w", err)
+			}
+			if err := json.Unmarshal(raw, &c.def); err != nil {
+				// Unparseable: zero the definition so the defensive arm below
+				// clears the fire time — otherwise the row re-claims forever.
+				c.def = Definition{}
+			}
+			claims = append(claims, c)
+		}
+		// The cursor must close before we issue writes on the same tx; the
+		// FOR UPDATE locks persist for the transaction, so the claim holds.
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			return err
+		}
+		for _, c := range claims {
+			if c.def.Trigger.Kind != kindSchedule || c.def.Trigger.Schedule == nil {
+				// Defensive: a non-schedule rule must never carry a fire time
+				// (the lifecycle NULLs it). Clear it so it never re-claims.
+				if _, err := tx.Exec(ctx,
+					`UPDATE automation SET schedule_next_at = NULL WHERE id = $1`, c.id); err != nil {
+					return fmt.Errorf("automation: clear stale schedule: %w", err)
+				}
+				continue
+			}
+			loc, lerr := scheduleLocation(c.def.Trigger.Schedule.TZ)
+			if lerr != nil {
+				loc = time.UTC // validated at write; defensive
+			}
+			next := nextFire(*c.def.Trigger.Schedule, now, loc)
+			if _, err := tx.Exec(ctx,
+				`UPDATE automation SET schedule_next_at = $2 WHERE id = $1`, c.id, next); err != nil {
+				return fmt.Errorf("automation: advance schedule: %w", err)
+			}
+			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+				OrgID: c.orgID, ActorKind: enum.ActorSystem,
+				EntityType: enum.EntityAutomation, EntityID: c.id, Verb: verbScheduleDue,
+				Payload: eventlog.MustPayload(map[string]any{
+					"automation_id": c.id, "scheduled_for": c.scheduledFor}),
+			}); err != nil {
+				return fmt.Errorf("automation: append schedule_due: %w", err)
+			}
+			fired++
+		}
+		return nil
+	})
+	return fired, err
 }

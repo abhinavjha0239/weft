@@ -58,6 +58,9 @@ type api struct {
 	authLimit   *ratelimit.Limiter
 	apiLimit    *ratelimit.Limiter
 	publicLimit *ratelimit.Limiter
+	// hookLimit: inbound webhook ingest, per RULE (past the per-IP authLimit).
+	// Also the bound on external-service echo loops.
+	hookLimit *ratelimit.Limiter
 }
 
 // Handler builds the routed, middleware-wrapped HTTP handler. Limiter
@@ -80,10 +83,12 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 		authLimit:   ratelimit.New(0.5, 10), // ~30/min burst 10 per IP
 		apiLimit:    ratelimit.New(50, 100), // 50 rps burst 100 per user
 		publicLimit: ratelimit.New(5, 20),   // 5 rps burst 20 per IP
+		hookLimit:   ratelimit.New(1, 10),   // ~1 rps burst 10 per rule
 	}
 	go a.authLimit.Janitor(ctx, time.Minute)
 	go a.apiLimit.Janitor(ctx, time.Minute)
 	go a.publicLimit.Janitor(ctx, time.Minute)
+	go a.hookLimit.Janitor(ctx, time.Minute)
 
 	mux := http.NewServeMux()
 	preAuth := withIPLimit(a.authLimit)
@@ -241,6 +246,14 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("DELETE /api/v1/automations/{id}", a.withAuth(a.handleDeleteAutomation))
 	mux.HandleFunc("POST /api/v1/automations/{id}/consent", a.withAuth(a.handleConsentAutomation))
 	mux.HandleFunc("GET /api/v1/automations/{id}/runs", a.withAuth(a.handleListAutomationRuns))
+	// P-23 slash + webhook triggers. The slash invocation is authed; the
+	// webhook-token rotation is scope-admin (gated in the domain).
+	mux.HandleFunc("POST /api/v1/automations/slash", a.withAuth(a.handleSlash))
+	mux.HandleFunc("POST /api/v1/automations/{id}/webhook-token", a.withAuth(a.handleRotateWebhookToken))
+	// The inbound webhook is UNAUTHENTICATED (the token in the path IS the
+	// capability), so it sits OUTSIDE withAuth behind only the per-IP authLimit
+	// (the unsubscribe precedent); a per-rule limiter lives in the handler.
+	mux.Handle("POST /api/v1/hooks/rules/{id}/{token}", preAuth(http.HandlerFunc(a.handleWebhook)))
 	mux.HandleFunc("GET /api/v1/gateway", a.handleGateway)
 
 	return chain(mux, withRequestID, withRecover(d.Log), withLog(d.Log))
