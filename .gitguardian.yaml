@@ -1,0 +1,22 @@
+# GitGuardian secret-scanning config.
+#
+# The only entries here are TEST cryptographic fixtures, not production
+# secrets. The generic high-entropy detector cannot distinguish a published
+# standards-document test vector (or an ephemeral test key) from a real
+# credential, so these two test files are excluded by path:
+#
+#   - internal/platform/webpush/encrypt_test.go carries the RFC 8291
+#     Appendix A "Push Message Encryption Example" verbatim — the public
+#     known-answer vector our Web Push encryption is verified against. Its
+#     keys/salt/secret are printed in the RFC itself.
+#   - internal/transport/rest/push_test.go builds Web Push subscriptions from
+#     throwaway P-256 test keys (e.g. an auth secret that is base64 of
+#     "0123456789abcdef") used only against an in-process fake push service.
+#
+# No production key material is stored anywhere in the tree; VAPID keys are
+# supplied at runtime via WEFT_VAPID_* and never committed.
+version: 2
+secret:
+  ignored-paths:
+    - internal/platform/webpush/encrypt_test.go
+    - internal/transport/rest/push_test.go
