@@ -233,11 +233,12 @@ func eventDepth(hint json.RawMessage) int {
 }
 
 func match(rl rule, ev eventlog.Row) bool {
-	if rl.Def.Trigger.Verb != ev.Verb {
+	if !triggerMatches(rl, ev) {
 		return false
 	}
 	// Loop guard (AU-4): never self-trigger; other rules' events only with
-	// the explicit opt-in.
+	// the explicit opt-in. Only automation-authored events carry this risk;
+	// the schedule/webhook/slash lane events are system- or human-actored.
 	if ev.ActorKind == enum.ActorAutomation {
 		if ev.ActorID != nil && *ev.ActorID == rl.ID {
 			return false
@@ -251,12 +252,59 @@ func match(rl rule, ev eventlog.Row) bool {
 	if rl.ActorUserID != nil && !rl.Consented {
 		return false
 	}
-	if rl.ScopeType == ScopeChannel && eventChannel(ev.Payload) != rl.ScopeID {
-		return false
+	// Channel-scope coverage applies to event and slash triggers (both carry a
+	// channel_id in payload): a channel-scope rule fires only for its own
+	// channel, an org-scope rule for any. Schedule/webhook triggers are
+	// targeted by automation_id and carry no channel, so the filter neither
+	// applies nor makes sense for them.
+	switch rl.Def.Trigger.Kind {
+	case kindSchedule, kindWebhook:
+	default:
+		if rl.ScopeType == ScopeChannel && eventChannel(ev.Payload) != rl.ScopeID {
+			return false
+		}
 	}
 	// Conditions (AU-1 filters) are the last gate, evaluated in memory: a miss
 	// returns false so execute() is never reached and NO run row is written.
 	return matchConditions(rl.Def.Conditions, ev.Payload)
+}
+
+// triggerMatches reports whether the event fires this rule's trigger, by kind.
+// event: the subscribed verb. schedule/webhook: the lane's internal verb AND
+// the event targets THIS rule (payload.automation_id) — these events can never
+// fire another rule. slash: the invocation verb AND the command matches (scope
+// coverage rides match's channel-scope filter). A legacy definition (no kind)
+// normalizes to event via the default arm.
+func triggerMatches(rl rule, ev eventlog.Row) bool {
+	switch rl.Def.Trigger.Kind {
+	case kindSchedule:
+		return ev.Verb == verbScheduleDue && eventAutomationID(ev.Payload) == rl.ID
+	case kindWebhook:
+		return ev.Verb == verbWebhookReceived && eventAutomationID(ev.Payload) == rl.ID
+	case kindSlash:
+		return ev.Verb == verbSlashInvoked && rl.Def.Trigger.Command == eventCommand(ev.Payload)
+	default:
+		return ev.Verb == rl.Def.Trigger.Verb
+	}
+}
+
+// eventAutomationID reads the target rule id from a targeted lane event's
+// payload (zero when absent).
+func eventAutomationID(payload json.RawMessage) int64 {
+	var p struct {
+		AutomationID int64 `json:"automation_id"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	return p.AutomationID
+}
+
+// eventCommand reads the invoked command from a slash event's payload.
+func eventCommand(payload json.RawMessage) string {
+	var p struct {
+		Command string `json:"command"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	return p.Command
 }
 
 type stepTrace struct {

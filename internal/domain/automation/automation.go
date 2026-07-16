@@ -16,6 +16,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -58,9 +59,37 @@ type Definition struct {
 	Steps      []Step      `json:"steps"`
 }
 
+// Trigger selects what fires a rule. Kind absent = "event" (every definition
+// stored before P-23 stays valid; normalized at validate and on load). Each
+// kind reads only its own fields — a field foreign to the kind must be absent.
 type Trigger struct {
-	Verb string `json:"verb"`
+	Kind     string    `json:"kind,omitempty"`
+	Verb     string    `json:"verb,omitempty"`     // event: an event-log verb from triggerVerbs
+	Schedule *Schedule `json:"schedule,omitempty"` // schedule: the cadence (required)
+	Command  string    `json:"command,omitempty"`  // slash: the command name (required)
 }
+
+// Trigger kinds (Definition.Trigger.Kind).
+const (
+	kindEvent    = "event"
+	kindSchedule = "schedule"
+	kindWebhook  = "webhook"
+	kindSlash    = "slash"
+)
+
+// The internal verbs the schedule/webhook/slash lanes append. They are
+// deliberately NOT in triggerVerbs: they are not event-pattern-subscribable,
+// so matching them is TARGETED (schedule/webhook by payload.automation_id,
+// slash by command + scope coverage) rather than by open verb subscription.
+const (
+	verbScheduleDue     = "automation.schedule_due"
+	verbWebhookReceived = "automation.webhook_received"
+	verbSlashInvoked    = "automation.slash_invoked"
+)
+
+// slashCommandRe bounds a slash command name — shared by the definition and
+// the invocation path.
+var slashCommandRe = regexp.MustCompile(`^[a-z0-9][a-z0-9_-]{0,31}$`)
 
 type Step struct {
 	Kind string `json:"kind"`
@@ -137,8 +166,8 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 	if err := dec.Decode(&def); err != nil {
 		return def, apperr.Invalid("definition: " + err.Error())
 	}
-	if !triggerVerbs[def.Trigger.Verb] {
-		return def, apperr.Invalid(fmt.Sprintf("definition: unknown trigger verb %q", def.Trigger.Verb))
+	if err := validateTrigger(&def.Trigger); err != nil {
+		return def, err
 	}
 	if err := validateConditions(def.Conditions); err != nil {
 		return def, err
@@ -179,6 +208,47 @@ func (s *Service) validateDefinition(ctx context.Context, tx pgx.Tx, orgID int64
 		}
 	}
 	return def, nil
+}
+
+// validateTrigger normalizes the kind (absent = event) and enforces the
+// per-kind shape: an "event" trigger names a verb from triggerVerbs;
+// "schedule" carries a valid schedule; "webhook" carries nothing more;
+// "slash" names a valid command. A field foreign to the kind must be ABSENT —
+// a stray verb on a webhook rule is a misconfiguration, never silently ignored.
+func validateTrigger(t *Trigger) error {
+	if t.Kind == "" {
+		t.Kind = kindEvent
+	}
+	switch t.Kind {
+	case kindEvent:
+		if !triggerVerbs[t.Verb] {
+			return apperr.Invalid(fmt.Sprintf("definition: unknown trigger verb %q", t.Verb))
+		}
+		if t.Schedule != nil || t.Command != "" {
+			return apperr.Invalid("definition: an event trigger takes only a verb")
+		}
+	case kindSchedule:
+		if t.Verb != "" || t.Command != "" {
+			return apperr.Invalid("definition: a schedule trigger takes only a schedule")
+		}
+		if err := validateSchedule(t.Schedule); err != nil {
+			return err
+		}
+	case kindWebhook:
+		if t.Verb != "" || t.Schedule != nil || t.Command != "" {
+			return apperr.Invalid("definition: a webhook trigger takes no verb, schedule, or command")
+		}
+	case kindSlash:
+		if t.Verb != "" || t.Schedule != nil {
+			return apperr.Invalid("definition: a slash trigger takes only a command")
+		}
+		if !slashCommandRe.MatchString(t.Command) {
+			return apperr.Invalid("definition: slash command must match ^[a-z0-9][a-z0-9_-]{0,31}$")
+		}
+	default:
+		return apperr.Invalid(fmt.Sprintf("definition: unknown trigger kind %q", t.Kind))
+	}
+	return nil
 }
 
 // Create stores a rule DISABLED — create, review, then enable. A human
