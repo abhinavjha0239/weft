@@ -144,7 +144,7 @@ func (s *Service) togglePin(ctx context.Context, actor auth.Identity, msgID int6
 func (s *Service) ListChannelPins(ctx context.Context, actor auth.Identity, channelID int64) ([]PinnedMessage, error) {
 	out := []PinnedMessage{}
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.requireMember(ctx, tx, channelID, actor.UserID); err != nil {
+		if err := s.requireMember(ctx, tx, actor.OrgID, channelID, actor.UserID); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `

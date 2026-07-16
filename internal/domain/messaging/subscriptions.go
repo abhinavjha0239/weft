@@ -45,7 +45,7 @@ func (s *Service) SetThreadSubscription(ctx context.Context, actor auth.Identity
 		if kind == 2 {
 			return apperr.Invalid("the channel root thread cannot be followed or muted")
 		}
-		if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+		if err := s.requireMember(ctx, tx, actor.OrgID, *channelID, actor.UserID); err != nil {
 			return err
 		}
 		if state == 0 {
@@ -88,7 +88,7 @@ func (s *Service) SetChannelNotification(ctx context.Context, actor auth.Identit
 		return apperr.Invalid("level must be 0 (inherit), 1 (all), 2 (mentions) or 3 (nothing)")
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.requireMember(ctx, tx, channelID, actor.UserID); err != nil {
+		if err := s.requireMember(ctx, tx, actor.OrgID, channelID, actor.UserID); err != nil {
 			return err
 		}
 		if p.Level != nil {

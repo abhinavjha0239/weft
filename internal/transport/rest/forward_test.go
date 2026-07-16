@@ -251,9 +251,10 @@ func TestForwarding(t *testing.T) {
 		t.Fatalf("private-source forward = %d, want 404", code)
 	}
 
-	// 6. Target send-gate 403: bob may read src (channel A) but cannot post
-	//    into the private channel he is not a member of.
-	if code := forwardStatus(bobTok, src, privRoot, ""); code != http.StatusForbidden {
-		t.Fatalf("target send-gate forward = %d, want 403", code)
+	// 6. Target send-gate 404 (P-34): bob may read src (channel A) but the
+	//    private target channel he is not a member of is masked — the forward's
+	//    send gate is the same oracle-free 404 a direct send would return.
+	if code := forwardStatus(bobTok, src, privRoot, ""); code != http.StatusNotFound {
+		t.Fatalf("target send-gate forward = %d, want 404", code)
 	}
 }

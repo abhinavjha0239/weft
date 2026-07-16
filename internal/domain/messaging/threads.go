@@ -55,7 +55,7 @@ func (s *Service) CreateThread(ctx context.Context, actor auth.Identity, p Creat
 		if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
 			return err
 		}
-		if err := s.requireMember(ctx, tx, p.ChannelID, actor.UserID); err != nil {
+		if err := s.requireMember(ctx, tx, actor.OrgID, p.ChannelID, actor.UserID); err != nil {
 			return err
 		}
 		if err := s.requireLiveChannel(ctx, tx, actor.OrgID, p.ChannelID); err != nil {
@@ -150,7 +150,7 @@ func (s *Service) UpdateThread(ctx context.Context, actor auth.Identity, threadI
 		if err != nil {
 			return err
 		}
-		if err := s.requireMember(ctx, tx, *channelID, actor.UserID); err != nil {
+		if err := s.requireMember(ctx, tx, actor.OrgID, *channelID, actor.UserID); err != nil {
 			return err
 		}
 
@@ -229,7 +229,7 @@ func (s *Service) ListThreads(ctx context.Context, actor auth.Identity, channelI
 	}
 	var page ThreadPage
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.requireChannelRead(ctx, tx, channelID, actor.UserID); err != nil {
+		if err := s.requireChannelRead(ctx, tx, actor.OrgID, channelID, actor.UserID); err != nil {
 			return err
 		}
 		rows, err := tx.Query(ctx, `
@@ -293,7 +293,7 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 		}
 		var historyFrom *time.Time
 		if channelID != nil {
-			if err := s.requireChannelRead(ctx, tx, *channelID, actor.UserID); err != nil {
+			if err := s.requireChannelRead(ctx, tx, actor.OrgID, *channelID, actor.UserID); err != nil {
 				return err
 			}
 			// P-16: a protected channel (history_mode 2) bounds each member's
@@ -352,40 +352,84 @@ func (s *Service) ListMessages(ctx context.Context, actor auth.Identity, threadI
 	return page, nil
 }
 
-// requireMember is the visibility gate (ADR-008 C-2 read-model slice).
-func (s *Service) requireMember(ctx context.Context, tx pgx.Tx, channelID, userID int64) error {
-	var member bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM channel_member
-		 WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NULL)`,
-		channelID, userID).Scan(&member); err != nil {
-		return apperr.Internal("membership check", err)
+// channelAccess is the single org-pinned visibility probe behind the P-34
+// masking gates (requireMember / requireChannelRead). One query resolves the
+// channel row — org-pinned, ANY archived state, since a member keeps an
+// archived private channel's history (the lifecycle contract) — and whether
+// the user is a LIVE member. An absent or foreign-org channel is an
+// oracle-free NotFound("channel not found"); the wrappers map a private
+// non-member to the IDENTICAL NotFound, so absent / foreign / masked are
+// indistinguishable by construction.
+func (s *Service) channelAccess(ctx context.Context, tx pgx.Tx, orgID, channelID, userID int64) (visibility int16, member bool, err error) {
+	err = tx.QueryRow(ctx, `
+		SELECT c.visibility,
+		       EXISTS (SELECT 1 FROM channel_member cm
+		               WHERE cm.channel_id = c.id AND cm.user_id = $3
+		                 AND cm.unsubscribed_at IS NULL)
+		FROM channel c
+		WHERE c.id = $1 AND c.org_id = $2`,
+		channelID, orgID, userID).Scan(&visibility, &member)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return 0, false, apperr.NotFound("channel not found")
 	}
-	if !member {
-		return apperr.Forbidden("not a channel member")
+	if err != nil {
+		return 0, false, apperr.Internal("channel access", err)
 	}
-	return nil
+	return visibility, member, nil
 }
 
-// requireChannelRead is the READ gate (P-16): live membership, or the channel
-// is web-public AND live. Web-public is world-readable, member-writable — the
-// WRITE paths (requireThreadSend, CreateThread, pins) must keep requireMember,
-// or non-members could post. Archiving closes the web-public branch while
-// members keep their history (the lifecycle contract).
-func (s *Service) requireChannelRead(ctx context.Context, tx pgx.Tx, channelID, userID int64) error {
-	var ok bool
-	if err := tx.QueryRow(ctx, `
-		SELECT EXISTS (SELECT 1 FROM channel_member
-		 WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NULL)
-		OR EXISTS (SELECT 1 FROM channel
-		 WHERE id = $1 AND visibility = 3 AND archived_at IS NULL)`,
-		channelID, userID).Scan(&ok); err != nil {
-		return apperr.Internal("read-access check", err)
+// requireMember is the WRITE/visibility gate (ADR-008 C-2), now P-34
+// existence-masking. A live member passes. A non-member of a PRIVATE channel
+// gets the oracle-free NotFound — indistinguishable from an absent/foreign
+// channel — so a stranger can never confirm the channel exists. A non-member
+// of a PUBLIC or web-public channel gets Forbidden: those are directory-
+// knowable, so the join affordance and the send-before-join 403 stay honest.
+func (s *Service) requireMember(ctx context.Context, tx pgx.Tx, orgID, channelID, userID int64) error {
+	visibility, member, err := s.channelAccess(ctx, tx, orgID, channelID, userID)
+	if err != nil {
+		return err
 	}
-	if !ok {
+	if member {
+		return nil
+	}
+	if visibility == visibilityPrivate {
+		return apperr.NotFound("channel not found")
+	}
+	return apperr.Forbidden("not a channel member")
+}
+
+// requireChannelRead is the READ gate (P-16): a live member, or a LIVE
+// web-public channel (world-readable, member-writable — the WRITE paths keep
+// requireMember, or non-members could post). P-34 masking layers on top: a
+// non-member of a PRIVATE channel is the oracle-free NotFound; a non-member of
+// a PUBLIC channel is Forbidden (existence is org-knowable). Archiving closes
+// the web-public non-member branch (members keep their history) and — its
+// existence having been public — yields Forbidden, not the private mask.
+func (s *Service) requireChannelRead(ctx context.Context, tx pgx.Tx, orgID, channelID, userID int64) error {
+	visibility, member, err := s.channelAccess(ctx, tx, orgID, channelID, userID)
+	if err != nil {
+		return err
+	}
+	if member {
+		return nil
+	}
+	switch visibility {
+	case visibilityWebPublic:
+		var live bool
+		if err := tx.QueryRow(ctx,
+			`SELECT archived_at IS NULL FROM channel WHERE id = $1 AND org_id = $2`,
+			channelID, orgID).Scan(&live); err != nil {
+			return apperr.Internal("read-access check", err)
+		}
+		if live {
+			return nil
+		}
+		return apperr.Forbidden("not a channel member")
+	case visibilityPrivate:
+		return apperr.NotFound("channel not found")
+	default:
 		return apperr.Forbidden("not a channel member")
 	}
-	return nil
 }
 
 // requireParticipant is the DM visibility gate: participation IS the
@@ -540,7 +584,7 @@ func (s *Service) RequireChannelSend(ctx context.Context, tx pgx.Tx, actor auth.
 	if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
 		return err
 	}
-	if err := s.requireMember(ctx, tx, channelID, actor.UserID); err != nil {
+	if err := s.requireMember(ctx, tx, actor.OrgID, channelID, actor.UserID); err != nil {
 		return err
 	}
 	return s.requireLiveChannel(ctx, tx, actor.OrgID, channelID)

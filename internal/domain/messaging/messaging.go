@@ -67,18 +67,12 @@ func (s *Service) Send(ctx context.Context, actor auth.Identity, p SendParams) (
 		if err := s.perms.Require(ctx, tx, actor, perms.VerbSendMessage, chain); err != nil {
 			return err
 		}
-		// Visibility gate, separate from the verb: private-channel content is
-		// member-only (ADR-008 C-2 read model; conservative for public too
-		// until the read model lands).
-		var member bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM channel_member
-			 WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NULL)`,
-			p.ChannelID, actor.UserID).Scan(&member); err != nil {
-			return apperr.Internal("membership check", err)
-		}
-		if !member {
-			return apperr.Forbidden("not a channel member")
+		// Visibility gate, separate from the verb (P-34): a member passes; a
+		// non-member of a PRIVATE channel is masked (the oracle-free 404 that
+		// makes send indistinguishable from an absent channel), while a
+		// non-member of a PUBLIC channel keeps the send-before-join 403.
+		if err := s.requireMember(ctx, tx, actor.OrgID, p.ChannelID, actor.UserID); err != nil {
+			return err
 		}
 		if err := s.requireLiveChannel(ctx, tx, actor.OrgID, p.ChannelID); err != nil {
 			return err
