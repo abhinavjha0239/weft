@@ -10,8 +10,10 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -45,6 +47,10 @@ type Service struct {
 	// SetPerms. Nil is fine for tests that never hit those endpoints —
 	// enforcement in Upload/StoreDocument needs no perms.
 	perms *perms.Service
+	// log records best-effort work that must never fail an upload — today,
+	// P-18 thumbnail generation. Wired via SetLogger; nil falls back to
+	// slog.Default() (the logger() accessor).
+	log *slog.Logger
 }
 
 func New(pool *pgxpool.Pool, store blob.Store) *Service {
@@ -158,6 +164,16 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	}
 	if quarantined {
 		return File{}, apperr.Unprocessable("file rejected by malware scan")
+	}
+	// Best-effort thumbnail (P-18): render a derived JPEG for allowlisted
+	// images, AFTER the scan verdict and the blob Put, so a clean image is
+	// browsable inline. Generation NEVER gates the upload — a non-image is
+	// silently ignored; a corrupt image or an over-cap decompression bomb is
+	// logged and skipped. A GET can still backfill it lazily later.
+	if _, seekErr := spool.Seek(0, io.SeekStart); seekErr == nil {
+		if _, _, terr := s.renderThumbFrom(ctx, key, spool); terr != nil && !errors.Is(terr, errNotRenderable) {
+			s.logger().Warn("thumbnail generation failed", "file_id", out.ID, "err", terr)
+		}
 	}
 	out.Name, out.Mime, out.Size, out.SHA = name, mime, size, shaHex
 	out.URL = fmt.Sprintf("/api/v1/files/%d", out.ID)

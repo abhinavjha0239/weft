@@ -88,6 +88,39 @@ func (a *api) handleDownloadFile(w http.ResponseWriter, r *http.Request) {
 	a.streamFile(w, meta, rc)
 }
 
+// handleThumbnail: GET /api/v1/files/{id}/thumbnail — serves a derived JPEG
+// rendition of an image file, INLINE. Authorization is EXACTLY the download
+// ACL (OpenThumbnail → authorizeDownload): a file you cannot download has no
+// thumbnail, so denied / absent / quarantined / non-image collapse to one
+// oracle-free 404. Inline is safe ONLY because WE encoded these bytes as JPEG
+// (the avatar precedent, handlers_avatar.go) — originals keep attachment
+// disposition (handlers_files.go's stored-XSS stance is untouched). The
+// original + thumbnail dimensions ride as headers (client layout hints; no
+// schema change).
+func (a *api) handleThumbnail(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	fileID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad file id")
+		return
+	}
+	meta, rc, err := a.Files.OpenThumbnail(r.Context(), id, fileID)
+	if err != nil {
+		writeDomainError(w, a.Log, r, err)
+		return
+	}
+	defer rc.Close()
+	h := w.Header()
+	h.Set("Content-Type", "image/jpeg")
+	h.Set("X-Content-Type-Options", "nosniff")
+	h.Set("Cache-Control", "private, max-age=3600")
+	h.Set("Content-Disposition", "inline")
+	h.Set("X-Image-Width", strconv.Itoa(meta.SrcW))
+	h.Set("X-Image-Height", strconv.Itoa(meta.SrcH))
+	h.Set("X-Thumbnail-Width", strconv.Itoa(meta.W))
+	h.Set("X-Thumbnail-Height", strconv.Itoa(meta.H))
+	_, _ = io.Copy(w, rc)
+}
+
 // handleSignLink mints a signed capability URL for a file (POST
 // /files/{id}/link), running the SAME download ACL as a fetch. A server with
 // no signing secret configured is a clear 500 (operator misconfiguration, not
