@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/files"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
@@ -307,6 +308,15 @@ func (j *Janitor) purgeFile(ctx context.Context, fileID int64, predicate string,
 			return nil
 		}
 		*blobs++
+		// P-18: the thumbnail is a DERIVED blob (files.ThumbKey) under the
+		// original's content-addressed key, never a file row — so it is
+		// reclaimed HERE, gated by the SAME twin rule as the original (the
+		// deleteBlob = !twinLive decision above): a live twin keeps the shared
+		// original AND its shared thumb key. Best-effort like the original's
+		// own delete; an orphaned thumb is recoverable, never a live-row issue.
+		if err := j.store.Delete(ctx, files.ThumbKey(key)); err != nil {
+			j.log.Warn("janitor: thumb delete failed", "key", key, "err", err)
+		}
 	}
 	return nil
 }

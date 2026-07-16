@@ -171,6 +171,9 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	// Download is NOT withAuth-wrapped: it self-authenticates the bearer path
 	// and leaves the signed-link path (?sig=) unauthenticated (P-07).
 	mux.HandleFunc("GET /api/v1/files/{id}", a.handleDownloadFile)
+	// Thumbnails serve inline (weft-encoded JPEG only); the bearer ACL is the
+	// download ACL, so this one IS withAuth-wrapped (the avatar precedent).
+	mux.HandleFunc("GET /api/v1/files/{id}/thumbnail", a.withAuth(a.handleThumbnail))
 	mux.HandleFunc("POST /api/v1/files/{id}/link", a.withAuth(a.handleSignLink))
 	mux.HandleFunc("PUT /api/v1/me/avatar", a.withAuth(a.handleSetAvatar))
 	mux.HandleFunc("DELETE /api/v1/me/avatar", a.withAuth(a.handleClearAvatar))
