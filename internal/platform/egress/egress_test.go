@@ -265,8 +265,52 @@ func TestPostDoesNotFollowRedirect(t *testing.T) {
 	}
 }
 
+// TestPostRawContentTypeAndGuard: PostRaw is Post with a caller-set
+// Content-Type (Web Push sends an aes128gcm blob, not JSON). It carries the
+// caller's headers, our User-Agent wins, and it rides the SAME guard — a
+// private resolution is rejected pre-dial exactly like Post.
+func TestPostRawContentTypeAndGuard(t *testing.T) {
+	var gotMethod, gotUA, gotCT, gotEncoding, gotAuth, gotBody string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotUA = r.UserAgent()
+		gotCT = r.Header.Get("Content-Type")
+		gotEncoding = r.Header.Get("Content-Encoding")
+		gotAuth = r.Header.Get("Authorization")
+		b, _ := io.ReadAll(r.Body)
+		gotBody = string(b)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer ts.Close()
+
+	c := New(Options{UserAgent: "weftbot-test/1.0", AllowLoopbackForTests: true})
+	body := []byte{0x01, 0x02, 0x03, 0xff}
+	resp, err := c.PostRaw(context.Background(), ts.URL,
+		map[string]string{"Content-Encoding": "aes128gcm", "Authorization": "vapid t=jwt,k=key", "TTL": "86400"},
+		body, "application/octet-stream")
+	if err != nil {
+		t.Fatalf("PostRaw(httptest) = %v", err)
+	}
+	resp.Body.Close()
+	if gotMethod != http.MethodPost || gotUA != "weftbot-test/1.0" ||
+		gotCT != "application/octet-stream" || gotEncoding != "aes128gcm" ||
+		gotAuth != "vapid t=jwt,k=key" || gotBody != string(body) {
+		t.Fatalf("method %q UA %q CT %q enc %q auth %q body %q",
+			gotMethod, gotUA, gotCT, gotEncoding, gotAuth, gotBody)
+	}
+
+	// Same guard as Post: an internal-resolving host is refused before any dial.
+	g := New(Options{
+		UserAgent: "test",
+		LookupIP:  fakeLookup(map[string][]string{"internal.test": {"10.0.0.7"}}),
+	})
+	if _, err := g.PostRaw(context.Background(), "http://internal.test/push", nil, []byte{0}, "application/octet-stream"); !errors.Is(err, ErrDisallowed) {
+		t.Fatalf("PostRaw(internal) = %v, want ErrDisallowed", err)
+	}
+}
+
 // TestPostBlocksPrivateResolution: a hostname resolving to an internal address
-// is rejected by the guard BEFORE any dial, exactly like Get.
+// is rejected by the guard BEFORE any dial, exactly like Post.
 func TestPostBlocksPrivateResolution(t *testing.T) {
 	c := New(Options{
 		UserAgent: "test",

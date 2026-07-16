@@ -45,6 +45,13 @@ type Config struct {
 	// BaseURL is the public origin used to build absolute links in email
 	// (the one-click unsubscribe URL). Trailing slash trimmed.
 	BaseURL string
+	// Web Push (P-21): the VAPID key pair (base64url raw P-256 keys) and the
+	// contact subject (mailto:/https:). All three unset → the push lane is a
+	// structural no-op and the subscribe API 409s (the mail log-driver spirit:
+	// dev/CI never need keys). `weftd gen-vapid-keys` prints a fresh pair.
+	VAPIDPublicKey  string
+	VAPIDPrivateKey string
+	PushSubject     string
 }
 
 func Load() (Config, error) {
@@ -74,6 +81,9 @@ func Load() (Config, error) {
 	c.SMTPFrom = os.Getenv(brand.EnvPrefix + "SMTP_FROM")
 	c.SMTPUser = os.Getenv(brand.EnvPrefix + "SMTP_USER")
 	c.SMTPPass = os.Getenv(brand.EnvPrefix + "SMTP_PASS")
+	c.VAPIDPublicKey = os.Getenv(brand.EnvPrefix + "VAPID_PUBLIC_KEY")
+	c.VAPIDPrivateKey = os.Getenv(brand.EnvPrefix + "VAPID_PRIVATE_KEY")
+	c.PushSubject = os.Getenv(brand.EnvPrefix + "PUSH_SUBJECT")
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("%sDATABASE_URL is required", brand.EnvPrefix)
 	}

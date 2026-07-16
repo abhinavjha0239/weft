@@ -138,6 +138,35 @@ func (c *Client) Post(ctx context.Context, rawURL string, headers map[string]str
 // It is the client New built; callers must not mutate it.
 func (c *Client) HTTPClient() *http.Client { return c.http }
 
+// PostRaw is Post with a caller-chosen Content-Type instead of the fixed
+// application/json — the ONLY difference. It shares Post's spine verbatim: the
+// URL shape is vetted before any network work, the pinned dialer vets every
+// resolved address, no credentials of OUR own are attached, and a POST NEVER
+// follows a redirect (New's CheckRedirect hands a 30x straight back). Web Push
+// (RFC 8291) needs this: its body is an aes128gcm blob, not JSON, and it rides
+// this same guard because the endpoint is a user-registered URL. Caller headers
+// are set first so our User-Agent and Content-Type always win; the caller owns
+// resp.Body and MUST cap reads with an io.LimitReader.
+func (c *Client) PostRaw(ctx context.Context, rawURL string, headers map[string]string, body []byte, contentType string) (*http.Response, error) {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %v", ErrDisallowed, err)
+	}
+	if err := c.opts.vetURL(u); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, u.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, err
+	}
+	for k, v := range headers {
+		req.Header.Set(k, v)
+	}
+	req.Header.Set("User-Agent", c.opts.UserAgent)
+	req.Header.Set("Content-Type", contentType)
+	return c.http.Do(req)
+}
+
 // VetURLShape runs only the static, network-free URL checks (scheme http(s),
 // no userinfo, standard ports) that vetURL applies with production options —
 // for validating a configured destination at definition time, so an operator

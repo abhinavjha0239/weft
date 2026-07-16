@@ -15,6 +15,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
+	"github.com/abhinavjha0239/weft/internal/platform/webpush"
 )
 
 // Reason classes (notification.kind), in the schema comment's order
@@ -37,6 +38,10 @@ type Service struct {
 	// unsubSecret keys the one-click unsubscribe MAC (P-20); empty disables
 	// the unsubscribe endpoints (they 404 — nothing to verify against).
 	unsubSecret string
+	// push is the configured Web Push VAPID identity (P-21); nil = push
+	// unconfigured, so the subscribe API 409s and the lane is a no-op (the
+	// mail log-driver spirit — dev/CI never need keys).
+	push *webpush.Sender
 }
 
 func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
