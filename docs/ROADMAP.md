@@ -2132,6 +2132,681 @@ decision, not this slice).
 
 ---
 
+## Tier 1 — SCALE CLUSTER (promoted 2026-07-17)
+
+### Cluster: `scale: Hold a 100k mega-org in one cell.` (P-36…P-43 ≡ S0…S7)
+
+Full research dossier (verified current-state map with `file:line`
+evidence, starting-map corrections, honest-deferral ledger):
+`~/Documents/oss-chat-platform/scale-mega-cell-spec.md`. The S-numbers
+below are used for cross-references inside the cluster; the P-numbers
+keep the queue convention. Entries are SPEC-READY unless marked
+DEFERRED.
+
+**North star.** Weft must genuinely hold a mega-org at ~100k inside a
+SINGLE Postgres cell on all three axes simultaneously: membership (100k
+members in one channel), throughput (sustained write+consume volume),
+and connections (~100k live WebSockets). The cell model puts a whole org
+in ONE cell, so sharding cannot rescue a hot path. The non-negotiable
+invariant:
+
+> **NO per-message cost may scale with membership, connection count, or
+> message volume. Every per-message op is O(1); all O(N) work is pushed
+> to RARE events (joins, pref edits, group edits) and made incremental,
+> async, or coalesced there.**
+
+**The O(N)-blowup ledger this cluster closes:**
+
+| Axis | Blowup today | Slice |
+|---|---|---|
+| Connections | O(connections) `event_log` queries per message (`gateway.go:256-263`) | **S3** |
+| Membership | O(members) live join per message (`runner.go:195-207`) | **S1** |
+| Membership | O(members) unread aggregate per read (`readstate.go:131-143`) | **S6** |
+| Membership | O(members) synchronous closure rebuild per group edit (`perms.go:235-257`), 2× per invite | **S2** |
+| Throughput | DB-global xmin stall (`consumer.go:60`); NOTIFY per append | **S4** |
+| Connections | O(connections) presence fans under one mutex; multi-node fragmentation (`presence.go`) | **S5** |
+| (proof) | no lag/fan metrics; rig never drove 100k (`ARCHITECTURE.md:101-106`, `PERF.md:69`) | **S0** |
+| (security) | agent write-back has no grant∩permission enforcement (`capability_grant` unused) | **S7 (deferred)** |
+
+**Migrations pre-assigned** (current max = `0020`): `0021` S1, `0022`
+S2, `0023` S6, `0024` S4. S0, S3, S5, S7 are migration-free or reuse
+dormant tables. Append-only rule holds.
+
+**Dispatch topology.** S0 and S1 dispatch in PARALLEL on separate
+worktrees (reviewer-approved deviation from the dossier's serial-first
+ordering: the metrics seam API is PINNED below, so S1 codes against it;
+S0 merges FIRST and S1 is rebased on it, the reviewer reconciling the
+shared `internal/platform/metrics` package and the runner counter —
+same reviewer-owned cross-slice wiring precedent as the worktrack
+cluster). Then S2 (serial, Fable execution) → S6 → S4 (serial, Fable
+execution, its own window) → S5 (serial with S3's hub changes). S3 may
+run parallel with S2/S6 once S0 is merged. S7 stays DEFERRED.
+
+**Decisions locked at promotion (were flagged as options in the
+dossier):**
+
+1. **S0 metrics driver: `expvar` (stdlib, no dep).** A
+   `platform/metrics` seam with a `noop` default and an expvar-backed
+   driver; Prometheus stays a one-file driver an operator can add later
+   (mirrors the `blob.Store` seam precedent).
+2. **S4 feed: `jackc/pglogrepl`.** A go-oidc-class justified dep
+   exception (WAL replication protocol + keepalives + slot management
+   are not responsibly hand-rollable; same author family as the
+   existing `pgx` dep). The written justification lands with S4's PR.
+   The no-dep per-org commit-fence fallback is recorded in the dossier.
+3. **S5 presence plane: the dormant UNLOGGED `presence` table +
+   LISTEN/NOTIFY** (wakes `0006:56-62`; no new dep; cell-local). An
+   external cache is a later driver behind the same seam.
+4. **S6 DM counters: same `channel_unread_counter` table** for
+   symmetry (DM spaces are containers like channels).
+
+---
+
+### P-36 (S0) `scale: 100k-org proof harness + consumer-lag metrics.` — L — **[~] in flight (Opus executor)**
+
+**What & why.** The cluster's whole point is designed→built+**PROVEN**.
+Today there is no way to prove any scale guard: no lag metric
+(`ARCHITECTURE.md:101-106` designed, not built — grep finds no
+`prometheus`/`expvar` anywhere in `internal/` or `cmd/`), and the rig
+has never driven a single mega-org (`PERF.md:69`). S0 builds the
+proving ground FIRST so every later slice attaches a red/green scale
+pin to real numbers.
+
+**O(1) invariant defended:** none directly — it MEASURES the invariants
+so the others can prove them. **O(N) blowup prevented:** measurement gap
+(unfalsifiable scale claims).
+
+**Current verified state.** `cmd/loadgen`/`internal/loadtest` is
+many-tenant small-fan (`loadtest.go:36-75`); no metrics registry
+anywhere; consumer cursor lag is derivable from `event_consumer_cursor`
+(`0001:60-66`) but nothing exposes it.
+
+**The build (decided):**
+
+- **Metrics seam** at `internal/platform/metrics`, config-picked driver
+  (`noop` default, `expvar` the shipped driver — DECIDED, no new dep).
+  The API is **PINNED** (S1/S2/S3/S4 assert against it verbatim):
+
+  ```go
+  package metrics
+
+  type Registry interface {
+      Counter(name string, labelNames ...string) Counter
+      Gauge(name string, labelNames ...string) Gauge
+  }
+  type Counter interface {
+      Add(delta float64, labelValues ...string)
+  }
+  type Gauge interface {
+      Set(value float64, labelValues ...string)
+  }
+  func Nop() Registry       // zero-cost default when metrics are off
+  func NewExpvar() Registry // the "expvar" driver; exposes /debug/vars
+  ```
+
+  `NewExpvar()` MUST be safe to construct repeatedly in one process
+  (tests run `-p 1` in a single binary): look up an already-published
+  `expvar.Map` before publishing (`expvar.Get` first) — a bare
+  `expvar.Publish` panics on a duplicate name. Labeled series publish
+  as map keys (`label=value` tuples) under the metric name. Metric
+  names carry NO brand prefix (brand-token lint).
+- **Counters/gauges:** `fanout_events_total{consumer}`,
+  `fanout_deliveries_total`, `consumer_lag{consumer,org}` (max
+  committed id − cursor last_id, THE health signal per
+  `ARCHITECTURE.md`/`SCHEMA.md`), `gateway_connections{org}`,
+  `gateway_pump_queries_total`,
+  `notification_candidates_scanned_total`, `closure_rebuild_seconds`.
+- **`consumer_lag` derivation:** one query per (consumer, org):
+  `MAX(event_log.id) − event_consumer_cursor.last_id` gated by the same
+  xmin horizon the consumers use.
+- **Loadgen mega-org mode:** a `-mega` config that provisions ONE org
+  with a single channel of N members (default 100k, via the service
+  layer, outside the timing window per `PERF.md:8-10`), opens M
+  connections (default 100k) to that org, and drives a fixed send rate
+  while recording (a) per-message fan-out DB query count, (b) delivery
+  p50/p99 by id-correlation (reuse the `loadtest.go` histogram), (c)
+  closure rebuild wall-time when a group edit is injected. No new
+  external dep for the rig.
+- **Instrument the four hot sites** (counters only, NO behavior
+  change): the gateway pump (`gateway.go:254`), the notification
+  candidate scan (`runner.go:195`), `RebuildClosure` (`perms.go:235`),
+  and `Consumer.Poll` (`consumer.go:50`). Thread the `Registry` in as
+  an optional dependency defaulting to `Nop()` — keep constructor
+  churn minimal.
+
+**Migrations.** None (metrics read existing tables; loadgen provisions
+via the service layer).
+
+**Red/green proof plan.** S0 is itself the proof INSTRUMENT, so its own
+tests assert the instrument reads reality: `TestConsumerLagMetric`
+(append events, do not consume, assert `consumer_lag` rises by exactly
+the backlog; consume, assert it falls to 0) and
+`TestMegaOrgHarnessSmoke` (provision a 2k-member channel — bounded for
+CI — 200 connections, one send, assert the pump-query counter rose by
+~connection-count, proving the S3 blowup is measurable BEFORE S3 fixes
+it). The full 100k run is an operator procedure documented beside
+`PERF.md`, not a CI gate (environment-bound, per `PERF.md:69` and
+`ARCHITECTURE.md:113`).
+
+**Risks / pre-mortem.** (1) Provisioning 100k members through the
+service layer is slow — keep it outside the timing window and cache a
+provisioned org between runs. (2) The harness must not itself become
+the bottleneck (the `PERF.md:44-51` VM-tax lesson) — run loadgen on
+separate hosts; document it. (3) The expvar duplicate-publish panic
+(mitigated above).
+
+**Dependencies + ordering.** FIRST to merge. S1 runs in parallel on its
+own worktree but merges after; every other slice attaches its red/green
+scale pin here.
+
+**Deferred (honest):** the full 100k CI floor stays deferred
+(rig-bound, `PERF.md:69`); S0 ships the harness + metrics + a bounded
+CI smoke, and the operator procedure for the real number.
+
+---
+
+### P-37 (S1) `notification: Materialized deliverability set + batch coalescing (F-17).` — L — migration 0021 — **[~] in flight (Fable executor)**
+
+**What & why.** The materializer joins ALL ~100k `channel_member` rows
+for EVERY message in a big channel (`runner.go:195-207`). F-17
+(`ADR-011:100-110`) makes the per-message candidate set O(reasons), not
+O(members): a maintained per-channel deliverability set records only
+the users with a NON-DEFAULT delivery reason (followers, `level=all`,
+alert-word holders), invalidated on the rare events that change those.
+A normal message in a 100k channel where nobody set `level=all` then
+notifies only its mentions (a handful) — O(mentions), not O(100k).
+
+**O(1) invariant defended:** per-message notification cost = O(actual
+reasons on the message), independent of channel membership.
+**O(N) blowup prevented:** the O(members) live join + O(members)
+candidate scan per message (`runner.go:195-207`).
+
+**Current verified state.** LIVE join per message: `runner.go:195-207`;
+keyword join `runner.go:360-375`; per-recipient insert
+`runner.go:282-313`. No deliverability table exists (SCHEMA
+"intentionally absent" list, `docs/SCHEMA.md:154-156`).
+
+**The build (decided):**
+
+- **Table `channel_deliverability` (0021):** `(channel_id, user_id,
+  reason SMALLINT, medium SMALLINT, org_id)`, PRIMARY KEY
+  `(channel_id, user_id, reason, medium)`, `fillfactor` tuned like
+  `channel_member`. `reason`: 1 follow (thread-level rides
+  `thread_subscription`), 2 level=all, 3 alert-word-holder. A row
+  EXISTS only for a non-default reason — a channel where everyone is
+  on defaults has ZERO rows, so the per-message join returns only
+  mentions. Index `(channel_id, reason)`.
+- **Invalidation triggers (the O(N)→rare-event push):** the set is
+  rebuilt/patched ONLY on: channel notification-level change
+  (`PUT /channels/{id}/notification`), thread follow/mute change
+  (`thread_subscription`), alert-word edit (`alert_word`), and
+  membership change (`member.joined`/`member.left`). Consume
+  `member.joined/left` via the event log (keeps messaging free of a
+  notification import); membership add/remove patches a single user's
+  rows (O(1) per join, not a channel rebuild). This invalidation
+  dispatch is built to be SHARED — S2 reuses it.
+- **Consumer-contract change:** `runner.processEvent` (`runner.go:149`)
+  replaces the live `channel_member` join (`:195-207`) with a join over
+  `channel_deliverability` for the activity/follow/keyword reasons;
+  mentions stay driven by the event payload (`p.Mentions`, already
+  O(1)). The DM path (`:251-273`) is unchanged (participant counts are
+  small by nature). The per-recipient insert + `dndSuppressed`
+  (`:282-313`) is unchanged in shape but now runs only for set members.
+- **Batch-id coalescing (F-17b):** bulk producers (sprint close
+  `sprint.closed`, automation sweeps, retention vacuum) stamp a
+  `batch_id` in the event `hint` (the reserved field, `eventlog.go:44`,
+  `ADR-002 P1`). The materializer groups per (user, batch_id) into ONE
+  digest notification row instead of N. Add `notification.batch_id
+  BIGINT NULL` (0021) + a partial index; the dedupe key (`0010`) gains
+  batch awareness. This prevents a 100k-item sprint close from minting
+  100k×members notifications.
+- **Backfill:** lazy, keyed by a `channel.deliverability_built_at`
+  marker (DECIDED — no big-bang migration over a live org): the set is
+  built for a channel on first use after deploy, then maintained by
+  the invalidation triggers.
+- **Metrics:** increment `notification_candidates_scanned_total` (the
+  PINNED S0 API) in the new candidate path. If
+  `internal/platform/metrics` is absent on your branch (S0 in flight),
+  create it as a separate prep commit implementing EXACTLY the pinned
+  API above and flag it in your report — the reviewer reconciles with
+  S0's package at merge.
+
+**Migrations.** `0021_notification_deliverability.sql`:
+`channel_deliverability` + indexes; `notification.batch_id`; a partial
+index for coalesced rows. Comments cite ADR-011 F-17.
+
+**Red/green proof plan.** `TestDeliverabilitySet` on real PG: (1) a
+big-member channel (bounded to e.g. 5k in CI) with nobody on level=all
+— send one message with one mention, assert exactly ONE notification
+row and assert the candidate-scan counter rose by O(1), NOT
+O(members). **RED:** revert `processEvent` to the live `channel_member`
+join → the counter rises by O(members) and the "scan is O(reasons)"
+assert goes red. (2) A user sets level=all → the set gains one row →
+the next message notifies them; unset → row gone. (3) Batch
+coalescing: a synthetic bulk event with N item-payloads + one batch_id
+→ ONE digest row per user, not N (RED: drop the batch_id grouping → N
+rows, assert goes red).
+
+**Risks / pre-mortem.** (1) **Invalidation drift** — a missed
+invalidation silently drops notifications (worse than the
+slow-but-correct status quo). Mitigation: a periodic reconciliation
+sweep (low-frequency, like the janitor) that recomputes a channel's set
+and logs divergences; the set is a CACHE of a derivable truth, never
+the source. (2) The membership-change patch rides the event log
+(`member.joined/left`), NOT a same-tx write from messaging — keeps
+module ownership clean. (3) level=all in a genuinely 100k-active
+channel is inherently O(N) recipients — accepted and bounded by batch
+coalescing + the digest; documented as the residual honest rung.
+
+**Dependencies + ordering.** Dispatched parallel with S0 on its own
+worktree; MERGES AFTER S0 (reviewer rebases + reconciles the metrics
+package and the runner counter). Serial pair with S2 (S1 defines the
+invalidation surface S2 reuses).
+
+**Deferred (honest):** the editable NotificationScheme matrix
+(`notification_scheme`, `0006:115-118`, N-5) stays dormant; item-event
+recipient resolvers stay out of scope; the genuinely-O(N) all-active
+channel is bounded, not eliminated.
+
+---
+
+### P-38 (S2) `perms: Async closure rebuild behind a version fence.` — L — migration 0022 — **[ ] (Fable execution — correctness-critical)**
+
+**What & why.** A 100k-member org-wide group edit rebuilds the ENTIRE
+`user_group_closure` synchronously in the writer's transaction
+(`perms.go:235-257`), holding a long lock and blocking every concurrent
+join/invite. Invite accept does it TWICE (`invites.go:335`+`:338`).
+This is the membership axis's rare-event O(N): correct today, but a
+mega-org group edit is a multi-second full-table churn inside a user
+request.
+
+**O(1) invariant defended:** the hot check `Require` stays ONE indexed
+closure lookup (`perms.go:85-101`) — UNCHANGED. **O(N) blowup
+prevented:** a full-org synchronous rebuild on the request path; the
+double rebuild per join.
+
+**Current verified state.** `RebuildClosure` synchronous full DELETE +
+recursive INSERT: `perms.go:235-257`. Callers: `perms.go:216, 226`,
+`invites.go:338`, `importer.go:879`. Double rebuild: `invites.go:335`
+(via `AddUserToGroup`→`perms.go:226`) + `invites.go:338`.
+
+**The build (design level).**
+
+- **Prep commit (no-op fix):** remove the redundant `invites.go:338`
+  `RebuildClosure` — `AddUserToGroup` already rebuilds (`perms.go:226`).
+  Separate commit. Red/green: a test asserting the closure is correct
+  after invite accept passes with ONE rebuild.
+- **Incremental delta maintenance (the primary build):** replace the
+  full DELETE+recompute with a DELTA. Adding user U to group G inserts
+  the closure rows for U into G and every ANCESTOR of G (walk
+  `user_group_subgroup` upward — bounded by nesting depth, not
+  membership); removing U deletes U's rows for G and ancestors that no
+  longer reach U. Group nesting edits (add/remove subgroup) patch only
+  the affected subtree × its members. This makes AddUserToGroup
+  O(depth), not O(org). The hot table and `Require` call site are
+  untouched (the `SCHEMA.md:48-52`/`perms.go:229-234` contract).
+- **Async rebuild behind a version fence (for the rare full recompute
+  — bulk import, subgroup restructure):** add
+  `user_group.closure_version` and `user_group_closure.version` (0022).
+  A full rebuild writes into the new version, then atomically flips a
+  per-org `closure_current_version` pointer; `Require`/`HoldersAt` read
+  `WHERE version = current`. Readers never see a half-built closure and
+  never block on the rebuild. A `closure_rebuild_job` row (claimed
+  `FOR UPDATE SKIP LOCKED`, multi-node-safe) drives the async recompute;
+  the version fence means an in-flight rebuild degrades gracefully.
+- **Consumer-contract change:** none for `Require`'s callers (the query
+  gains a `version = current` predicate transparently). Importer
+  (`importer.go:879`) switches to enqueue-an-async-rebuild.
+
+**Migrations.** `0022_closure_versioning.sql`: `closure_version`
+columns, `closure_rebuild_job` table, a per-org current-version
+row/table, indexes including `(group_id, user_id, version)`. Cite
+ADR-006 F-16 + `perms.go:229-234`.
+
+**Red/green proof plan.** `TestClosureIncremental` on real PG: (1)
+correctness parity — after a sequence of add/remove/nest edits, the
+incremental closure equals a from-scratch `WITH RECURSIVE` recompute
+(exhaustive equality, the load-bearing correctness pin). (2) Scale — a
+big-member org (bounded in CI), time `AddUserToGroup`; assert wall-time
+is flat as membership grows (and `closure_rebuild_seconds` via S0).
+**RED:** revert to the full DELETE+recompute → the metric scales with
+membership and the "flat" assert goes red. (3) Version fence — start a
+rebuild, assert concurrent `Require` calls read the OLD version and
+never block or see partial state (RED: drop the version predicate → a
+reader sees a half-built closure mid-rebuild). (4) Invite accept does
+exactly ONE rebuild (RED: the double-rebuild regression).
+
+**Risks / pre-mortem.** (1) **Incremental maintenance is subtly wrong
+on diamond nesting** (a user reachable via two paths — removing one
+path must not delete the closure row). Mitigation: the delta-delete
+recomputes reachability for the affected (group, user) pairs, never
+blind-deletes; the parity test with the recursive recompute is the
+guard. Highest-correctness-risk slice → Fable execution. (2) The
+version flip must be atomic and org-scoped (cell invariant). (3)
+Deactivation/`kind` changes affect `HoldersAt` (`perms.go:151-157`) —
+keep them consistent with the closure version.
+
+**Dependencies + ordering.** After S1 merges (reuses the shared
+membership-change invalidation dispatch). SERIAL — do not parallelize
+with S1.
+
+**Deferred (honest):** permission_profile / custom-group governance
+(`ADR-006 P-3`) stays out of scope; only the closure maintenance
+changes.
+
+---
+
+### P-39 (S3) `gateway: Per-org multicast — one query per event, fan in memory.` — L — no migration — **[ ]**
+
+**What & why.** One message to a 100k-connection org triggers ~100k
+independent `event_log` queries — each connection runs its own catch-up
+(`gateway.go:256-263`) after `wakeOrgLocked` signals all of them
+(`gateway.go:142-149`). This is THE connections-axis per-message
+blowup. The fix (designed in `PERF.md:66-71`): the dispatcher queries
+the org's new events ONCE, then fans the rows to that org's connections
+in memory, each connection applying its O(1) ACL filter
+(`gateway.go:320-346`) against the shared batch.
+
+**O(1) invariant defended:** per-message DB cost on the connections
+axis = O(1) `event_log` read per org per event-batch, independent of
+connection count. **O(N) blowup prevented:** O(connections) `event_log`
+queries per message.
+
+**Current verified state.** Per-connection pump query
+`gateway.go:256-263`; `wakeOrgLocked` signals every conn
+`gateway.go:142-149`; the O(1) ACL filter already exists
+`gateway.go:320-346`; the resume/gap machinery (F-2, `ADR-002:60-75`)
+and checkpoint heartbeat `gateway.go:242-248`.
+
+**The build (design level).**
+
+- **Per-org reader goroutine.** Replace per-connection pump-on-wake
+  with ONE per-org "multicast reader": on wake (NOTIFY or sweep) it
+  runs the single query (the existing pump SQL, hoisted to org scope,
+  from the org-min live cursor), then iterates its connections applying
+  `client.filter` (`gateway.go:320`) to the shared rows, delivering to
+  each connection whose ACL passes and advancing that connection's
+  `lastID`.
+- **Cursor model.** Connections at different `lastID` split into two
+  lanes: (a) LIVE connections caught up to the org head share the
+  single multicast read; (b) a resuming connection behind the org head
+  runs its OWN bounded catch-up (the current pump) UNTIL it reaches the
+  head, then joins the live lane. The per-connection query survives
+  only for the resume gap (rare, bounded by the 24h replay window),
+  never for steady-state live traffic.
+- **Concurrency:** the per-org reader owns delivery; `h.mu` is split
+  into a per-org lock (or a sharded lock map) so a 100k-connection org
+  does not serialize the whole hub. Writes to each conn stay serialized
+  by `client.writeMu` (`gateway.go:54-55`) — unchanged.
+- **No protocol change:** `seq` is still the event-log id, gaps still
+  expected (F-2, `ADR-002:60-75`); checkpoints unchanged
+  (`gateway.go:242-248`). The membership-refresh-on-`member.joined`
+  (`gateway.go:328-330`) still runs per affected connection.
+
+**Migrations.** None (in-memory dispatcher restructure).
+
+**Red/green proof plan.** `TestGatewayMulticast` + the S0 harness: N
+connections (bounded in CI, 100k operator run) to one org, send one
+message, assert `gateway_pump_queries_total` rose by O(1) per
+event-batch, NOT O(N). **RED:** revert to per-connection pump → the
+counter rises by ~N and the "one query per org" assert goes red. Plus
+correctness carry-over from the existing gateway suite: resume-gap
+replay still works, ACL filtering still drops non-member events,
+checkpoint heartbeat still fires.
+
+**Risks / pre-mortem.** (1) **A slow/dead connection must not stall the
+shared multicast** — deliver best-effort per conn (the existing
+`fanEphemeral` posture, `signals.go:150-153`), failing only that conn.
+(2) The live/resume lane split must not drop an event at the hand-off
+(connection reaches head exactly as a new event arrives) — the reader
+holds the org lock across "read batch + snapshot connection cursors" so
+the hand-off is a single consistent point. (3) Backpressure: a
+connection whose write buffer fills should be disconnected (resume
+later), not block the org — bounded per-conn send with a
+drop-then-checkpoint policy (F-2 "no undetectable loss" tolerates this
+— the client resyncs).
+
+**Dependencies + ordering.** After S0 merges (needs
+`gateway_pump_queries_total`). Parallel-capable with S2/S6 (disjoint:
+in-memory gateway, no shared tables). Must precede S5 (S5 shares the
+Hub lock split).
+
+**Deferred (honest):** WebTransport/QUIC pipe (`ADR-002:8-10`);
+cross-node connection routing (that is sticky-routing + S5's shared
+plane, not this slice).
+
+---
+
+### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[ ] (Fable execution — all-consumer contract; its own serial window)**
+
+**What & why.** The `txid < pg_snapshot_xmin(...)` gate
+(`consumer.go:60`) is DATABASE-GLOBAL: one long write tx anywhere
+stalls delivery for every org and every consumer (gateway,
+notifications, automations, unfurl, search). The designed replacement
+(`SCHEMA.md:127-130`, `PERF.md:73-74`): a logical-decoding feed where
+WAL order = commit order, so NO gate is needed — behind the SAME
+`Consumer` interface (`consumer.go:31`) so every consumer swaps
+transparently.
+
+**O(1) invariant defended:** delivery latency independent of unrelated
+concurrent transactions; no global stall point. **Blowup prevented:**
+one long tx stalling ALL delivery; NOTIFY storms at high event rates.
+
+**Current verified state.** Global gate `consumer.go:50-63` (`:60`) and
+its copy `gateway.go:260`; NOTIFY per append `eventlog.go:83-84`; the
+scale-tier note `consumer.go:21-31`, `SCHEMA.md:127-134`. Consumers:
+`notification` (`runner.go:48`), `automations`, `unfurl`, gateway pump.
+
+**The build (decided: `jackc/pglogrepl` — the justified dep
+exception; the written justification lands with the PR).**
+
+- **A logical-decoding reader** consumes the WAL via a replication slot
+  + publication on `event_log`, decoding committed INSERTs in COMMIT
+  order — no xmin gate because uncommitted rows never appear. The
+  `Consumer` interface gains a logical-backed implementation.
+- **Interface preservation:** `eventlog.Consumer` (`consumer.go:31`)
+  keeps `Poll`/`Ack`; a new `LogicalConsumer` implements the same
+  shape. Offsets become LSN-based; `event_consumer_cursor`
+  (`0001:60-66`) gains a nullable `lsn` column (0024) alongside
+  `last_id` (id ordering stays the client-facing `seq`, LSN is the
+  internal cursor). Replay = reset LSN. Idempotency (dedupe keys /
+  ON CONFLICT) is already required (outbox rule) so at-least-once is
+  safe.
+- **NOTIFY coalescing (folds in):** coalesce `pg_notify` per (tx, org)
+  instead of per append (`eventlog.go:83-84`; `SCHEMA.md:134`). With
+  logical decoding the feed is push-driven, so NOTIFY becomes a
+  wake-hint only.
+- **Cell invariant:** the slot/publication is per-cell (one Postgres);
+  decoding is per-org-ordered by filtering `org_id` in the decode
+  handler. No cross-org coordination (`SCHEMA.md:112-120`). Slot
+  creation is a deploy-time operator step, documented in the runbook
+  (not a schema migration).
+
+**Migrations.** `0024_logical_decoding_offsets.sql`:
+`event_consumer_cursor.lsn` column. Publication/slot creation is
+documented as an operator step. Cite ADR-003 F-1 + `consumer.go:21-31`.
+
+**Red/green proof plan.** `TestLogicalFeedNoGlobalStall`: open a
+deliberately long-running write tx in org A, then send+consume in org
+B; assert org B's `consumer_lag` (S0) stays ~0. **RED:** point the
+consumer at the old xmin-gated `Poll` → org B stalls behind org A's
+long tx and the "no cross-org stall" assert goes red (the exact blowup
+`consumer.go:22-26` describes). Plus parity: no event skipped, commit
+order preserved under the logical feed.
+
+**Risks / pre-mortem.** (1) Replication slots retain WAL if a consumer
+dies — a stuck slot fills the disk. Mitigation: slot monitoring via S0
+metrics + a max-lag alarm + documented operator runbook; a bounded slot
+with a drop-and-resync policy. (2) Highest-risk slice — changes the
+delivery mechanism under EVERY consumer → Fable execution, its own
+serial window, only after S1 (stable consumer logic) and ideally S3
+(the feed plugs into the multicast reader, one place). (3) It is a
+latency/liveness fix, not a per-message-O(N) fix — sequenced after the
+true O(N) blowups.
+
+**Dependencies + ordering.** After S1, ideally after S3. SERIAL, its
+own window.
+
+**Deferred (honest):** NATS/Kafka broker (`ADR-003 E1`); the no-dep
+per-org commit-fence fallback stays recorded in the dossier.
+
+---
+
+### P-41 (S5) `gateway: Multi-node shared presence plane.` — M — no migration (wakes the dormant `presence` table) — **[ ]**
+
+**What & why.** Presence is per-process (`presence.go:9-26`): with 100k
+connections across N gateway nodes, each node knows only its own
+connections, so presence is fragmented and wrong. Also, every presence
+transition fans to the whole org under the single `h.mu`
+(`presence.go:150-154` → `signals.go:141-154`), and
+connects/disconnects are constant at 100k. S5 gives presence a shared
+plane so any node sees org-wide presence, and makes the fan efficient.
+
+**O(1) invariant defended:** presence correctness independent of which
+node holds a connection; per-transition fan bounded. **Blowup
+prevented:** fragmented/wrong presence across nodes; whole-org fans
+and whole-registry sweeps under one global mutex.
+
+**Current verified state.** Per-process registry `presence.go:22-71`;
+whole-org broadcast `presence.go:150-154`; sweep holds `h.mu` over all
+`userConns` `presence.go:113-146`; the UNLOGGED `presence` table is
+DORMANT (`0006:56-62`). `NotifyUser` scans all org conns for one user
+`presence.go:175-178`.
+
+**The build (decided: the dormant UNLOGGED `presence` table +
+LISTEN/NOTIFY as the shipped driver, behind a `platform/presence`
+seam so an external cache is a later driver swap).**
+
+- **Shared presence plane:** node-local presence deltas publish to the
+  plane; each node subscribes and maintains an org-wide view.
+- **Fan efficiency:** presence transitions publish a coalesced delta
+  (state changed for user U) once; each node fans to ITS local
+  connections only. The sweep (`presence.go:113-146`) copies the
+  transition list under the lock and fans after release — the lock
+  becomes per-org/sharded (shared with S3's lock split).
+- **Invisible mode (optional fold-in, ADR-011 N-3):** the plane carries
+  a read-side mask so `presence_enabled=false` users appear offline.
+  Can defer.
+- **Consumer-contract:** presence stays EPHEMERAL — never event-logged
+  (`ADR-002 P5`, `SCHEMA.md:72-74`). The plane is a side-channel, not
+  the event log.
+
+**Migrations.** None (the `presence` table exists, `0006:56-62`).
+
+**Red/green proof plan.** `TestMultiNodePresence` (two in-process Hubs
+sharing one plane, simulating two nodes on one PG): user connects to
+node 1 → node 2's `PresenceSnapshot`/live delta shows them active;
+disconnect → both see offline. **RED:** point the plane at the
+per-process registry (status quo) → node 2 never sees node 1's user
+and the cross-node assert goes red. Plus fan efficiency: a presence
+transition fans O(local conns) per node, asserted via S0's fan counter.
+
+**Risks / pre-mortem.** (1) **Presence flapping** across nodes on
+reconnect — debounce at the plane (last-writer-wins with a short grace,
+mirroring `presence.go:32-92`). (2) The UNLOGGED table is truncated on
+crash — fine, presence is rebuildable from live connections
+(`SCHEMA.md:72-74`); document the rebuild-on-reconnect. (3) Cell
+invariant: the plane is per-cell, per-org-scoped; never cross-org.
+
+**Dependencies + ordering.** After S3 (shares the Hub lock split).
+SERIAL with S3 (same files, `internal/gateway`); parallel-capable with
+the durable path (S2/S6).
+
+**Deferred (honest):** typing-indicator fan efficiency at 100k (same
+plane, later); OS-level away vs socket-silence idle; cross-node typing;
+the external-cache driver.
+
+---
+
+### P-42 (S6) `messaging: O(1) unread counters (F-17 twin).` — M — migration 0023 — **[ ]**
+
+**What & why.** `Unreads` (`readstate.go:130-158`) is an O(user's
+channels × messages-since-watermark) aggregate per request — its own
+comment (`readstate.go:126-129`) names the unbuilt tier: "a maintained
+per-(user,channel) counter updated on the notification path (F-17
+deliverability sets) — same result, O(1) read. Documented, not built."
+S6 builds it, reusing S1's invalidation/notification machinery. Also
+finally wakes the mention badge: `ChannelUnread.Mentioned`
+(`readstate.go:83`) is declared but never populated, and
+`message_user_flag` is DORMANT (only a janitor DELETE, zero writers).
+
+**O(1) invariant defended:** unread-count READ = O(user's channels)
+index scan of a counter, never a re-aggregation over messages.
+**O(N) blowup prevented:** per-request re-count over all messages since
+the watermark in a high-volume 100k channel.
+
+**Current verified state.** Live aggregate `readstate.go:131-143`;
+`DMUnreads` `readstate.go:95-105`; scale note `readstate.go:126-129`;
+`ChannelUnread.Mentioned` declared-but-unpopulated `readstate.go:83`.
+
+**The build (decided: DM spaces use the SAME counter table for
+symmetry).**
+
+- **Table `channel_unread_counter` (0023):** `(user_id, channel_id,
+  unread_count INT, mention_count INT, org_id)`, PK `(user_id,
+  channel_id)`, `fillfactor` tuned (HOT updates, like the watermark).
+- **Maintenance (consumer-driven, NOT send-path):** the notification
+  materializer (S1) already visits every message's recipients — it
+  increments `unread_count` there (and `mention_count` on a mention
+  row), so the counter rides the EXISTING consumer pass, never the O(1)
+  send path. MarkRead (`readstate.go:30`) resets the counter in the
+  same tx as the watermark write. This wakes the `Mentioned` field via
+  `mention_count`.
+- **Consistency model:** the counter is a CACHE; a periodic
+  reconciliation sweep (like S1's) recomputes from the watermark truth
+  and logs divergence. The watermark (`thread_read_watermark`) stays
+  the source of truth (`SCHEMA.md:37-45`).
+- **`Unreads` read (`readstate.go:130`)** becomes a plain index scan of
+  the counter table; the live aggregate stays as the reconciliation
+  recompute only.
+
+**Migrations.** `0023_unread_counters.sql`: `channel_unread_counter` +
+index. Cite F-17 + `readstate.go:126-129`.
+
+**Red/green proof plan.** `TestUnreadCounters`: in a high-volume
+channel (bounded in CI), assert `GET /unreads` runs in O(channels) with
+no per-message scan (S0 counter). Correctness: counter equals the live
+aggregate after sends + mark-reads + edits/deletes. **RED:** point
+`Unreads` back at the live aggregate → the scan cost scales with
+message volume and the "O(1) read" assert goes red. Mention badge: a
+mention increments `mention_count`, surfaced in
+`ChannelUnread.Mentioned` (RED: the field stays false today).
+
+**Risks / pre-mortem.** (1) **Counter drift** on edits/deletes/moves
+(P-04 move changes a message's thread) — the reconciliation sweep is
+the backstop; deletes decrement in `DeleteMessage`'s tx. (2) Must not
+add cost to the O(1) send path — all increments ride the notification
+consumer (already O(reasons) after S1), never `Send`.
+
+**Dependencies + ordering.** After S1 (reuses the invalidation +
+consumer-visit machinery). Independent of S3/S4/S5 —
+parallel-capable with S3/S5 once S1 lands.
+
+**Deferred (honest):** per-thread unread breakdown; the exact
+edit/delete decrement vs recompute-on-read trade is the executor's to
+flag if ambiguous in practice.
+
+---
+
+### P-43 (S7) `perms: CC-6 grant∩permission enforcement for agents.` — M — **DEFERRED — do not dispatch with this cluster**
+
+Security-adjacent, not a per-message hot path. `capability_grant`
+(`0002:143-156`) is a hook only — zero Go references; the reserved
+intersection point is `perms.go:70-71`. When promoted (sequenced with
+the automations write-back milestone, alongside P-26): `Require` gains,
+for agent-kind principals (actor_kind 2), an intersection after the
+closure `EXISTS` passes — effective verbs = group permissions ∩
+`grant.scopes`, gated by `revoked_at IS NULL AND (expires_at IS NULL
+OR expires_at > now())`; deny if no live grant covers the (verb,
+scope). Grants NARROW only, never extend; human principals bypass.
+One indexed lookup on `capability_grant_principal_idx`. Red/green:
+`TestCapabilityGrant` (no grant → denied despite group permission;
+live grant → allowed; revoked/expired → denied; RED: skip the
+intersection → the agent writes on group permission alone).
+Security-critical → Fable execution when promoted.
+
+---
+
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
 (Each needs a final-spec pass by the strongest model; the bullets below
 record the scope and the known design questions so nothing is lost.)
