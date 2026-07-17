@@ -15,6 +15,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
@@ -38,10 +39,15 @@ func TestReadWatermarks(t *testing.T) {
 
 	hub := gateway.NewHub(pool, slog.Default())
 	go hub.Run(ctx)
+	// S6: unread now rides the counter maintained on the notification consumer
+	// pass, so this test drains that consumer before reading unreads.
+	msgSvc := messaging.New(pool, perms.New(pool))
+	runner := notification.NewRunner(pool, hub, slog.Default())
+	runner.SetUnread(msgSvc)
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
 		Identity:  identity.New(pool, perms.New(pool)),
-		Messaging: messaging.New(pool, perms.New(pool)),
+		Messaging: msgSvc,
 	}))
 	defer ts.Close()
 
@@ -71,6 +77,7 @@ func TestReadWatermarks(t *testing.T) {
 			map[string]any{"content": fmt.Sprintf("msg %d", i)}, &out)
 		last = out.MessageID
 	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 
 	rootThreadID := channelRootThread(t, ctx, pool, boot.ChannelID)
 
@@ -107,6 +114,7 @@ func TestReadWatermarks(t *testing.T) {
 		MessageID int64 `json:"message_id"`
 	}
 	postJSON(t, chURL+"/messages", boot.Token, map[string]any{"content": "new one"}, &out)
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	if got := unreadForChannel(t, ts.URL, readerTok, boot.ChannelID); got != 1 {
 		t.Fatalf("after clamp + 1 new message, unread = %d, want 1", got)
 	}

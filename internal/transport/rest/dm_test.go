@@ -17,6 +17,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/dm"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
@@ -43,6 +44,10 @@ func TestDirectMessages(t *testing.T) {
 	go hub.Run(ctx)
 	permsSvc := perms.New(pool)
 	msgSvc := messaging.New(pool, permsSvc)
+	// S6: the DM unread badge rides the counter maintained on the notification
+	// consumer pass, so drain it before reading unreads below.
+	runner := notification.NewRunner(pool, hub, slog.Default())
+	runner.SetUnread(msgSvc)
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
 		Identity:  identity.New(pool, permsSvc),
@@ -143,7 +148,9 @@ func TestDirectMessages(t *testing.T) {
 		t.Fatalf("bob's DM search = %d hits, want 1", len(got))
 	}
 
-	// Unread badge for bob → cleared by mark-read on the DM thread.
+	// Unread badge for bob → cleared by mark-read on the DM thread. The
+	// counter rides the consumer, so drain it first.
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	var un struct {
 		DMs []struct {
 			DMSpaceID   int64 `json:"dm_space_id"`

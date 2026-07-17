@@ -1,0 +1,312 @@
+package messaging
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// S6 (F-17 twin): maintenance of the O(1) unread counter (container_unread_counter,
+// migration 0023). The design keeps the READ — messaging.Unreads/DMUnreads — a
+// plain index scan of this table, while the counter is maintained OFF the hot
+// send path:
+//
+//   - INCREMENT rides S1's notification consumer pass (ApplyMessageUnread, called
+//     by notification.Runner via the UnreadMaintainer seam once per created
+//     message). It is ONE set-based statement per message — a bulk UPSERT over the
+//     container's live members, O(members) ROWS touched but never a per-member Go
+//     loop — because unread is "every live container member except the author",
+//     which is NOT the O(reasons) notification deliverability set. That cost lands
+//     on the async consumer, never messaging.Send, and turns the READ into O(1).
+//   - RESET rides MarkRead (resetContainerUnread, same tx as the watermark write):
+//     the counter is recomputed from the live aggregate — the exact truth after
+//     the new watermark — and SET.
+//   - DECREMENT rides DeleteMessage (decrementUnreadOnDelete, same tx as the
+//     scrub): a deleted message stops counting, so members who had not read it
+//     lose one unread.
+//   - RECONCILE (ReconcileUnreadOnce, the notification runner's slow ticker)
+//     recomputes every counter row from the live aggregate and repairs +
+//     Warn-logs divergence. The counter is a CACHE; thread_read_watermark is the
+//     source of truth. This is the backstop for the bounded drift the design
+//     tolerates: at-least-once consumer replay (guarded by last_event_id, so
+//     replay is normally a no-op), an intra-channel P-04 move (the container is
+//     unchanged, only a per-thread watermark relationship shifts), and a
+//     delete/create commit race.
+//
+// Idempotency: the consumer delivers at-least-once (a crash between processing
+// and cursor-ack replays a batch). Each counter row carries last_event_id, and
+// an increment applies only WHERE last_event_id < the event's id, so a replay of
+// an already-counted event is a no-op. MarkRead advances last_event_id to the
+// org's current max event id (GREATEST), so a message already reflected in the
+// recompute is not re-counted when the consumer later reaches its create event.
+//
+// mention_count wakes ChannelUnread.Mentioned. It is incremented for mentioned
+// members on the consumer pass; MarkRead/delete/reconcile hold the invariant
+// mention_count <= unread_count via a LEAST clamp, so a full read (unread → 0)
+// always clears the badge. There is no per-message mention TRUTH to reconcile
+// against (message_user_flag is dormant, out of this slice), so the badge is a
+// best-effort signal: it can linger after a partial read while unread non-mention
+// messages remain, but it never MISSES a live mention and always clears on a full
+// read.
+
+// queryRower is satisfied by both *pgxpool.Pool and pgx.Tx, so the recompute
+// runs identically inside MarkRead's transaction and in the standalone sweep.
+type queryRower interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// recomputeContainerUnread is THE live aggregate for ONE (user, container),
+// mirroring Unreads/DMUnreads exactly (an unsubscribed member / non-participant
+// yields 0, matching the reads that drop them): unread = messages in the
+// container after the user's per-thread watermarks, authored by someone else,
+// still visible. It is the reconciliation truth and MarkRead's reset value —
+// shared here so the counter and the aggregate can never drift apart in
+// definition.
+func recomputeContainerUnread(ctx context.Context, q queryRower, userID, channelID, dmSpaceID int64) (int, error) {
+	var unread int
+	var err error
+	if channelID != 0 {
+		err = q.QueryRow(ctx, `
+			SELECT count(*)
+			FROM channel_member cm
+			JOIN message m
+			  ON m.channel_id = cm.channel_id
+			 AND m.author_id <> cm.user_id
+			 AND m.deleted_at IS NULL
+			LEFT JOIN thread_read_watermark w
+			  ON w.user_id = cm.user_id AND w.thread_id = m.thread_id
+			WHERE cm.user_id = $1 AND cm.channel_id = $2 AND cm.unsubscribed_at IS NULL
+			  AND m.id > COALESCE(w.last_read_message_id, 0)`,
+			userID, channelID).Scan(&unread)
+	} else {
+		err = q.QueryRow(ctx, `
+			SELECT count(*)
+			FROM dm_participant dp
+			JOIN message m
+			  ON m.dm_space_id = dp.dm_space_id
+			 AND m.author_id <> dp.user_id
+			 AND m.deleted_at IS NULL
+			LEFT JOIN thread_read_watermark w
+			  ON w.user_id = dp.user_id AND w.thread_id = m.thread_id
+			WHERE dp.user_id = $1 AND dp.dm_space_id = $2
+			  AND m.id > COALESCE(w.last_read_message_id, 0)`,
+			userID, dmSpaceID).Scan(&unread)
+	}
+	if err != nil {
+		return 0, fmt.Errorf("unread: recompute: %w", err)
+	}
+	return unread, nil
+}
+
+// ApplyMessageUnread increments the counter for a newly-created message,
+// off the notification consumer pass (the UnreadMaintainer seam). Exactly one
+// of channelID/dmSpaceID is non-zero. It is one set-based UPSERT over the
+// container's live members except the author: +1 unread each, +1 mention for a
+// mentioned member. The last_event_id guard makes an at-least-once replay a
+// no-op, and the EXISTS(message live) guard skips a message already deleted
+// before the consumer reached it (so it never over-counts against a delete).
+func (s *Service) ApplyMessageUnread(ctx context.Context, orgID, channelID, dmSpaceID, messageID, authorID, eventID int64, mentions []int64) error {
+	if mentions == nil {
+		mentions = []int64{} // an explicit NULL array would make = ANY() null; keep it empty
+	}
+	var err error
+	if channelID != 0 {
+		_, err = s.pool.Exec(ctx, `
+			INSERT INTO container_unread_counter
+				(user_id, channel_id, org_id, unread_count, mention_count, last_event_id)
+			SELECT cm.user_id, $1, $2, 1,
+			       (CASE WHEN cm.user_id = ANY($5::bigint[]) THEN 1 ELSE 0 END),
+			       $4
+			FROM channel_member cm
+			WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL AND cm.user_id <> $3
+			  AND EXISTS (SELECT 1 FROM message WHERE id = $6 AND deleted_at IS NULL)
+			ON CONFLICT (user_id, channel_id) WHERE channel_id IS NOT NULL
+			DO UPDATE SET
+			    unread_count  = container_unread_counter.unread_count  + EXCLUDED.unread_count,
+			    mention_count = container_unread_counter.mention_count + EXCLUDED.mention_count,
+			    last_event_id = EXCLUDED.last_event_id
+			WHERE container_unread_counter.last_event_id < EXCLUDED.last_event_id`,
+			channelID, orgID, authorID, eventID, mentions, messageID)
+	} else {
+		_, err = s.pool.Exec(ctx, `
+			INSERT INTO container_unread_counter
+				(user_id, dm_space_id, org_id, unread_count, mention_count, last_event_id)
+			SELECT dp.user_id, $1, $2, 1,
+			       (CASE WHEN dp.user_id = ANY($5::bigint[]) THEN 1 ELSE 0 END),
+			       $4
+			FROM dm_participant dp
+			WHERE dp.dm_space_id = $1 AND dp.user_id <> $3
+			  AND EXISTS (SELECT 1 FROM message WHERE id = $6 AND deleted_at IS NULL)
+			ON CONFLICT (user_id, dm_space_id) WHERE dm_space_id IS NOT NULL
+			DO UPDATE SET
+			    unread_count  = container_unread_counter.unread_count  + EXCLUDED.unread_count,
+			    mention_count = container_unread_counter.mention_count + EXCLUDED.mention_count,
+			    last_event_id = EXCLUDED.last_event_id
+			WHERE container_unread_counter.last_event_id < EXCLUDED.last_event_id`,
+			dmSpaceID, orgID, authorID, eventID, mentions, messageID)
+	}
+	if err != nil {
+		return fmt.Errorf("unread: apply message: %w", err)
+	}
+	return nil
+}
+
+// resetContainerUnread recomputes ONE (user, container)'s unread from the live
+// aggregate and SETs the counter, inside MarkRead's transaction (after the
+// watermark write, so it reads the applied watermark). last_event_id is
+// advanced to the org's current max event id so a message already reflected in
+// this recompute is not re-counted when the consumer later processes its create
+// event; GREATEST never rewinds a higher watermark a concurrent increment set.
+// mention_count is clamped to the fresh unread (a full read → 0 clears the
+// badge) — a new row starts with 0 mentions.
+func (s *Service) resetContainerUnread(ctx context.Context, tx pgx.Tx, orgID, userID, channelID, dmSpaceID int64) error {
+	unread, err := recomputeContainerUnread(ctx, tx, userID, channelID, dmSpaceID)
+	if err != nil {
+		return err
+	}
+	var maxEvent int64
+	if err := tx.QueryRow(ctx,
+		`SELECT COALESCE(MAX(id), 0) FROM event_log WHERE org_id = $1`, orgID).Scan(&maxEvent); err != nil {
+		return fmt.Errorf("unread: reset max event: %w", err)
+	}
+	var col string
+	var containerID int64
+	if channelID != 0 {
+		col, containerID = "channel_id", channelID
+	} else {
+		col, containerID = "dm_space_id", dmSpaceID
+	}
+	_, err = tx.Exec(ctx, fmt.Sprintf(`
+		INSERT INTO container_unread_counter
+			(user_id, %[1]s, org_id, unread_count, mention_count, last_event_id)
+		VALUES ($1, $2, $3, $4, 0, $5)
+		ON CONFLICT (user_id, %[1]s) WHERE %[1]s IS NOT NULL
+		DO UPDATE SET
+		    unread_count  = EXCLUDED.unread_count,
+		    mention_count = LEAST(container_unread_counter.mention_count, EXCLUDED.unread_count),
+		    last_event_id = GREATEST(container_unread_counter.last_event_id, EXCLUDED.last_event_id)`, col),
+		userID, containerID, orgID, unread, maxEvent)
+	if err != nil {
+		return fmt.Errorf("unread: reset: %w", err)
+	}
+	return nil
+}
+
+// decrementUnreadOnDelete drops one unread from every member who had NOT read
+// the deleted message (their thread watermark is below it), inside
+// DeleteMessage's transaction. GREATEST(...,0) floors a counter that a
+// delete-before-consume race left short, and the mention clamp holds
+// mention_count <= unread_count.
+func (s *Service) decrementUnreadOnDelete(ctx context.Context, tx pgx.Tx, channelID, dmSpaceID, threadID, messageID, authorID int64) error {
+	var err error
+	if channelID != 0 {
+		_, err = tx.Exec(ctx, `
+			UPDATE container_unread_counter c
+			SET unread_count  = GREATEST(c.unread_count - 1, 0),
+			    mention_count = LEAST(c.mention_count, GREATEST(c.unread_count - 1, 0))
+			FROM channel_member cm
+			LEFT JOIN thread_read_watermark w
+			  ON w.user_id = cm.user_id AND w.thread_id = $3
+			WHERE c.user_id = cm.user_id AND c.channel_id = $1
+			  AND cm.channel_id = $1 AND cm.unsubscribed_at IS NULL AND cm.user_id <> $4
+			  AND $2 > COALESCE(w.last_read_message_id, 0)`,
+			channelID, messageID, threadID, authorID)
+	} else {
+		_, err = tx.Exec(ctx, `
+			UPDATE container_unread_counter c
+			SET unread_count  = GREATEST(c.unread_count - 1, 0),
+			    mention_count = LEAST(c.mention_count, GREATEST(c.unread_count - 1, 0))
+			FROM dm_participant dp
+			LEFT JOIN thread_read_watermark w
+			  ON w.user_id = dp.user_id AND w.thread_id = $3
+			WHERE c.user_id = dp.user_id AND c.dm_space_id = $1
+			  AND dp.dm_space_id = $1 AND dp.user_id <> $4
+			  AND $2 > COALESCE(w.last_read_message_id, 0)`,
+			dmSpaceID, messageID, threadID, authorID)
+	}
+	if err != nil {
+		return fmt.Errorf("unread: decrement on delete: %w", err)
+	}
+	return nil
+}
+
+// ReconcileUnreadOnce sweeps every counter row, recomputes its unread from the
+// live aggregate, and repairs + Warn-logs divergence (the F-17-style safety
+// net: the counter is a cache, so a nonzero repair means a maintenance miss).
+// One short recompute per row on the runner's slow ticker; the mention clamp
+// travels with the repair. Exposed as the UnreadMaintainer seam.
+func (s *Service) ReconcileUnreadOnce(ctx context.Context) error {
+	rows, err := s.pool.Query(ctx, `
+		SELECT user_id, COALESCE(channel_id, 0), COALESCE(dm_space_id, 0),
+		       unread_count
+		FROM container_unread_counter
+		ORDER BY user_id, channel_id, dm_space_id`)
+	if err != nil {
+		return fmt.Errorf("unread: reconcile list: %w", err)
+	}
+	type counter struct {
+		userID, channelID, dmSpaceID int64
+		stored                       int
+	}
+	var counters []counter
+	for rows.Next() {
+		var c counter
+		if err := rows.Scan(&c.userID, &c.channelID, &c.dmSpaceID, &c.stored); err != nil {
+			rows.Close()
+			return fmt.Errorf("unread: reconcile scan: %w", err)
+		}
+		counters = append(counters, c)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("unread: reconcile list: %w", err)
+	}
+	for _, c := range counters {
+		recomputed, err := recomputeContainerUnread(ctx, s.pool, c.userID, c.channelID, c.dmSpaceID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			s.log.Warn("messaging: unread reconcile recompute", "user", c.userID, "err", err)
+			continue
+		}
+		if recomputed == c.stored {
+			continue
+		}
+		if err := s.repairUnread(ctx, c.userID, c.channelID, c.dmSpaceID, recomputed); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			s.log.Warn("messaging: unread reconcile repair", "user", c.userID, "err", err)
+			continue
+		}
+		s.log.Warn("messaging: unread counter diverged (repaired)",
+			"user", c.userID, "channel", c.channelID, "dm_space", c.dmSpaceID,
+			"stored", c.stored, "recomputed", recomputed)
+	}
+	return nil
+}
+
+// repairUnread SETs one counter row to the recomputed unread and clamps its
+// mention to match (the reconcile write half).
+func (s *Service) repairUnread(ctx context.Context, userID, channelID, dmSpaceID int64, unread int) error {
+	col, containerID := "channel_id", channelID
+	if channelID == 0 {
+		col, containerID = "dm_space_id", dmSpaceID
+	}
+	_, err := s.pool.Exec(ctx, fmt.Sprintf(`
+		UPDATE container_unread_counter
+		SET unread_count  = $3,
+		    mention_count = LEAST(mention_count, $3)
+		WHERE user_id = $1 AND %s = $2`, col), userID, containerID, unread)
+	if err != nil {
+		return fmt.Errorf("unread: repair: %w", err)
+	}
+	return nil
+}
+
+// compile-time guard that the pool type carries QueryRow (documents the
+// queryRower contract the recompute relies on for both pool and tx).
+var _ queryRower = (*pgxpool.Pool)(nil)

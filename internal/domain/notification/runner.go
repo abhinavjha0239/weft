@@ -37,6 +37,18 @@ type Fanout interface {
 	NotifyUser(ctx context.Context, orgID, userID int64, payload json.RawMessage)
 }
 
+// UnreadMaintainer keeps the S6 O(1) unread counters current off THIS
+// materializer's existing per-message pass (the F-17 twin): the counter rides
+// the async consumer, never messaging's O(1) send path. messaging owns the
+// container_unread_counter table and implements it; a nil maintainer (a
+// composition without unread counters, e.g. a focused notification test) skips
+// it. Signatures are primitive-only so the implementor needs no notification
+// import — the Fanout seam pattern.
+type UnreadMaintainer interface {
+	ApplyMessageUnread(ctx context.Context, orgID, channelID, dmSpaceID, messageID, authorID, eventID int64, mentions []int64) error
+	ReconcileUnreadOnce(ctx context.Context) error
+}
+
 // Runner is the materializer: a named, cursor-tracked, txid-gated event-log
 // consumer (the same Consumer the M0 spine shipped), NOTIFY-driven with a
 // slow sweep. Resolution reads the CURRENT muting/level settings, so
@@ -57,6 +69,10 @@ type Runner struct {
 	// deliv owns the F-17 candidate set: the runner lazily builds it per
 	// channel and patches it from member.joined/left events.
 	deliv *Deliverability
+	// unread is the S6 O(1) unread-counter maintainer (messaging owns the
+	// table). Optional (nil skips): the counter rides this consumer's
+	// per-message pass and its slow reconcile ticker.
+	unread UnreadMaintainer
 }
 
 func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
@@ -79,6 +95,12 @@ func (r *Runner) SetMetrics(reg metrics.Registry) {
 	r.scanned = reg.Counter(candidatesScannedMetric)
 	r.consumer.SetMetrics(reg)
 }
+
+// SetUnread wires the S6 unread-counter maintainer (messaging). Optional — a
+// nil maintainer leaves the counter unmaintained (the read falls back to
+// nothing, so a composition that wants counters must wire this). Call once
+// before Run/ProcessOrg (the Fanout seam pattern).
+func (r *Runner) SetUnread(m UnreadMaintainer) { r.unread = m }
 
 // Run blocks until ctx ends: LISTEN on the event channel and process the
 // signalled org; a sweep catches anything a missed NOTIFY left behind.
@@ -154,6 +176,13 @@ func (r *Runner) reconcileLoop(ctx context.Context) {
 		case <-t.C:
 			if err := r.deliv.ReconcileOnce(ctx); err != nil && ctx.Err() == nil {
 				r.log.Warn("notification: deliverability reconcile", "err", err)
+			}
+			// S6: the same slow ticker drives the O(1) unread-counter sweep
+			// (recompute from the live aggregate, repair + Warn divergence).
+			if r.unread != nil {
+				if err := r.unread.ReconcileUnreadOnce(ctx); err != nil && ctx.Err() == nil {
+					r.log.Warn("notification: unread reconcile", "err", err)
+				}
 			}
 		}
 	}
@@ -241,6 +270,17 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 		var h hintPayload
 		if json.Unmarshal(ev.Hint, &h) == nil {
 			batchID = h.BatchID
+		}
+	}
+	// S6: a newly-created message increments the O(1) unread counter for every
+	// live container member except the author (mentions bump mention_count).
+	// This rides THIS consumer pass — one set-based statement, off messaging's
+	// send path — and only for creates: edits add no unread, and the early
+	// return above already excluded imports (backfills never notify or unread).
+	if ev.Verb == "message.created" && r.unread != nil {
+		if err := r.unread.ApplyMessageUnread(ctx, ev.OrgID, p.ChannelID, p.DMSpaceID,
+			p.MessageID, author, ev.ID, p.Mentions); err != nil {
+			return err
 		}
 	}
 	// F-17 lazy backfill: the first channel message after deploy derives

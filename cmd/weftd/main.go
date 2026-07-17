@@ -238,6 +238,10 @@ func serve(ctx context.Context, cfg config.Config) error {
 	// F-17: level/follow settings changes patch the notification candidate
 	// set in the same tx as the setting write (the SetFiles seam pattern).
 	msgSvc.SetDeliverability(notification.NewDeliverability(pool, log))
+	msgSvc.SetLogger(log) // S6 unread-counter reconcile Warn-logs here
+	// S6: the O(1) unread counter rides the notification consumer's per-message
+	// pass and its slow reconcile ticker (messaging owns the counter table).
+	notifRunner.SetUnread(msgSvc)
 	autoSvc := automation.New(pool, permsSvc)
 	autoSvc.SetMessaging(msgSvc) // the slash-command channel-send gate
 	autoRunner := automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log)
