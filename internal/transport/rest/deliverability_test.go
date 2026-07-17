@@ -11,12 +11,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/enum"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 )
@@ -231,5 +235,69 @@ func TestDeliverabilitySet(t *testing.T) {
 	}
 	if n := setRows(bobID, 2); n != 0 {
 		t.Fatalf("reconcile did not remove bob's bogus row (rows=%d)", n)
+	}
+
+	// (3) Batch coalescing (F-17b): a synthetic bulk producer emits N item
+	// events (message payloads with distinct entity ids) all stamped with
+	// ONE batch_id in the hint — each recipient gets ONE digest row per
+	// reason class, never N. Charlie still holds level=all from the
+	// reconcile step, so the batch exercises the mention lane (bob) and
+	// the activity lane (charlie) at once.
+	waitForConsumer()
+	const batchItems = 5
+	const bulkBatchID = 777
+	rootThread := channelRootThread(t, ctx, pool, boot.ChannelID)
+	err = db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+		for i := 0; i < batchItems; i++ {
+			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+				OrgID: boot.OrgID, ActorKind: enum.ActorHuman, ActorID: &boot.UserID,
+				EntityType: enum.EntityMessage, EntityID: int64(900000 + i),
+				Verb: "message.created",
+				Payload: eventlog.MustPayload(map[string]any{
+					"message_id": 900000 + i, "thread_id": rootThread,
+					"channel_id": boot.ChannelID, "mentions": []int64{bobID}}),
+				Hint: eventlog.MustPayload(map[string]any{"batch_id": bulkBatchID}),
+			}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatalf("append bulk batch: %v", err)
+	}
+	waitForConsumer()
+	batchRows := func(userID int64) (n int, kind int16, entity int64, gotBatch *int64) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*), COALESCE(min(kind), 0), COALESCE(min(entity_id), 0), min(batch_id)
+			FROM notification
+			WHERE org_id = $1 AND user_id = $2 AND entity_type = 1
+			  AND entity_id BETWEEN 900000 AND 900004`,
+			boot.OrgID, userID).Scan(&n, &kind, &entity, &gotBatch); err != nil {
+			t.Fatalf("batch rows: %v", err)
+		}
+		return n, kind, entity, gotBatch
+	}
+	if n, kind, entity, gotBatch := batchRows(bobID); n != 1 || kind != notification.KindMention ||
+		entity != 900000 || gotBatch == nil || *gotBatch != bulkBatchID {
+		t.Fatalf("bulk event minted %d rows for bob (kind=%d entity=%d batch=%v), want ONE digest row anchored on the first item",
+			n, kind, entity, gotBatch)
+	}
+	if n, kind, _, gotBatch := batchRows(charlieID); n != 1 || kind != notification.KindChannelActivity ||
+		gotBatch == nil || *gotBatch != bulkBatchID {
+		t.Fatalf("bulk event minted %d activity rows for charlie (kind=%d batch=%v), want ONE digest row",
+			n, kind, gotBatch)
+	}
+	var totalBatch int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM notification
+		WHERE org_id = $1 AND entity_type = 1 AND entity_id BETWEEN 900000 AND 900004`,
+		boot.OrgID).Scan(&totalBatch); err != nil {
+		t.Fatalf("total batch rows: %v", err)
+	}
+	if totalBatch != 2 {
+		t.Fatalf("bulk event minted %d rows total for %d items, want 2 (one digest per recipient)",
+			totalBatch, batchItems)
 	}
 }

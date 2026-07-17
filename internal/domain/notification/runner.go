@@ -168,6 +168,14 @@ type messagePayload struct {
 	NewMentions []int64 `json:"new_mentions"`
 }
 
+// hintPayload reads the F-17b coalescing stamp bulk producers set on the
+// event hint (the reserved field, ADR-002 P1): every item event of one
+// bulk operation carries the same batch_id, and the materializer folds a
+// recipient's N item rows into ONE digest row per (user, kind, batch).
+type hintPayload struct {
+	BatchID *int64 `json:"batch_id"`
+}
+
 // ProcessOrg drains the org's pending events into notification rows and
 // acks the cursor. Exported for tests; production calls arrive via Run.
 func (r *Runner) ProcessOrg(ctx context.Context, orgID int64) error {
@@ -225,6 +233,16 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	if ev.ActorID != nil {
 		author = *ev.ActorID
 	}
+	// F-17b: a batch-stamped hint switches every insert for this event
+	// into digest mode. A malformed hint is ignored like a malformed
+	// payload — never a stall.
+	var batchID *int64
+	if len(ev.Hint) > 0 {
+		var h hintPayload
+		if json.Unmarshal(ev.Hint, &h) == nil {
+			batchID = h.BatchID
+		}
+	}
 	// F-17 lazy backfill: the first channel message after deploy derives
 	// the deliverability set (the last O(members) pass this channel pays).
 	if p.ChannelID != 0 && p.ThreadID != 0 {
@@ -253,7 +271,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 		}
 		mentioned[uid] = true
 		delete(keyworded, uid)
-		if err := r.insert(ctx, ev, p, uid, KindMention, author); err != nil {
+		if err := r.insert(ctx, ev, p, uid, KindMention, author, batchID); err != nil {
 			return err
 		}
 	}
@@ -316,7 +334,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 				kind = KindKeyword // a keyword upgrades plain activity
 			}
 			delete(keyworded, x.uid)
-			if err := r.insert(ctx, ev, p, x.uid, kind, author); err != nil {
+			if err := r.insert(ctx, ev, p, x.uid, kind, author, batchID); err != nil {
 				return err
 			}
 		}
@@ -325,7 +343,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	// Remaining keyword matches (members outside the level/follow pass, or
 	// edits that newly introduced a word) get the kind-4 row.
 	for uid := range keyworded {
-		if err := r.insert(ctx, ev, p, uid, KindKeyword, author); err != nil {
+		if err := r.insert(ctx, ev, p, uid, KindKeyword, author, batchID); err != nil {
 			return err
 		}
 	}
@@ -351,7 +369,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 			if uid == author || mentioned[uid] {
 				continue
 			}
-			if err := r.insert(ctx, ev, p, uid, KindDM, author); err != nil {
+			if err := r.insert(ctx, ev, p, uid, KindDM, author, batchID); err != nil {
 				return err
 			}
 		}
@@ -364,20 +382,32 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 // mention must not leak the channel's existence), DM and space threads use
 // their own containment (participants were just resolved; space threads are
 // org-visible in the v1 slice).
-func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, userID int64, kind int16, author int64) error {
+//
+// A non-nil batchID (F-17b) switches to digest mode: the row lands once
+// per (user, kind, batch) — the batch dedupe key — so a bulk operation's
+// N item events fold into ONE row per recipient. The conflict target is
+// left open there because a batched insert may legitimately hit EITHER
+// unique key (the entity dedupe on replay, the batch key on coalesce) and
+// both mean "already recorded"; the unbatched path keeps the explicit
+// 0010 target.
+func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, userID int64, kind int16, author int64, batchID *int64) error {
 	var actorID *int64
 	if author != 0 {
 		actorID = &author
 	}
+	conflict := `ON CONFLICT (user_id, kind, entity_type, entity_id) DO NOTHING`
+	if batchID != nil {
+		conflict = `ON CONFLICT DO NOTHING`
+	}
 	ct, err := r.pool.Exec(ctx, `
-		INSERT INTO notification (org_id, user_id, kind, entity_type, entity_id, actor_id, created_at)
-		SELECT $1, $2, $3, $4, $5, $6, $7
+		INSERT INTO notification (org_id, user_id, kind, entity_type, entity_id, actor_id, created_at, batch_id)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $9
 		WHERE $8 = 0 OR EXISTS (
 		    SELECT 1 FROM channel_member
 		    WHERE channel_id = $8 AND user_id = $2 AND unsubscribed_at IS NULL)
-		ON CONFLICT (user_id, kind, entity_type, entity_id) DO NOTHING`,
+		`+conflict,
 		ev.OrgID, userID, kind, int16(enum.EntityMessage), p.MessageID,
-		actorID, ev.RecordedAt, p.ChannelID)
+		actorID, ev.RecordedAt, p.ChannelID, batchID)
 	if err != nil {
 		return err
 	}
