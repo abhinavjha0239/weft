@@ -31,9 +31,15 @@ type wsClient struct {
 }
 
 func dialClient(t *testing.T, ctx context.Context, base, token string) *wsClient {
+	return dialClientLast(t, ctx, base, token, "0")
+}
+
+// dialClientLast dials the gateway at an explicit last_id — "0" (full replay),
+// "-1" (tail/live), or a resume point — and drains into the events channel.
+func dialClientLast(t *testing.T, ctx context.Context, base, token, lastID string) *wsClient {
 	t.Helper()
 	u := strings.Replace(base, "http://", "ws://", 1) +
-		"/api/v1/gateway?last_id=0&token=" + token
+		"/api/v1/gateway?last_id=" + lastID + "&token=" + token
 	conn, _, err := websocket.Dial(ctx, u, nil)
 	if err != nil {
 		t.Fatalf("ws dial: %v", err)

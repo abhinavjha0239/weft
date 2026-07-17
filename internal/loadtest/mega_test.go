@@ -22,12 +22,14 @@ import (
 	"github.com/abhinavjha0239/weft/migrations"
 )
 
-// TestMegaOrgHarnessSmoke is the S0 proof that the mega-org harness measures
-// the gateway fan-out blowup — the whole point of building the proving ground
-// BEFORE S3 fixes it. A single send to a channel with `conns` live connections
-// must cost ~`conns` catch-up queries (one per connection per wake), because
-// today every connection runs its OWN pump query. Bounded for CI (2k members,
-// 200 connections); the full 100k run is the operator procedure beside PERF.md.
+// TestMegaOrgHarnessSmoke pins the S3 per-org multicast fix on the mega-org
+// harness S0 built. A single send to a channel with `conns` live connections
+// now costs O(1) catch-up queries — ONE per-org multicast read fans the shared
+// rows to every connection in memory — not ~`conns` (the pre-S3 blowup: one
+// pump query per connection per wake, which THIS assertion measured red before
+// the fix). Delivery is unchanged: every connection still sees the send.
+// Bounded for CI (2k members, 200 connections); the full 100k run is the
+// operator procedure beside PERF.md.
 func TestMegaOrgHarnessSmoke(t *testing.T) {
 	url := os.Getenv("TEST_DATABASE_URL")
 	if url == "" {
@@ -83,18 +85,22 @@ func TestMegaOrgHarnessSmoke(t *testing.T) {
 	if res.Delivered != conns {
 		t.Fatalf("delivered = %d, want %d (each connection sees the one send)", res.Delivered, conns)
 	}
-	// THE pin: one send fans out to a per-connection catch-up query, so the
-	// pump-query counter rises by ~connection-count. This is the S3 blowup made
-	// MEASURABLE before S3 (per-org multicast) drives it to O(1).
-	if res.PumpQueriesDelta < int64(conns) {
-		t.Fatalf("pump queries rose by %d for one send to %d connections; want >= %d (the O(N) fan-out)",
-			res.PumpQueriesDelta, conns, conns)
+	// THE S3 pin (this assertion was `>= conns` before the fix): one send now
+	// fans out via a SINGLE per-org multicast read, so the pump-query counter
+	// rises by O(1) — a small constant independent of the connection count —
+	// not by ~connections (the blowup this harness was built to catch, now
+	// proven fixed by the same smoke that measured it). A stray sweep tick may
+	// add a query or two, so the ceiling is loose but stays FAR below the
+	// connection count; reverting to per-connection pump blows past it (red).
+	if res.PumpQueriesDelta > int64(conns)/4 {
+		t.Fatalf("pump queries rose by %d for one send to %d connections; want O(1) per-org multicast, not O(N) (ceiling %d)",
+			res.PumpQueriesDelta, conns, int64(conns)/4)
 	}
-	// Sanity ceiling: it must scale ~linearly with connections, not explode —
-	// a runaway loop or repeated re-pump would blow past this.
-	if res.PumpQueriesDelta > int64(conns)*4 {
-		t.Fatalf("pump queries rose by %d, far above connection count %d — unexpected re-pump loop?",
-			res.PumpQueriesDelta, conns)
+	// But the reader DID run its one hoisted read — a zero rise would mean the
+	// send never reached the multicast lane at all.
+	if res.PumpQueriesDelta < 1 {
+		t.Fatalf("pump queries did not rise (%d); the multicast reader must run its one hoisted read per event-batch",
+			res.PumpQueriesDelta)
 	}
 	// The harness also recorded a real closure-rebuild wall-time for the
 	// mega-org's injected group edit (the perms scale-tier target).

@@ -139,14 +139,18 @@ func (h *Hub) handleReadMarker(ctx context.Context, c *client, f clientFrame) {
 // coder/websocket serializes concurrent writers, so writing from the sender's
 // reader goroutine is safe alongside the pump goroutine.
 func (h *Hub) fanEphemeral(ctx context.Context, orgID int64, e Envelope, filter func(*client) bool) {
-	h.mu.Lock()
-	targets := make([]*client, 0, len(h.conns[orgID]))
-	for peer := range h.conns[orgID] {
+	sh := h.shard(orgID)
+	if sh == nil {
+		return
+	}
+	sh.mu.Lock()
+	targets := make([]*client, 0, len(sh.conns))
+	for peer := range sh.conns {
 		if filter(peer) {
 			targets = append(targets, peer)
 		}
 	}
-	h.mu.Unlock()
+	sh.mu.Unlock()
 	for _, peer := range targets {
 		// Best effort: a slow/dead peer fails its own connection, not the fan.
 		_ = h.send(ctx, peer, e)
