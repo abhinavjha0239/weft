@@ -306,9 +306,17 @@ func (s *Service) CreateItem(ctx context.Context, actor auth.Identity, p CreateI
 	return out, nil
 }
 
+// channelVisibilityPrivate mirrors the channel visibility enum's schema value
+// (messaging/channels.go); worktrack needs it only to decide the P-34 mask.
+const channelVisibilityPrivate = 2
+
 // PromoteThread: the D2 fusion reverse direction — an existing CHANNEL thread
 // becomes a work item's discussion. The thread's ACL does not change (F-5):
-// the channel keeps governing it; the item points at it.
+// the channel keeps governing it; the item points at it. Existence-masked
+// (the P-34 residual this closes): every answer about a thread in a private
+// channel the actor cannot see — the membership 403 AND the shape 400s below
+// it — collapses to the SAME "thread not found" a nonexistent id gets, so
+// promotion can never confirm a hidden thread exists.
 func (s *Service) PromoteThread(ctx context.Context, actor auth.Identity, threadID, spaceID int64, itemType string) (Item, error) {
 	if itemType == "" {
 		itemType = "Task"
@@ -329,22 +337,42 @@ func (s *Service) PromoteThread(ctx context.Context, actor auth.Identity, thread
 		if err != nil {
 			return apperr.NotFound("thread not found")
 		}
+		// The promoter must be able to SEE the discussion they are promoting —
+		// checked FIRST, before the shape 400s, or "root thread" / "already in
+		// a space" would confirm what a hidden id points at. Worktrack's copy
+		// of messaging's requireMember decision: a member passes; a PUBLIC
+		// channel's non-member gets the honest 403 (existence is org-knowable,
+		// the join affordance stays); a PRIVATE channel's non-member gets the
+		// oracle-free 404, byte-identical to an absent thread. RED/GREEN:
+		// restore the old order-and-403 and the private-thread probe in
+		// TestPromoteThreadMask answers 403/400, flipping the byte-identity
+		// asserts red. Space threads (channelID nil) follow v1 org-wide space
+		// visibility — the recorded gap — so their 400 stands.
+		if channelID != nil {
+			var visibility int16
+			var member bool
+			if err := tx.QueryRow(ctx, `
+				SELECT c.visibility,
+				       EXISTS (SELECT 1 FROM channel_member cm
+				               WHERE cm.channel_id = c.id AND cm.user_id = $3
+				                 AND cm.unsubscribed_at IS NULL)
+				FROM channel c
+				WHERE c.id = $1 AND c.org_id = $2`,
+				*channelID, actor.OrgID, actor.UserID).Scan(&visibility, &member); err != nil {
+				return apperr.Internal("channel access", err)
+			}
+			if !member {
+				if visibility == channelVisibilityPrivate {
+					return apperr.NotFound("thread not found")
+				}
+				return apperr.Forbidden("not a member of the thread's channel")
+			}
+		}
 		if channelID == nil {
 			return apperr.Invalid("this thread already belongs to a space")
 		}
 		if kind == 2 {
 			return apperr.Invalid("the channel root thread cannot be promoted")
-		}
-		// Promoter must be able to SEE the discussion they are promoting.
-		var member bool
-		if err := tx.QueryRow(ctx, `
-			SELECT EXISTS (SELECT 1 FROM channel_member
-			 WHERE channel_id = $1 AND user_id = $2 AND unsubscribed_at IS NULL)`,
-			*channelID, actor.UserID).Scan(&member); err != nil {
-			return apperr.Internal("membership check", err)
-		}
-		if !member {
-			return apperr.Forbidden("not a member of the thread's channel")
 		}
 		var already bool
 		if err := tx.QueryRow(ctx,
