@@ -43,6 +43,7 @@ type Envelope struct {
 type client struct {
 	conn   *websocket.Conn
 	id     auth.Identity
+	shard  *orgShard // the org slice this connection belongs to (set at register)
 	lastID int64
 	wake   chan struct{}
 	// Membership views for ACL filtering (channels + DM participation);
@@ -54,6 +55,20 @@ type client struct {
 	frameLimit *rate.Limiter
 	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
 	writeMu sync.Mutex
+}
+
+// orgShard is one org's slice of the hub — its live connections and its
+// per-user derived-presence registry — under a single per-org lock. The hub's
+// top-level mu only guards the orgs map; all per-org work takes the shard lock,
+// so a 100k-connection org's traffic never contends the whole hub. Connections
+// and presence drain together: the last connection to leave empties both maps.
+type orgShard struct {
+	orgID int64
+	mu    sync.Mutex
+	conns map[*client]struct{}
+	// Per-user derived presence (connection count + last activity + idle flag);
+	// per-process, never stored (the UNLOGGED presence table is unused).
+	userConns map[int64]*userPresence // userID → presence
 }
 
 type Hub struct {
@@ -68,11 +83,12 @@ type Hub struct {
 	// demotes active→idle (P-05). Exported so tests shrink it; default 10min.
 	IdleAfter time.Duration
 
-	mu    sync.Mutex
-	conns map[int64]map[*client]struct{} // orgID → clients
-	// Per-user derived presence (connection count + last activity + idle
-	// flag); per-process, never stored (the UNLOGGED presence table is unused).
-	userConns map[int64]map[int64]*userPresence
+	// mu guards the orgs map only (shard lookup/create/delete). Each org's
+	// connection set and derived-presence registry live under that shard's OWN
+	// lock, so a high-fan-out org never serializes the whole hub — the S3 lock
+	// split (docs/PERF.md). S5's multi-node presence reuses these shards.
+	mu   sync.Mutex
+	orgs map[int64]*orgShard
 
 	// Metrics (S0), optional (default Nop). pumpQueries is THE S3 signal — one
 	// catch-up query PER connection PER wake, so it scales with connection
@@ -84,9 +100,69 @@ type Hub struct {
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
 	h := &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
-		conns: map[int64]map[*client]struct{}{}}
+		orgs: map[int64]*orgShard{}}
 	h.SetMetrics(metrics.Nop())
 	return h
+}
+
+// shard returns the org's shard, or nil when the org has no connections.
+func (h *Hub) shard(orgID int64) *orgShard {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.orgs[orgID]
+}
+
+// shards snapshots the live shard set for the sweeps: copied under the map
+// lock, iterated (and locked individually) without it.
+func (h *Hub) shards() []*orgShard {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	out := make([]*orgShard, 0, len(h.orgs))
+	for _, sh := range h.orgs {
+		out = append(out, sh)
+	}
+	return out
+}
+
+// register adds c to its org's shard (creating the shard on first use) and
+// records the connection for presence, reporting whether an "active" presence
+// broadcast is owed. Registration nests h.mu→sh.mu so a shard can never be
+// deleted by a concurrent deregister between lookup and insert (which would
+// strand the connection in an orphaned shard, invisible to wake/fan-out).
+func (h *Hub) register(c *client, now time.Time) (announce bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sh := h.orgs[c.id.OrgID]
+	if sh == nil {
+		sh = &orgShard{orgID: c.id.OrgID, conns: map[*client]struct{}{},
+			userConns: map[int64]*userPresence{}}
+		h.orgs[c.id.OrgID] = sh
+	}
+	c.shard = sh
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	sh.conns[c] = struct{}{}
+	h.connections.Set(float64(len(sh.conns)), strconv.FormatInt(c.id.OrgID, 10))
+	return sh.trackConnect(c.id.UserID, now)
+}
+
+// deregister removes c from its shard, dropping the shard from the orgs map
+// once its last connection leaves, and reports whether the user went offline.
+// Nested h.mu→sh.mu matches register so the empty-shard delete is atomic.
+func (h *Hub) deregister(c *client) (wentOffline bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	sh := c.shard
+	sh.mu.Lock()
+	delete(sh.conns, c)
+	h.connections.Set(float64(len(sh.conns)), strconv.FormatInt(c.id.OrgID, 10))
+	wentOffline = sh.trackDisconnect(c.id.UserID)
+	empty := len(sh.conns) == 0
+	sh.mu.Unlock()
+	if empty {
+		delete(h.orgs, sh.orgID)
+	}
+	return wentOffline
 }
 
 // SetMetrics wires an observability registry (S0). Optional — the default is
@@ -142,23 +218,25 @@ func (h *Hub) sweep(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			h.mu.Lock()
-			for orgID := range h.conns {
-				h.wakeOrgLocked(orgID)
+			for _, sh := range h.shards() {
+				sh.wakeAll()
 			}
-			h.mu.Unlock()
 		}
 	}
 }
 
 func (h *Hub) wakeOrg(orgID int64) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.wakeOrgLocked(orgID)
+	if sh := h.shard(orgID); sh != nil {
+		sh.wakeAll()
+	}
 }
 
-func (h *Hub) wakeOrgLocked(orgID int64) {
-	for c := range h.conns[orgID] {
+// wakeAll signals every connection in the shard to run its catch-up pump.
+// (Per-connection catch-up; the S3 per-org multicast reader replaces this.)
+func (sh *orgShard) wakeAll() {
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	for c := range sh.conns {
 		select {
 		case c.wake <- struct{}{}:
 		default: // already signaled
@@ -197,26 +275,12 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		ws.Close(websocket.StatusInternalError, "membership load failed")
 		return
 	}
-	h.mu.Lock()
-	if h.conns[id.OrgID] == nil {
-		h.conns[id.OrgID] = map[*client]struct{}{}
-	}
-	h.conns[id.OrgID][c] = struct{}{}
-	h.connections.Set(float64(len(h.conns[id.OrgID])), strconv.FormatInt(id.OrgID, 10))
-	announce := h.trackConnect(id.OrgID, id.UserID, time.Now())
-	h.mu.Unlock()
+	announce := h.register(c, time.Now())
 	if announce {
 		h.broadcastPresence(ctx, id.OrgID, id.UserID, "active")
 	}
 	defer func() {
-		h.mu.Lock()
-		delete(h.conns[id.OrgID], c)
-		if len(h.conns[id.OrgID]) == 0 {
-			delete(h.conns, id.OrgID)
-		}
-		h.connections.Set(float64(len(h.conns[id.OrgID])), strconv.FormatInt(id.OrgID, 10))
-		wentOffline := h.trackDisconnect(id.OrgID, id.UserID)
-		h.mu.Unlock()
+		wentOffline := h.deregister(c)
 		if wentOffline {
 			// The request context is gone; presence still fans out.
 			h.broadcastPresence(context.Background(), id.OrgID, id.UserID, "offline")

@@ -28,17 +28,11 @@ type userPresence struct {
 // trackConnect registers a new connection for the user and reports whether a
 // presence.changed "active" should be broadcast — true when this is their
 // FIRST connection, or a reconnect that finds them idle (a reconnect resets
-// the idle timer). Caller must hold h.mu.
-func (h *Hub) trackConnect(orgID, userID int64, now time.Time) (announce bool) {
-	if h.userConns == nil {
-		h.userConns = map[int64]map[int64]*userPresence{}
-	}
-	if h.userConns[orgID] == nil {
-		h.userConns[orgID] = map[int64]*userPresence{}
-	}
-	p := h.userConns[orgID][userID]
+// the idle timer). Caller must hold sh.mu.
+func (sh *orgShard) trackConnect(userID int64, now time.Time) (announce bool) {
+	p := sh.userConns[userID]
 	if p == nil {
-		h.userConns[orgID][userID] = &userPresence{conns: 1, lastActive: now}
+		sh.userConns[userID] = &userPresence{conns: 1, lastActive: now}
 		return true
 	}
 	p.conns++
@@ -49,13 +43,10 @@ func (h *Hub) trackConnect(orgID, userID int64, now time.Time) (announce bool) {
 }
 
 // trackDisconnect decrements and reports whether this was the user's LAST live
-// connection (→ offline). Caller must hold h.mu.
-func (h *Hub) trackDisconnect(orgID, userID int64) bool {
-	m := h.userConns[orgID]
-	if m == nil {
-		return false
-	}
-	p := m[userID]
+// connection (→ offline). Caller must hold sh.mu. The shard itself is dropped
+// from the orgs map by deregister once its last connection leaves.
+func (sh *orgShard) trackDisconnect(userID int64) bool {
+	p := sh.userConns[userID]
 	if p == nil {
 		return false
 	}
@@ -63,23 +54,16 @@ func (h *Hub) trackDisconnect(orgID, userID int64) bool {
 	if p.conns > 0 {
 		return false
 	}
-	delete(m, userID)
-	if len(m) == 0 {
-		delete(h.userConns, orgID)
-	}
+	delete(sh.userConns, userID)
 	return true
 }
 
 // markActiveLocked records activity for the user and reports whether it
 // promoted them from idle back to active (the only transition worth a
 // broadcast; a user already active just has their timer refreshed). Multi-
-// device: activity on ANY connection makes the user active. Caller holds h.mu.
-func (h *Hub) markActiveLocked(orgID, userID int64, now time.Time) (promoted bool) {
-	m := h.userConns[orgID]
-	if m == nil {
-		return false
-	}
-	p := m[userID]
+// device: activity on ANY connection makes the user active. Caller holds sh.mu.
+func (sh *orgShard) markActiveLocked(userID int64, now time.Time) (promoted bool) {
+	p := sh.userConns[userID]
 	if p == nil {
 		return false
 	}
@@ -97,9 +81,10 @@ func (h *Hub) markActiveLocked(orgID, userID int64, now time.Time) (promoted boo
 // to active. The lock is released before broadcasting — the fan never holds
 // h.mu.
 func (h *Hub) recordActivity(ctx context.Context, c *client) {
-	h.mu.Lock()
-	promoted := h.markActiveLocked(c.id.OrgID, c.id.UserID, time.Now())
-	h.mu.Unlock()
+	sh := c.shard
+	sh.mu.Lock()
+	promoted := sh.markActiveLocked(c.id.UserID, time.Now())
+	sh.mu.Unlock()
 	if promoted {
 		h.broadcastPresence(ctx, c.id.OrgID, c.id.UserID, "active")
 	}
@@ -108,7 +93,7 @@ func (h *Hub) recordActivity(ctx context.Context, c *client) {
 // presenceSweep demotes silent-but-connected users active→idle once they pass
 // IdleAfter. One ticker per hub; the transition list is copied UNDER the lock
 // and fanned AFTER releasing it, so the sweep never broadcasts while holding
-// h.mu. The interval tracks IdleAfter (so a tiny test threshold is observed
+// sh.mu. The interval tracks IdleAfter (so a tiny test threshold is observed
 // promptly) but is capped at a minute for the 10-minute production default.
 func (h *Hub) presenceSweep(ctx context.Context) {
 	interval := h.IdleAfter / 4
@@ -128,16 +113,19 @@ func (h *Hub) presenceSweep(ctx context.Context) {
 		case <-t.C:
 			now := time.Now()
 			var demoted []transition
-			h.mu.Lock()
-			for orgID, users := range h.userConns {
-				for userID, p := range users {
+			// Per-shard so the sweep never holds a global lock across every
+			// org; the transition list is copied under each shard lock and
+			// fanned only after releasing it (the fan never holds sh.mu).
+			for _, sh := range h.shards() {
+				sh.mu.Lock()
+				for userID, p := range sh.userConns {
 					if !p.idle && now.Sub(p.lastActive) > h.IdleAfter {
 						p.idle = true
-						demoted = append(demoted, transition{orgID, userID})
+						demoted = append(demoted, transition{sh.orgID, userID})
 					}
 				}
+				sh.mu.Unlock()
 			}
-			h.mu.Unlock()
 			for _, d := range demoted {
 				h.broadcastPresence(ctx, d.orgID, d.userID, "idle")
 			}
@@ -157,10 +145,14 @@ func (h *Hub) broadcastPresence(ctx context.Context, orgID, userID int64, state 
 // mapped to their current state ("active" or "idle"); offline users are
 // absent. Clients read it once, then apply presence.changed signals.
 func (h *Hub) PresenceSnapshot(orgID int64) map[int64]string {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	out := make(map[int64]string, len(h.userConns[orgID]))
-	for uid, p := range h.userConns[orgID] {
+	sh := h.shard(orgID)
+	if sh == nil {
+		return map[int64]string{}
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	out := make(map[int64]string, len(sh.userConns))
+	for uid, p := range sh.userConns {
 		state := "active"
 		if p.idle {
 			state = "idle"
