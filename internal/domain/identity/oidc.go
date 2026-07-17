@@ -142,6 +142,15 @@ func (s *Service) StartOIDC(ctx context.Context, orgSlug, provider string) (stri
 // OIDCResult is the callback's answer: a native session token plus who it is
 // for. The API-era austerity — no web page, no redirect handoff (a recorded
 // gap) — mirrors the password-reset "the mail carries the token" precedent.
+//
+// When the redirect handoff IS built, the callback MUST be bound to the
+// browser that initiated /start (a state cookie or double-submit pair set at
+// /start and required at the callback). The state proves a flow EXISTS, not
+// WHO is completing it: unbound, an attacker can start their own flow and
+// drive a victim's browser to the callback URL, silently logging the victim
+// into the attacker's account (login CSRF). Today the token is the response
+// BODY to whoever presents code+state — the moment it becomes a cookie or
+// fragment handoff, browser binding stops being optional.
 type OIDCResult struct {
 	Token  string `json:"token"`
 	UserID int64  `json:"user_id"`
@@ -248,14 +257,19 @@ func (s *Service) CallbackOIDC(ctx context.Context, orgSlug, provider, code, sta
 //     unverified mailbox must not grant their account) — this is the
 //     load-bearing guard.
 //  3. Else refuse (Forbidden) — the invite is the authorization; no JIT.
+//
+// Both link resolves pin the USER to the provider's org: providers are
+// org-scoped, so a link row whose user_id crossed orgs can only exist through
+// a bug elsewhere — and even then it must never resolve, or one org's IdP
+// would mint sessions for another org's users (the cross-org red/green).
 func (s *Service) resolveOIDCAccount(ctx context.Context, tx pgx.Tx, pr providerRow, subject, email string, emailVerified bool) (int64, error) {
 	var userID int64
 	err := tx.QueryRow(ctx, `
 		SELECT u.id FROM external_identity ei
 		JOIN user_account u ON u.id = ei.user_id
-		WHERE ei.provider_id = $1 AND ei.subject = $2
+		WHERE ei.provider_id = $1 AND ei.subject = $2 AND u.org_id = $3
 		  AND u.deactivated_at IS NULL AND u.kind = 1`,
-		pr.id, subject).Scan(&userID)
+		pr.id, subject, pr.orgID).Scan(&userID)
 	if err == nil {
 		return userID, nil // rule 1
 	}
@@ -290,12 +304,14 @@ func (s *Service) resolveOIDCAccount(ctx context.Context, tx pgx.Tx, pr provider
 		pr.orgID, matchID, pr.id, subject, strings.ToLower(email)); err != nil {
 		return 0, apperr.Internal("oidc link identity", err)
 	}
+	// The org pin makes a conflicting CROSS-ORG row unresolvable by design:
+	// Internal (never a session) is the only safe answer to that corruption.
 	if err := tx.QueryRow(ctx, `
 		SELECT u.id FROM external_identity ei
 		JOIN user_account u ON u.id = ei.user_id
-		WHERE ei.provider_id = $1 AND ei.subject = $2
+		WHERE ei.provider_id = $1 AND ei.subject = $2 AND u.org_id = $3
 		  AND u.deactivated_at IS NULL AND u.kind = 1`,
-		pr.id, subject).Scan(&userID); err != nil {
+		pr.id, subject, pr.orgID).Scan(&userID); err != nil {
 		return 0, apperr.Internal("oidc link resolve", err)
 	}
 	// Audit the link — an external identity gaining access to an account is a

@@ -139,7 +139,8 @@ func (f *fakeIdP) signLocked() string {
 // enable-via-discovery-probe, the decision table (link-by-verified-email,
 // ride-the-link, no-link-for-unverified, no-JIT, deactivated-exclusion,
 // OIDC-only accounts), state replay, nonce mismatch, disabled providers,
-// password coexistence, and provider CRUD (write-only secret, 422, non-admin).
+// password coexistence, cross-org isolation (admin reach and the org-pinned
+// link resolves), and provider CRUD (write-only secret, 422, non-admin).
 func TestOIDCLogin(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -389,6 +390,76 @@ func TestOIDCLogin(t *testing.T) {
 		if resp.StatusCode != http.StatusNotFound {
 			t.Fatalf("start %q = %d, want 404", name, resp.StatusCode)
 		}
+	}
+
+	// 11. Cross-org admin reach: mallory owns org "rival", so she HAS
+	//     manage_org — in HER org. Acme's provider is a 404 to her PATCH and
+	//     DELETE (the org-pinned load), and stays enabled.
+	var rival struct {
+		OrgID  int64  `json:"org_id"`
+		UserID int64  `json:"user_id"`
+		Token  string `json:"token"`
+	}
+	if code := postRetry(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "rival", "email": "mallory@rival.test",
+		"password": "password123", "full_name": "Mallory",
+	}, &rival); code != http.StatusCreated {
+		t.Fatalf("rival bootstrap = %d", code)
+	}
+	adminURL := fmt.Sprintf("%s/api/v1/admin/auth-providers/%d", ts.URL, googleID)
+	if c := patchJSONInto(t, adminURL, rival.Token, map[string]any{"enabled": false}, nil); c != http.StatusNotFound {
+		t.Fatalf("cross-org provider patch = %d, want 404", c)
+	}
+	if c := deleteReq(t, adminURL, rival.Token); c != http.StatusNotFound {
+		t.Fatalf("cross-org provider delete = %d, want 404", c)
+	}
+	var stillEnabled bool
+	if err := pool.QueryRow(ctx,
+		`SELECT enabled FROM auth_provider WHERE id = $1`, googleID).Scan(&stillEnabled); err != nil || !stillEnabled {
+		t.Fatalf("cross-org admin touched the provider: enabled=%v err=%v", stillEnabled, err)
+	}
+
+	// 12. RED/GREEN PIN 3 — the cross-org resolve. A link row that (through
+	//     some future bug) points at ANOTHER org's user must never resolve:
+	//     acme's IdP asserting that subject gets rule 3's 403, not a session
+	//     as the rival-org user. Dropping the `u.org_id` pin from the rule-1
+	//     resolve in resolveOIDCAccount mints exactly that session and flips
+	//     this red.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO external_identity (org_id, user_id, provider_id, subject, email_at_link)
+		VALUES ($1, $2, $3, 'crossorg-sub', 'mallory@rival.test')`,
+		boot.OrgID, rival.UserID, googleID); err != nil {
+		t.Fatalf("seed cross-org link: %v", err)
+	}
+	before = sessionCount(t, ctx, pool, rival.UserID)
+	code, _ = login("google", "crossorg-sub", "mallory@rival.test", true, false)
+	if code != http.StatusForbidden {
+		t.Fatalf("cross-org link login = %d, want 403", code)
+	}
+	if after := sessionCount(t, ctx, pool, rival.UserID); after != before {
+		t.Fatalf("CROSS-ORG SESSION: rival user sessions %d → %d via acme's IdP", before, after)
+	}
+
+	// 13. RED/GREEN PIN 4 — the link re-select. Same corrupt row, but the IdP
+	//     now asserts an email that DOES match an acme human, so rule 2 tries
+	//     to link — and the INSERT's ON CONFLICT collides with the corrupt
+	//     row. The org-pinned re-select cannot resolve it: corruption is
+	//     loudly unresolvable (500), never a session for EITHER user, and the
+	//     tx rollback keeps erin unlinked. Dropping the pin from the re-select
+	//     resolves mallory instead and flips this red.
+	erinID := seedUser(t, ctx, pool, boot.OrgID, "erin@acme.test", "Erin", "", false)
+	rivalBefore := sessionCount(t, ctx, pool, rival.UserID)
+	erinBefore := sessionCount(t, ctx, pool, erinID)
+	code, _ = login("google", "crossorg-sub", "erin@acme.test", true, false)
+	if code != http.StatusInternalServerError {
+		t.Fatalf("conflicted cross-org link login = %d, want 500", code)
+	}
+	if sessionCount(t, ctx, pool, rival.UserID) != rivalBefore ||
+		sessionCount(t, ctx, pool, erinID) != erinBefore {
+		t.Fatal("conflicted cross-org link minted a session")
+	}
+	if n := extIdentityCount(t, ctx, pool, googleID, "crossorg-sub"); n != 1 {
+		t.Fatalf("conflicted link rows = %d, want 1 (rollback keeps erin unlinked)", n)
 	}
 
 	oidcProviderCRUD(t, ctx, pool, ts, boot.OrgID, boot.ChannelID, boot.Token)
