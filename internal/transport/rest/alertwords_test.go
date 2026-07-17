@@ -73,9 +73,7 @@ func TestAlertWords(t *testing.T) {
 
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("materialize: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	}
 	send := func(content string) int64 {
 		t.Helper()

@@ -85,15 +85,11 @@ func TestAutomationTemplating(t *testing.T) {
 
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("process: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	}
 	notifProcess := func() {
 		t.Helper()
-		if err := notifRunner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("notif process: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, notifRunner.ProcessOrg)
 	}
 	send := func(channelID int64, content string) {
 		t.Helper()

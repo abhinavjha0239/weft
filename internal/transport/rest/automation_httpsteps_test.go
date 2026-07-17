@@ -111,9 +111,7 @@ func TestAutomationHTTPSteps(t *testing.T) {
 		"org_slug": "outb", "email": "a@outb.test", "password": "password123",
 		"full_name": "Alice Chen",
 	}, &boot)
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("drain: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 
 	// mkHTTPRule seeds an enabled org-scope rule by SQL: the write-time shape
 	// gate is PRODUCTION-strict (standard ports only), so the httptest
@@ -160,9 +158,7 @@ func TestAutomationHTTPSteps(t *testing.T) {
 		if sent.MessageID == 0 {
 			t.Fatal("send failed")
 		}
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("process: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	}
 	lane := func(r *automation.Runner) int {
 		t.Helper()

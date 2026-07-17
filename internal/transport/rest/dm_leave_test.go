@@ -113,9 +113,7 @@ func TestGroupDMLeave(t *testing.T) {
 	// Alice's first message: Bob is still a participant, so he can read it,
 	// gets fan-out for it, and it becomes history he keeps after leaving.
 	msg1 := sendMsg(t, ts.URL, boot.Token, root, "the launch is friday")
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process #1: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	if n := notifCount(t, ts.URL, bobTok); n != 1 {
 		t.Fatalf("bob notifications after msg1 = %d, want 1", n)
 	}
@@ -178,9 +176,7 @@ func TestGroupDMLeave(t *testing.T) {
 	// --- Alice posts while Bob is gone: fan-out must exclude the deleted
 	// participant. Bob gets NO new notification; Carol does. ---
 	msg2 := sendMsg(t, ts.URL, boot.Token, root, "secret while bob is out")
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process #2: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	if n := notifCount(t, ts.URL, bobTok); n != 1 {
 		t.Fatalf("bob notifications after msg2 = %d, want 1 (no fan-out to leaver)", n)
 	}
@@ -209,9 +205,7 @@ func TestGroupDMLeave(t *testing.T) {
 
 	// Fan-out is restored: a subsequent send notifies Bob again.
 	sendMsg(t, ts.URL, boot.Token, root, "welcome back")
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process #3: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	if n := notifCount(t, ts.URL, bobTok); n != 2 {
 		t.Fatalf("bob notifications after rejoin+send = %d, want 2 (fan-out restored)", n)
 	}

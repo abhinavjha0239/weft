@@ -80,9 +80,7 @@ func TestAutomationWebhooks(t *testing.T) {
 		"org_slug": "hook", "email": "a@hook.test", "password": "password123",
 		"full_name": "Alice Chen",
 	}, &boot)
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("drain: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 
 	// A webhook rule whose step templates the inbound body.
 	var rule automation.Automation
@@ -131,9 +129,7 @@ func TestAutomationWebhooks(t *testing.T) {
 	if code, body := postWebhook(t, hookURL(rule.ID, token), `{"x":"hello"}`); code != http.StatusAccepted {
 		t.Fatalf("happy webhook = %d %s, want 202", code, body)
 	}
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	if n := countPosts("hook: hello"); n != 1 {
 		t.Fatalf("templated posts = %d, want 1", n)
 	}
@@ -179,9 +175,7 @@ func TestAutomationWebhooks(t *testing.T) {
 		t.Fatalf("invalid json = %d, want 400", code)
 	}
 	// Neither of those should have fired a run.
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process 2: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	if n := countPosts("hook: hello"); n != 1 {
 		t.Fatalf("posts after bad bodies = %d, want still 1", n)
 	}

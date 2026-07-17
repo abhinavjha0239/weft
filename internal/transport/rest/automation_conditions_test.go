@@ -74,9 +74,7 @@ func TestAutomationConditions(t *testing.T) {
 
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("process: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	}
 	send := func(channelID int64, content string) {
 		t.Helper()

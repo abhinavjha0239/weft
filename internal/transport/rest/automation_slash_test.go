@@ -101,9 +101,7 @@ func TestAutomationSlash(t *testing.T) {
 			t.Fatalf("enable %d = %d", id, code)
 		}
 	}
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("drain: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 
 	slash := func(tok, command string, channelID int64, text string) int {
 		t.Helper()
@@ -138,9 +136,7 @@ func TestAutomationSlash(t *testing.T) {
 	if code := slash(boot.Token, "note", announce.ChannelID, "nope"); code != http.StatusAccepted {
 		t.Fatalf("note from announce = %d, want 202 (invocation accepted, rule just won't match)", code)
 	}
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	if n := count(announce.ChannelID, "deploy: v2"); n != 1 {
 		t.Fatalf("deploy v2 in announce = %d, want 1 (member fired org rule, templated)", n)
 	}

@@ -86,9 +86,7 @@ func TestDMBreakthrough(t *testing.T) {
 
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("materialize: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	}
 	// openDM returns (dm_space id, root thread id) for the given target set.
 	openDM := func(fromTok string, toIDs ...int64) (int64, int64) {

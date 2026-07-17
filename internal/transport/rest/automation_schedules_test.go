@@ -69,9 +69,7 @@ func TestAutomationSchedules(t *testing.T) {
 	}, &boot)
 
 	// Drain bootstrap history before any rule exists.
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("drain: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 
 	// A channel-scope schedule rule posting into its own channel every 5 min.
 	var rule automation.Automation
@@ -137,9 +135,7 @@ func TestAutomationSchedules(t *testing.T) {
 		t.Fatalf("after claim next_at = %v, want advanced into the future", at)
 	}
 	// The consumer turns the schedule_due event into exactly one run posting.
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	if n := countTicks(); n != 1 {
 		t.Fatalf("ticks after one fire = %d, want 1", n)
 	}
@@ -155,9 +151,7 @@ func TestAutomationSchedules(t *testing.T) {
 	if err != nil || fired != 0 {
 		t.Fatalf("second claim fired = %d (%v), want 0", fired, err)
 	}
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("process 2: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	if n := countTicks(); n != 1 {
 		t.Fatalf("ticks after second claim = %d, want still 1", n)
 	}
