@@ -105,9 +105,7 @@ func TestNotificationEmails(t *testing.T) {
 	}
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("materialize: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	}
 	// The worker claims rows created BEFORE the cutoff: future = everything
 	// due, past = nothing due yet.
@@ -278,9 +276,7 @@ func TestEmailKeywordDefault(t *testing.T) {
 	}
 	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
 		boot.Token, map[string]any{"content": "we deploy today"}, nil)
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("materialize: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 
 	// The keyword notification is due and email-enabled by default → one email.
 	if n, err := worker.RunOnce(ctx, time.Now().Add(time.Minute)); err != nil || n != 1 {

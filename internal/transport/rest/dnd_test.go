@@ -114,9 +114,7 @@ func TestDNDSuppression(t *testing.T) {
 
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("materialize: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	}
 	due := func() time.Time { return time.Now().Add(time.Minute) }
 	openDM := func(fromTok string, toID int64) int64 {

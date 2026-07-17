@@ -165,9 +165,7 @@ func TestPushMedium(t *testing.T) {
 	}
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("materialize: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	}
 	seedSub := func(uid int64, endpoint string) (*ecdh.PrivateKey, []byte) {
 		t.Helper()

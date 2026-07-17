@@ -174,9 +174,7 @@ func TestNotificationPipeline(t *testing.T) {
 		WHERE consumer = 'notifications' AND org_id = $1`, boot.OrgID); err != nil {
 		t.Fatalf("reset cursor: %v", err)
 	}
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("replay: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	in = pollInbox(t, ts.URL, bobTok, 2)
 	if len(in.Notifications) != 2 {
 		t.Fatalf("replay duplicated notifications: %d rows", len(in.Notifications))
@@ -243,27 +241,12 @@ func TestNotificationDepth(t *testing.T) {
 
 	// Resolution reads CURRENT settings, so a settings change racing an
 	// unprocessed older event would mint extra (legitimate) rows on slow
-	// runners. The cursor is ordered: wait for the materializer to catch
-	// up before every settings mutation to keep expectations exact.
+	// runners. The cursor is ordered: drain the materializer before every
+	// settings mutation to keep expectations exact. ProcessOrg alongside the
+	// background runner is safe — the consumer is cursor-idempotent.
 	waitForConsumer := func() {
 		t.Helper()
-		deadline := time.Now().Add(8 * time.Second)
-		for {
-			var lag int
-			_ = pool.QueryRow(ctx, `
-				SELECT count(*) FROM event_log e
-				WHERE e.org_id = $1 AND e.id > COALESCE((
-				  SELECT last_id FROM event_consumer_cursor
-				  WHERE consumer = 'notifications' AND org_id = $1), 0)`,
-				boot.OrgID).Scan(&lag)
-			if lag == 0 {
-				return
-			}
-			if time.Now().After(deadline) {
-				t.Fatal("notification consumer never caught up")
-			}
-			time.Sleep(100 * time.Millisecond)
-		}
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	}
 
 	var th struct {
@@ -366,9 +349,7 @@ func TestNotificationDepth(t *testing.T) {
 		WHERE consumer = 'notifications' AND org_id = $1`, boot.OrgID); err != nil {
 		t.Fatalf("reset cursor: %v", err)
 	}
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("replay: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	pollInbox(t, ts.URL, bobTok, 2)     // muted follow suppressed, mention deduped
 	pollInbox(t, ts.URL, charlieTok, 4) // level back to default: nothing re-qualifies
 }

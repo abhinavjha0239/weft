@@ -118,9 +118,7 @@ func TestLinkPreviews(t *testing.T) {
 	}
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("unfurl process: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "unfurl", boot.OrgID, runner.ProcessOrg)
 	}
 	getMsg := func(id int64) messaging.Message {
 		t.Helper()

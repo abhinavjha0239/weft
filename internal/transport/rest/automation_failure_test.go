@@ -139,9 +139,7 @@ func TestAutomationFailureNotifies(t *testing.T) {
 
 	process := func() {
 		t.Helper()
-		if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-			t.Fatalf("process: %v", err)
-		}
+		drainConsumer(t, ctx, pool, "automations", boot.OrgID, runner.ProcessOrg)
 	}
 	fire := func(content string) {
 		t.Helper()

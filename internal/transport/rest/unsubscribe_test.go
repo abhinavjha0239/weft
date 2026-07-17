@@ -124,9 +124,7 @@ func TestUnsubscribe(t *testing.T) {
 	postJSON(t, ts.URL+"/api/v1/dms", boot.Token, map[string]any{"user_ids": []int64{bobID}}, &conv)
 	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, conv.RootThreadID),
 		boot.Token, map[string]any{"content": "the plan"}, nil)
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("materialize: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	if n, err := worker.RunOnce(ctx, due()); err != nil || n != 1 {
 		t.Fatalf("digest sweep = %d (%v), want 1", n, err)
 	}
@@ -175,9 +173,7 @@ func TestUnsubscribe(t *testing.T) {
 	// A now-due DM is NOT emailed (kind 1 is off).
 	postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/messages", ts.URL, conv.RootThreadID),
 		boot.Token, map[string]any{"content": "after unsub"}, nil)
-	if err := runner.ProcessOrg(ctx, boot.OrgID); err != nil {
-		t.Fatalf("materialize: %v", err)
-	}
+	drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
 	if n, err := worker.RunOnce(ctx, due()); err != nil || n != 0 {
 		t.Fatalf("post-unsub sweep = %d (%v), want 0", n, err)
 	}
