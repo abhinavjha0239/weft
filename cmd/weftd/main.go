@@ -222,6 +222,9 @@ func serve(ctx context.Context, cfg config.Config) error {
 		UserAgent: brand.Name + "Bot/1.0 (+oidc)",
 	}), cfg.BaseURL)
 	msgSvc := messaging.New(pool, permsSvc)
+	// F-17: level/follow settings changes patch the notification candidate
+	// set in the same tx as the setting write (the SetFiles seam pattern).
+	msgSvc.SetDeliverability(notification.NewDeliverability(pool, log))
 	autoSvc := automation.New(pool, permsSvc)
 	autoSvc.SetMessaging(msgSvc) // the slash-command channel-send gate
 	autoRunner := automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log)

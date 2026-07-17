@@ -35,6 +35,9 @@ const (
 type Service struct {
 	pool *pgxpool.Pool
 	fan  Fanout
+	// deliv maintains the F-17 candidate set on alert-word edits (the
+	// in-package leg of the invalidation dispatch).
+	deliv *Deliverability
 	// unsubSecret keys the one-click unsubscribe MAC (P-20); empty disables
 	// the unsubscribe endpoints (they 404 — nothing to verify against).
 	unsubSecret string
@@ -44,7 +47,9 @@ type Service struct {
 	push *webpush.Sender
 }
 
-func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func New(pool *pgxpool.Pool) *Service {
+	return &Service{pool: pool, deliv: NewDeliverability(pool, nil)}
+}
 
 // SetFanout wires the live-ping seam (the gateway Hub in production, a capture
 // in tests), set at composition time like messaging.SetFiles. The DM

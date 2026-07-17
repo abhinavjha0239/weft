@@ -58,6 +58,11 @@ func (s *Service) SetAlertWords(ctx context.Context, actor auth.Identity, words 
 				return apperr.Internal("store alert word", err)
 			}
 		}
+		// F-17: the word list defines the alert-word reason (3) across every
+		// channel the user is in — resync in the same tx.
+		if err := s.deliv.PatchAlertWords(ctx, tx, actor.OrgID, actor.UserID); err != nil {
+			return apperr.Internal("patch deliverability", err)
+		}
 		return nil
 	})
 	if err != nil {

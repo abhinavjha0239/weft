@@ -45,6 +45,9 @@ type Runner struct {
 	// pass — the O(channel size) fan-out cost this consumer bears per message
 	// (S0). Optional (default Nop). Set once at wiring.
 	scanned metrics.Counter
+	// deliv owns the F-17 candidate set: the runner lazily builds it per
+	// channel and patches it from member.joined/left events.
+	deliv *Deliverability
 }
 
 func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
@@ -53,6 +56,7 @@ func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
 		consumer: eventlog.NewConsumer(pool, consumerName, batchSize),
 		fan:      fan,
 		log:      log,
+		deliv:    NewDeliverability(pool, log),
 	}
 	r.SetMetrics(metrics.Nop())
 	return r
@@ -162,7 +166,25 @@ func (r *Runner) ProcessOrg(ctx context.Context, orgID int64) error {
 	}
 }
 
+// membershipPayload mirrors the member.joined/left event payload shape.
+type membershipPayload struct {
+	ChannelID int64 `json:"channel_id"`
+	UserID    int64 `json:"user_id"`
+}
+
 func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
+	// F-17 invalidation: membership changes patch the deliverability set
+	// off the event log (a single-user resync — O(1) per join, never a
+	// channel rebuild; consuming events keeps messaging and identity free
+	// of a notification import).
+	if ev.Verb == "member.joined" || ev.Verb == "member.left" {
+		var m membershipPayload
+		if err := json.Unmarshal(ev.Payload, &m); err != nil ||
+			m.ChannelID == 0 || m.UserID == 0 {
+			return nil // malformed payloads are logged history, not a stall
+		}
+		return r.deliv.PatchMembership(ctx, ev.OrgID, m.ChannelID, m.UserID)
+	}
 	// Backfill semantics (ADR-003 E4): imported history never notifies.
 	if (ev.Verb != "message.created" && ev.Verb != "message.edited") ||
 		ev.ActorKind == enum.ActorImporter {
@@ -175,6 +197,13 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	author := int64(0)
 	if ev.ActorID != nil {
 		author = *ev.ActorID
+	}
+	// F-17 lazy backfill: the first channel message after deploy derives
+	// the deliverability set (the last O(members) pass this channel pays).
+	if p.ChannelID != 0 && p.ThreadID != 0 {
+		if err := r.deliv.EnsureBuilt(ctx, ev.OrgID, p.ChannelID); err != nil {
+			return err
+		}
 	}
 
 	// An edit pings only the NEWLY-added mentions; the dedupe key would
