@@ -3,10 +3,15 @@
 // filtering), and the guarantee is "no undetectable loss" via checkpoint
 // heartbeats. Resume = reconnect with last_id; the gap replays from the log.
 //
-// Scale shape (docs/SCHEMA.md): ONE dispatcher goroutine LISTENs for event
-// notifications and wakes only the orgs that have connections with pending
-// signals — idle orgs cost zero. Each connection pumps independently with the
-// txid-gated read (same F-1 rule as consumers).
+// Scale shape (docs/SCHEMA.md, docs/PERF.md): ONE dispatcher goroutine LISTENs
+// for event notifications and wakes only the orgs that have connections — idle
+// orgs cost zero. Within an org, ONE per-org multicast reader (S3) runs a
+// SINGLE txid-gated event-log read per event-batch and fans the shared rows to
+// that org's live connections in memory, each applying its own O(1) ACL filter
+// — so per-message DB cost is O(1) per org, independent of connection count.
+// A connection that reconnects behind the org head runs its OWN bounded
+// catch-up (the per-connection pump) only until it reaches the head, then joins
+// the live lane; the per-connection query survives for the resume gap alone.
 package gateway
 
 import (
@@ -44,8 +49,19 @@ type client struct {
 	conn   *websocket.Conn
 	id     auth.Identity
 	shard  *orgShard // the org slice this connection belongs to (set at register)
+	cancel context.CancelFunc
 	lastID int64
-	wake   chan struct{}
+	// live is the lane flag (guarded by shard.mu): a live connection is caught
+	// up to the org head and receives the shared multicast batch via feed; a
+	// non-live connection is behind the head and runs its own resume pump until
+	// it catches up. lastID/channels/dms are otherwise owned by this
+	// connection's own goroutine (the pump, deliverShared, and checkpoint).
+	live bool
+	// feed carries the per-org reader's shared batch to this connection's live
+	// lane. Bounded: a connection that cannot keep up fills the buffer and is
+	// dropped (backpressure) rather than stalling the org (F-2 resync on reconnect).
+	feed chan []eventRow
+	wake chan struct{}
 	// Membership views for ACL filtering (channels + DM participation);
 	// refreshed when a membership event for this user arrives (F-2 replay
 	// rule, M0 slice).
@@ -57,6 +73,11 @@ type client struct {
 	writeMu sync.Mutex
 }
 
+// feedBuffer bounds how many multicast batches may queue for one connection
+// before the per-org reader gives up on it (drops it to resync). Small: live
+// connections drain immediately; a stalled one is shed fast, not indulged.
+const feedBuffer = 16
+
 // orgShard is one org's slice of the hub — its live connections and its
 // per-user derived-presence registry — under a single per-org lock. The hub's
 // top-level mu only guards the orgs map; all per-org work takes the shard lock,
@@ -66,6 +87,18 @@ type orgShard struct {
 	orgID int64
 	mu    sync.Mutex
 	conns map[*client]struct{}
+	// head is the org's live event cursor: the highest event-log id the
+	// multicast reader has read for the live lane (guarded by mu). A resuming
+	// connection joins the live lane only once its own cursor reaches head, and
+	// the reader advances head under the same lock — so the resume→live hand-off
+	// is a single consistent point and no event slips through it.
+	head int64
+	// wake signals the per-org multicast reader; buffered 1 so many event
+	// notifications for one org coalesce into a single catch-up pass.
+	wake chan struct{}
+	// stop ends the reader goroutine when the shard is dropped (last connection
+	// leaves) or the hub shuts down.
+	stop context.CancelFunc
 	// Per-user derived presence (connection count + last activity + idle flag);
 	// per-process, never stored (the UNLOGGED presence table is unused).
 	userConns map[int64]*userPresence // userID → presence
@@ -90,9 +123,17 @@ type Hub struct {
 	mu   sync.Mutex
 	orgs map[int64]*orgShard
 
-	// Metrics (S0), optional (default Nop). pumpQueries is THE S3 signal — one
-	// catch-up query PER connection PER wake, so it scales with connection
-	// count until per-org multicast lands (docs/PERF.md). Set once at wiring.
+	// runCtx is the hub's lifetime, set by Run under mu; per-org reader
+	// goroutines derive their context from it so they all stop on shutdown.
+	// Default context.Background() (a hub without Run has no gateway
+	// connections, hence no readers).
+	runCtx context.Context
+
+	// Metrics (S0), optional (default Nop). pumpQueries counts event-log
+	// catch-up reads: after S3 the per-org multicast reader runs ONE per
+	// event-batch (O(1) per org), plus one per resume-lane pump (rare, bounded
+	// by the replay gap) — so it no longer scales with connection count. Set
+	// once at wiring (docs/PERF.md).
 	pumpQueries metrics.Counter
 	deliveries  metrics.Counter
 	connections metrics.Gauge
@@ -100,7 +141,7 @@ type Hub struct {
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
 	h := &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
-		orgs: map[int64]*orgShard{}}
+		orgs: map[int64]*orgShard{}, runCtx: context.Background()}
 	h.SetMetrics(metrics.Nop())
 	return h
 }
@@ -124,31 +165,54 @@ func (h *Hub) shards() []*orgShard {
 	return out
 }
 
-// register adds c to its org's shard (creating the shard on first use) and
-// records the connection for presence, reporting whether an "active" presence
-// broadcast is owed. Registration nests h.mu→sh.mu so a shard can never be
-// deleted by a concurrent deregister between lookup and insert (which would
-// strand the connection in an orphaned shard, invisible to wake/fan-out).
-func (h *Hub) register(c *client, now time.Time) (announce bool) {
+// register adds c to its org's shard (creating the shard, and its per-org
+// multicast reader, on first use) and records the connection for presence.
+// A fresh shard's head seeds from orgHead — the org's event cursor at connect
+// time — so the reader only ever reads NEW events; c joins the LIVE lane when
+// its own cursor already reaches head, else the resume lane (its pump replays
+// the gap). Reports whether an "active" presence broadcast is owed and whether
+// c starts live. Registration nests h.mu→sh.mu so a shard is never deleted by
+// a concurrent deregister between lookup and insert (which would strand the
+// connection in an orphaned shard, invisible to fan-out).
+func (h *Hub) register(c *client, orgHead int64, now time.Time) (announce, live bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sh := h.orgs[c.id.OrgID]
 	if sh == nil {
-		sh = &orgShard{orgID: c.id.OrgID, conns: map[*client]struct{}{},
-			userConns: map[int64]*userPresence{}}
+		sh = h.newShard(c.id.OrgID, orgHead)
 		h.orgs[c.id.OrgID] = sh
 	}
 	c.shard = sh
 	sh.mu.Lock()
 	defer sh.mu.Unlock()
 	sh.conns[c] = struct{}{}
+	c.live = c.lastID >= sh.head
 	h.connections.Set(float64(len(sh.conns)), strconv.FormatInt(c.id.OrgID, 10))
-	return sh.trackConnect(c.id.UserID, now)
+	announce = sh.trackConnect(c.id.UserID, now)
+	return announce, c.live
 }
 
-// deregister removes c from its shard, dropping the shard from the orgs map
-// once its last connection leaves, and reports whether the user went offline.
-// Nested h.mu→sh.mu matches register so the empty-shard delete is atomic.
+// newShard builds an org's shard and starts its multicast reader. Caller holds
+// h.mu. The reader's context derives from the hub lifetime and a per-shard
+// cancel, so it stops on hub shutdown OR the moment the org empties.
+func (h *Hub) newShard(orgID, head int64) *orgShard {
+	ctx, cancel := context.WithCancel(h.runCtx)
+	sh := &orgShard{
+		orgID:     orgID,
+		conns:     map[*client]struct{}{},
+		userConns: map[int64]*userPresence{},
+		head:      head,
+		wake:      make(chan struct{}, 1),
+		stop:      cancel,
+	}
+	go h.runReader(ctx, sh)
+	return sh
+}
+
+// deregister removes c from its shard, dropping the shard (and stopping its
+// reader) once its last connection leaves, and reports whether the user went
+// offline. Nested h.mu→sh.mu matches register so the empty-shard delete is
+// atomic.
 func (h *Hub) deregister(c *client) (wentOffline bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -161,6 +225,7 @@ func (h *Hub) deregister(c *client) (wentOffline bool) {
 	sh.mu.Unlock()
 	if empty {
 		delete(h.orgs, sh.orgID)
+		sh.stop() // end the per-org multicast reader
 	}
 	return wentOffline
 }
@@ -178,8 +243,12 @@ func (h *Hub) SetMetrics(reg metrics.Registry) {
 func (h *Hub) SetMarkReader(m MarkReader) { h.markReader = m }
 
 // Run is the dispatcher: LISTEN on the event-log channel and wake that org's
-// connections; a slow sweep covers missed notifications. Blocks until ctx ends.
+// multicast reader; a slow sweep covers missed notifications. Blocks until ctx
+// ends. ctx is also the parent of every per-org reader, so they stop on shutdown.
 func (h *Hub) Run(ctx context.Context) {
+	h.mu.Lock()
+	h.runCtx = ctx
+	h.mu.Unlock()
 	go h.sweep(ctx)
 	go h.presenceSweep(ctx)
 	for ctx.Err() == nil {
@@ -219,7 +288,7 @@ func (h *Hub) sweep(ctx context.Context) {
 			return
 		case <-t.C:
 			for _, sh := range h.shards() {
-				sh.wakeAll()
+				sh.wakeReader()
 			}
 		}
 	}
@@ -227,45 +296,45 @@ func (h *Hub) sweep(ctx context.Context) {
 
 func (h *Hub) wakeOrg(orgID int64) {
 	if sh := h.shard(orgID); sh != nil {
-		sh.wakeAll()
+		sh.wakeReader()
 	}
 }
 
-// wakeAll signals every connection in the shard to run its catch-up pump.
-// (Per-connection catch-up; the S3 per-org multicast reader replaces this.)
-func (sh *orgShard) wakeAll() {
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	for c := range sh.conns {
-		select {
-		case c.wake <- struct{}{}:
-		default: // already signaled
-		}
+// wakeReader nudges the per-org multicast reader to run a catch-up pass. The
+// buffered-1 wake coalesces a burst of notifications into a single read.
+func (sh *orgShard) wakeReader() {
+	select {
+	case sh.wake <- struct{}{}:
+	default: // a pass is already pending
 	}
 }
 
 // Serve upgrades the request and streams events. ?last_id=N resumes.
 func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	lastID, _ := strconv.ParseInt(r.URL.Query().Get("last_id"), 10, 64)
-	// last_id=-1: tail mode — start from the org's current head instead of
-	// replaying history (fresh clients render state from REST, then follow).
+	// The org's current event cursor: it seeds a NEW shard's live head (so the
+	// per-org reader only ever reads fresh events) AND resolves tail mode
+	// (last_id<0 → start at head, no history replay). One query serves both — a
+	// fresh client renders state from REST, then follows the live stream.
+	var orgHead int64
+	if err := h.pool.QueryRow(r.Context(),
+		`SELECT COALESCE(MAX(id), 0) FROM event_log WHERE org_id = $1`,
+		id.OrgID).Scan(&orgHead); err != nil {
+		http.Error(w, "head lookup failed", http.StatusInternalServerError)
+		return
+	}
 	if lastID < 0 {
-		if err := h.pool.QueryRow(r.Context(),
-			`SELECT COALESCE(MAX(id), 0) FROM event_log WHERE org_id = $1`,
-			id.OrgID).Scan(&lastID); err != nil {
-			http.Error(w, "head lookup failed", http.StatusInternalServerError)
-			return
-		}
+		lastID = orgHead
 	}
 	ws, err := websocket.Accept(w, r, nil)
 	if err != nil {
 		return
 	}
-	c := &client{conn: ws, id: id, lastID: lastID,
-		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter()}
-
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	c := &client{conn: ws, id: id, cancel: cancel, lastID: lastID,
+		feed: make(chan []eventRow, feedBuffer),
+		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter()}
 
 	// Setup order matters (fixes a startup race): load the membership view and
 	// register the connection BEFORE reading any client frame, so the sender's
@@ -275,7 +344,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		ws.Close(websocket.StatusInternalError, "membership load failed")
 		return
 	}
-	announce := h.register(c, time.Now())
+	announce, live := h.register(c, orgHead, time.Now())
 	if announce {
 		h.broadcastPresence(ctx, id.OrgID, id.UserID, "active")
 	}
@@ -310,8 +379,13 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		return
 	}
 
-	// Immediate pump serves the resume gap before any live traffic.
-	c.wake <- struct{}{}
+	// Catch up anything committed since the head query: a resume-lane
+	// connection pumps its own gap; a live one nudges the per-org reader.
+	if live {
+		c.shard.wakeReader()
+	} else {
+		c.wake <- struct{}{}
+	}
 
 	checkpoint := time.NewTicker(checkpointInterval)
 	defer checkpoint.Stop()
@@ -319,8 +393,15 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		select {
 		case <-ctx.Done():
 			return
+		case batch := <-c.feed:
+			// Live lane: the per-org reader handed us the SHARED rows; we apply
+			// our own ACL filter and deliver — no per-connection query (S3).
+			if err := h.deliverShared(ctx, c, batch); err != nil {
+				return
+			}
 		case <-c.wake:
-			if err := h.pump(ctx, c); err != nil {
+			// Resume lane: drain our own catch-up gap, then join the live lane.
+			if err := h.resume(ctx, c); err != nil {
 				return
 			}
 		case <-checkpoint.C:
@@ -334,68 +415,211 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	}
 }
 
-// pump drains rows after the client's cursor, ACL-filtered, until caught up.
+// runReader is the per-org multicast dispatcher (S3): on each wake it runs ONE
+// event-log read for the whole org and fans the shared rows to that org's live
+// connections in memory — instead of every connection querying independently.
+// This is the connections-axis O(1) invariant: per-message DB cost is one read
+// per org per event-batch, independent of connection count (docs/PERF.md).
+func (h *Hub) runReader(ctx context.Context, sh *orgShard) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-sh.wake:
+			for {
+				more, err := h.multicast(ctx, sh)
+				if err != nil {
+					if ctx.Err() == nil {
+						h.log.Warn("gateway: multicast read failed",
+							"org", sh.orgID, "err", err)
+					}
+					break
+				}
+				if !more {
+					break
+				}
+			}
+		}
+	}
+}
+
+// multicast runs the single hoisted catch-up read for the org from its live
+// head, then fans the shared batch to every LIVE connection's lane. It
+// snapshots the live set and advances head under sh.mu, so a resuming
+// connection's go-live check sees one consistent hand-off point (risk #2); the
+// fan itself is OUTSIDE the lock, so a slow connection never stalls the org
+// (risk #1) — it overruns its bounded lane and is dropped (risk #3). Returns
+// whether the batch was full, so the reader drains a backlog to completion.
+func (h *Hub) multicast(ctx context.Context, sh *orgShard) (more bool, err error) {
+	sh.mu.Lock()
+	head := sh.head
+	sh.mu.Unlock()
+
+	// THE S3 read: one hoisted org-scope catch-up query per event-batch. This
+	// counter used to rise once PER connection PER wake (the blowup); now it
+	// rises once per org per batch (plus rare resume pumps) — docs/PERF.md.
+	h.pumpQueries.Add(1)
+	batch, err := h.readEvents(ctx, sh.orgID, head, batchLimit)
+	if err != nil {
+		return false, err
+	}
+	if len(batch) == 0 {
+		return false, nil
+	}
+	maxID := batch[len(batch)-1].id
+
+	sh.mu.Lock()
+	live := make([]*client, 0, len(sh.conns))
+	for c := range sh.conns {
+		if c.live {
+			live = append(live, c)
+		}
+	}
+	sh.head = maxID
+	sh.mu.Unlock()
+
+	for _, c := range live {
+		h.feed(c, batch)
+	}
+	return len(batch) == batchLimit, nil
+}
+
+// feed hands the shared batch to one live connection's lane without blocking
+// the org. A full buffer means the connection has fallen too far behind, so it
+// is dropped: its own goroutine sees the cancel, cleans up, and the client
+// resyncs on reconnect (F-2 tolerates detectable loss) — one slow connection
+// never stalls the rest of the org.
+func (h *Hub) feed(c *client, batch []eventRow) {
+	select {
+	case c.feed <- batch:
+	default:
+		c.cancel()
+	}
+}
+
+// eventRow is one event-log row as the gateway fans it: id (the wire seq), verb
+// (the event type), and the opaque payload. The per-org reader shares ONE
+// []eventRow across all of an org's live connections — read-only, so the fan is
+// a slice-header pass, not a per-connection re-query.
+type eventRow struct {
+	id      int64
+	verb    string
+	payload json.RawMessage
+}
+
+// readEvents reads an org's committed event-log rows after afterID (ascending,
+// up to limit), applying the SAME txid<xmin visibility gate the durable
+// consumers use (F-1) so an in-flight transaction's rows never surface early.
+func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) ([]eventRow, error) {
+	rows, err := h.pool.Query(ctx, `
+		SELECT e.id, e.verb, e.payload
+		FROM event_log e
+		WHERE e.org_id = $1 AND e.id > $2
+		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())
+		ORDER BY e.id
+		LIMIT $3`,
+		orgID, afterID, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var batch []eventRow
+	for rows.Next() {
+		var r eventRow
+		if err := rows.Scan(&r.id, &r.verb, &r.payload); err != nil {
+			return nil, err
+		}
+		batch = append(batch, r)
+	}
+	return batch, rows.Err()
+}
+
+// pump is the RESUME lane: a connection behind the org head runs its OWN
+// bounded catch-up read, draining its gap batch by batch. It survives only for
+// the reconnect gap (F-2's replay window); steady-state live traffic flows
+// through the per-org multicast reader, never here.
 func (h *Hub) pump(ctx context.Context, c *client) error {
 	for {
-		// One catch-up query PER connection PER wake: this counter is THE S3
-		// blowup signal — it scales with connection count until per-org
-		// multicast replaces it (docs/PERF.md), and S0 makes that measurable.
+		// One catch-up query for THIS connection's resume gap. The reader's
+		// hoisted org-scope read is the steady-state path; both increment
+		// gateway_pump_queries_total, and the S3 proof tells them apart by
+		// count — O(1) per org vs the old O(connections) (docs/PERF.md).
 		h.pumpQueries.Add(1)
-		rows, err := h.pool.Query(ctx, `
-			SELECT e.id, e.verb, e.payload
-			FROM event_log e
-			WHERE e.org_id = $1 AND e.id > $2
-			  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())
-			ORDER BY e.id
-			LIMIT $3`,
-			c.id.OrgID, c.lastID, batchLimit)
+		batch, err := h.readEvents(ctx, c.id.OrgID, c.lastID, batchLimit)
 		if err != nil {
-			return err
-		}
-		type row struct {
-			id      int64
-			verb    string
-			payload json.RawMessage
-		}
-		var batch []row
-		for rows.Next() {
-			var r row
-			if err := rows.Scan(&r.id, &r.verb, &r.payload); err != nil {
-				rows.Close()
-				return err
-			}
-			batch = append(batch, r)
-		}
-		rows.Close()
-		if err := rows.Err(); err != nil {
 			return err
 		}
 		if len(batch) == 0 {
 			return nil
 		}
-		for _, r := range batch {
-			deliver, refresh := c.filter(r.verb, r.payload)
-			if refresh {
-				if err := c.loadChannels(ctx, h.pool); err != nil {
-					return err
-				}
-			}
-			if deliver {
-				if err := h.send(ctx, c, Envelope{
-					Seq: r.id, Type: r.verb, OrgID: c.id.OrgID, Payload: r.payload,
-				}); err != nil {
-					return err
-				}
-				h.deliveries.Add(1)
-			}
-			// The cursor advances past filtered events too — gaps in seq are
-			// expected by the protocol (F-2).
-			c.lastID = r.id
+		if err := h.deliverShared(ctx, c, batch); err != nil {
+			return err
 		}
 		if len(batch) < batchLimit {
 			return nil
 		}
 	}
+}
+
+// deliverShared applies one connection's ACL filter to a batch of rows — the
+// resume pump's own batch OR the per-org reader's SHARED batch — writing the
+// events it may see and advancing its cursor past every row (gaps in seq are
+// expected, F-2). Rows at or below the cursor are skipped, so a live connection
+// that tailed past the org head silently ignores anything it already holds.
+func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) error {
+	for _, r := range batch {
+		if r.id <= c.lastID {
+			continue
+		}
+		deliver, refresh := c.filter(r.verb, r.payload)
+		if refresh {
+			if err := c.loadChannels(ctx, h.pool); err != nil {
+				return err
+			}
+		}
+		if deliver {
+			if err := h.send(ctx, c, Envelope{
+				Seq: r.id, Type: r.verb, OrgID: c.id.OrgID, Payload: r.payload,
+			}); err != nil {
+				return err
+			}
+			h.deliveries.Add(1)
+		}
+		// The cursor advances past filtered events too — gaps in seq are
+		// expected by the protocol (F-2).
+		c.lastID = r.id
+	}
+	return nil
+}
+
+// resume drains this connection's catch-up gap (the per-connection pump) and,
+// once its cursor reaches the org head under the shard lock, promotes it to the
+// live lane — from then on the per-org reader feeds it and it stops querying.
+// The go-live check and the reader's head advance share sh.mu, so the hand-off
+// never drops or duplicates an event (risk #2). If the head moved past our
+// drain, we re-arm the pump instead of joining, so the gap is never skipped.
+func (h *Hub) resume(ctx context.Context, c *client) error {
+	sh := c.shard
+	sh.mu.Lock()
+	already := c.live
+	sh.mu.Unlock()
+	if already {
+		return nil
+	}
+	if err := h.pump(ctx, c); err != nil {
+		return err
+	}
+	sh.mu.Lock()
+	if c.lastID >= sh.head {
+		c.live = true
+	} else {
+		select {
+		case c.wake <- struct{}{}: // head advanced mid-drain; pump again
+		default:
+		}
+	}
+	sh.mu.Unlock()
+	return nil
 }
 
 // filter applies the read ACL: channel-scoped events require membership,
