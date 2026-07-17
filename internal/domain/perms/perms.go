@@ -16,19 +16,36 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 )
 
 type Service struct {
 	pool *pgxpool.Pool
+	// rebuildSeconds records the wall-time of the last full-org closure rebuild
+	// — the O(org group graph) cost every group edit pays today, the signal the
+	// scale-tier incremental maintenance will drive down (S0). Optional (default
+	// Nop). Set once at wiring.
+	rebuildSeconds metrics.Gauge
 }
 
-func New(pool *pgxpool.Pool) *Service { return &Service{pool: pool} }
+func New(pool *pgxpool.Pool) *Service {
+	s := &Service{pool: pool}
+	s.SetMetrics(metrics.Nop())
+	return s
+}
+
+// SetMetrics wires an observability registry (S0). Optional — the default is
+// Nop, so an un-instrumented resolver pays nothing. Call once before use.
+func (s *Service) SetMetrics(reg metrics.Registry) {
+	s.rebuildSeconds = reg.Gauge("closure_rebuild_seconds")
+}
 
 // ScopeType mirrors permission_assignment.scope_type.
 type ScopeType int16
@@ -233,6 +250,10 @@ func (s *Service) AddUserToGroup(ctx context.Context, tx pgx.Tx, orgID, groupID,
 // replacement (incremental delta maintenance, or async rebuild behind a
 // version fence) keeps this exact table and call site.
 func (s *Service) RebuildClosure(ctx context.Context, tx pgx.Tx, orgID int64) error {
+	// Record the wall-time (S0): a full-org rebuild is O(org group graph), so
+	// this gauge is what the scale-tier incremental/async rebuild must beat.
+	start := time.Now()
+	defer func() { s.rebuildSeconds.Set(time.Since(start).Seconds()) }()
 	if _, err := tx.Exec(ctx, `
 		DELETE FROM user_group_closure gc
 		USING user_group g

@@ -12,6 +12,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 )
 
 const (
@@ -40,15 +41,30 @@ type Runner struct {
 	consumer *eventlog.Consumer
 	fan      Fanout
 	log      *slog.Logger
+	// scanned counts channel members walked by the activity/follow candidate
+	// pass — the O(channel size) fan-out cost this consumer bears per message
+	// (S0). Optional (default Nop). Set once at wiring.
+	scanned metrics.Counter
 }
 
 func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
-	return &Runner{
+	r := &Runner{
 		pool:     pool,
 		consumer: eventlog.NewConsumer(pool, consumerName, batchSize),
 		fan:      fan,
 		log:      log,
 	}
+	r.SetMetrics(metrics.Nop())
+	return r
+}
+
+// SetMetrics wires an observability registry (S0), propagating it to the
+// underlying event-log consumer (so fanout_events_total{consumer=notifications}
+// and consumer_lag are published too). Optional — default Nop. Call once before
+// Run/ProcessOrg.
+func (r *Runner) SetMetrics(reg metrics.Registry) {
+	r.scanned = reg.Counter("notification_candidates_scanned_total")
+	r.consumer.SetMetrics(reg)
 }
 
 // Run blocks until ctx ends: LISTEN on the event channel and process the
@@ -220,6 +236,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 			}
 		}
 		rows.Close()
+		r.scanned.Add(float64(len(recs)))
 		for _, x := range recs {
 			if mentioned[x.uid] {
 				continue // the more specific reason already fired

@@ -52,6 +52,10 @@ type Config struct {
 	VAPIDPublicKey  string
 	VAPIDPrivateKey string
 	PushSubject     string
+	// Metrics seam (S0): "" / "noop" (default, zero cost) or "expvar" (stdlib,
+	// served at /debug/vars). Picking expvar opts the operator into exposing
+	// that ops endpoint — the default stays off.
+	MetricsDriver string
 }
 
 func Load() (Config, error) {
@@ -84,6 +88,7 @@ func Load() (Config, error) {
 	c.VAPIDPublicKey = os.Getenv(brand.EnvPrefix + "VAPID_PUBLIC_KEY")
 	c.VAPIDPrivateKey = os.Getenv(brand.EnvPrefix + "VAPID_PRIVATE_KEY")
 	c.PushSubject = os.Getenv(brand.EnvPrefix + "PUSH_SUBJECT")
+	c.MetricsDriver = os.Getenv(brand.EnvPrefix + "METRICS_DRIVER")
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("%sDATABASE_URL is required", brand.EnvPrefix)
 	}
