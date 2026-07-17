@@ -27,15 +27,30 @@ type FileAttacher interface {
 	ReleaseEntityReferences(ctx context.Context, tx pgx.Tx, entity enum.EntityType, entityID int64) error
 }
 
+// DeliverabilityPatcher maintains the F-17 materialized notification
+// candidate set when a notification-shaping setting this module owns
+// changes (channel level, thread follow state): the patch rides the SAME
+// transaction as the setting write. The notification module implements it
+// (an interface keeps messaging free of a notification import, and nil —
+// compositions that never materialize notifications — skips maintenance).
+type DeliverabilityPatcher interface {
+	PatchChannelUser(ctx context.Context, tx pgx.Tx, orgID, channelID, userID int64) error
+}
+
 type Service struct {
 	pool  *pgxpool.Pool
 	perms *perms.Service
 	files FileAttacher
+	deliv DeliverabilityPatcher
 }
 
 // SetFiles wires the attachment hook (same pattern as the gateway's
 // MarkReader — set at composition time).
 func (s *Service) SetFiles(f FileAttacher) { s.files = f }
+
+// SetDeliverability wires the F-17 candidate-set patcher (the SetFiles
+// pattern — set at composition time).
+func (s *Service) SetDeliverability(d DeliverabilityPatcher) { s.deliv = d }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
 	return &Service{pool: pool, perms: p}

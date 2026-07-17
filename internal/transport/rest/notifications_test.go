@@ -214,10 +214,14 @@ func TestNotificationDepth(t *testing.T) {
 	runner := notification.NewRunner(pool, hub, slog.Default())
 	go runner.Run(ctx)
 	permsSvc := perms.New(pool)
+	msgSvc := messaging.New(pool, permsSvc)
+	// F-17: level/follow changes must patch the deliverability set the
+	// materializer resolves from (the production main.go wiring).
+	msgSvc.SetDeliverability(notification.NewDeliverability(pool, slog.Default()))
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
 		Identity:      identity.New(pool, permsSvc),
-		Messaging:     messaging.New(pool, permsSvc),
+		Messaging:     msgSvc,
 		Notifications: notification.New(pool),
 	}))
 	defer ts.Close()

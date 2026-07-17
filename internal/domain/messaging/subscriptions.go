@@ -55,15 +55,23 @@ func (s *Service) SetThreadSubscription(ctx context.Context, actor auth.Identity
 			if err != nil {
 				return apperr.Internal("clear subscription", err)
 			}
-			return nil
+		} else {
+			if _, err := tx.Exec(ctx, `
+				INSERT INTO thread_subscription (thread_id, user_id, state, updated_at)
+				VALUES ($1, $2, $3, now())
+				ON CONFLICT (thread_id, user_id)
+				DO UPDATE SET state = EXCLUDED.state, updated_at = now()`,
+				threadID, actor.UserID, state); err != nil {
+				return apperr.Internal("set subscription", err)
+			}
 		}
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO thread_subscription (thread_id, user_id, state, updated_at)
-			VALUES ($1, $2, $3, now())
-			ON CONFLICT (thread_id, user_id)
-			DO UPDATE SET state = EXCLUDED.state, updated_at = now()`,
-			threadID, actor.UserID, state); err != nil {
-			return apperr.Internal("set subscription", err)
+		// F-17: follow-state changes alter deliverability candidacy (reason 1
+		// marks "follows at least one thread here"). The resync is derivation-
+		// based and idempotent, so every state transition just recomputes.
+		if s.deliv != nil {
+			if err := s.deliv.PatchChannelUser(ctx, tx, actor.OrgID, *channelID, actor.UserID); err != nil {
+				return apperr.Internal("patch deliverability", err)
+			}
 		}
 		return nil
 	})
@@ -105,6 +113,14 @@ func (s *Service) SetChannelNotification(ctx context.Context, actor auth.Identit
 				WHERE channel_id = $2 AND user_id = $3`,
 				*p.Muted, channelID, actor.UserID); err != nil {
 				return apperr.Internal("set muted", err)
+			}
+		}
+		// F-17: a level change alters deliverability candidacy (level=all is
+		// reason 2) — resync in the same tx. Mute is a live-read filter over
+		// candidates, not a candidacy change, so mute-only updates skip it.
+		if p.Level != nil && s.deliv != nil {
+			if err := s.deliv.PatchChannelUser(ctx, tx, actor.OrgID, channelID, actor.UserID); err != nil {
+				return apperr.Internal("patch deliverability", err)
 			}
 		}
 		return nil

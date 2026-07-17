@@ -19,6 +19,15 @@ const (
 	consumerName  = "notifications"
 	sweepInterval = 5 * time.Second
 	batchSize     = 500
+	// reconcileInterval paces the F-17 safety-net sweep (janitor cadence):
+	// it recomputes each built channel's deliverability set and repairs +
+	// reports divergence, because a missed invalidation would silently
+	// DROP notifications.
+	reconcileInterval = time.Hour
+	// candidatesScannedMetric counts candidate rows the materializer
+	// examines per message — the F-17 O(reasons)-not-O(members) invariant,
+	// observable.
+	candidatesScannedMetric = "notification_candidates_scanned_total"
 )
 
 // Fanout delivers a live in-app ping to one user's connections; the gateway
@@ -45,6 +54,9 @@ type Runner struct {
 	// pass — the O(channel size) fan-out cost this consumer bears per message
 	// (S0). Optional (default Nop). Set once at wiring.
 	scanned metrics.Counter
+	// deliv owns the F-17 candidate set: the runner lazily builds it per
+	// channel and patches it from member.joined/left events.
+	deliv *Deliverability
 }
 
 func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
@@ -53,6 +65,7 @@ func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
 		consumer: eventlog.NewConsumer(pool, consumerName, batchSize),
 		fan:      fan,
 		log:      log,
+		deliv:    NewDeliverability(pool, log),
 	}
 	r.SetMetrics(metrics.Nop())
 	return r
@@ -63,7 +76,7 @@ func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
 // and consumer_lag are published too). Optional — default Nop. Call once before
 // Run/ProcessOrg.
 func (r *Runner) SetMetrics(reg metrics.Registry) {
-	r.scanned = reg.Counter("notification_candidates_scanned_total")
+	r.scanned = reg.Counter(candidatesScannedMetric)
 	r.consumer.SetMetrics(reg)
 }
 
@@ -71,6 +84,7 @@ func (r *Runner) SetMetrics(reg metrics.Registry) {
 // signalled org; a sweep catches anything a missed NOTIFY left behind.
 func (r *Runner) Run(ctx context.Context) {
 	go r.sweep(ctx)
+	go r.reconcileLoop(ctx)
 	for ctx.Err() == nil {
 		if err := r.listenLoop(ctx); err != nil && ctx.Err() == nil {
 			r.log.Warn("notification: listen loop restarting", "err", err)
@@ -128,6 +142,23 @@ func (r *Runner) sweep(ctx context.Context) {
 	}
 }
 
+// reconcileLoop drives the F-17 divergence sweep on the slow ticker;
+// ReconcileOnce does the per-channel work and logging.
+func (r *Runner) reconcileLoop(ctx context.Context) {
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.deliv.ReconcileOnce(ctx); err != nil && ctx.Err() == nil {
+				r.log.Warn("notification: deliverability reconcile", "err", err)
+			}
+		}
+	}
+}
+
 type messagePayload struct {
 	MessageID   int64   `json:"message_id"`
 	ThreadID    int64   `json:"thread_id"`
@@ -135,6 +166,14 @@ type messagePayload struct {
 	DMSpaceID   int64   `json:"dm_space_id"`
 	Mentions    []int64 `json:"mentions"`
 	NewMentions []int64 `json:"new_mentions"`
+}
+
+// hintPayload reads the F-17b coalescing stamp bulk producers set on the
+// event hint (the reserved field, ADR-002 P1): every item event of one
+// bulk operation carries the same batch_id, and the materializer folds a
+// recipient's N item rows into ONE digest row per (user, kind, batch).
+type hintPayload struct {
+	BatchID *int64 `json:"batch_id"`
 }
 
 // ProcessOrg drains the org's pending events into notification rows and
@@ -162,7 +201,25 @@ func (r *Runner) ProcessOrg(ctx context.Context, orgID int64) error {
 	}
 }
 
+// membershipPayload mirrors the member.joined/left event payload shape.
+type membershipPayload struct {
+	ChannelID int64 `json:"channel_id"`
+	UserID    int64 `json:"user_id"`
+}
+
 func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
+	// F-17 invalidation: membership changes patch the deliverability set
+	// off the event log (a single-user resync — O(1) per join, never a
+	// channel rebuild; consuming events keeps messaging and identity free
+	// of a notification import).
+	if ev.Verb == "member.joined" || ev.Verb == "member.left" {
+		var m membershipPayload
+		if err := json.Unmarshal(ev.Payload, &m); err != nil ||
+			m.ChannelID == 0 || m.UserID == 0 {
+			return nil // malformed payloads are logged history, not a stall
+		}
+		return r.deliv.PatchMembership(ctx, ev.OrgID, m.ChannelID, m.UserID)
+	}
 	// Backfill semantics (ADR-003 E4): imported history never notifies.
 	if (ev.Verb != "message.created" && ev.Verb != "message.edited") ||
 		ev.ActorKind == enum.ActorImporter {
@@ -175,6 +232,23 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	author := int64(0)
 	if ev.ActorID != nil {
 		author = *ev.ActorID
+	}
+	// F-17b: a batch-stamped hint switches every insert for this event
+	// into digest mode. A malformed hint is ignored like a malformed
+	// payload — never a stall.
+	var batchID *int64
+	if len(ev.Hint) > 0 {
+		var h hintPayload
+		if json.Unmarshal(ev.Hint, &h) == nil {
+			batchID = h.BatchID
+		}
+	}
+	// F-17 lazy backfill: the first channel message after deploy derives
+	// the deliverability set (the last O(members) pass this channel pays).
+	if p.ChannelID != 0 && p.ThreadID != 0 {
+		if err := r.deliv.EnsureBuilt(ctx, ev.OrgID, p.ChannelID); err != nil {
+			return err
+		}
 	}
 
 	// An edit pings only the NEWLY-added mentions; the dedupe key would
@@ -197,58 +271,70 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 		}
 		mentioned[uid] = true
 		delete(keyworded, uid)
-		if err := r.insert(ctx, ev, p, uid, KindMention, author); err != nil {
+		if err := r.insert(ctx, ev, p, uid, KindMention, author, batchID); err != nil {
 			return err
 		}
 	}
-	// Channel messages resolve N-1 steps 2–3 in one pass: followed threads
-	// boost (and override the channel level); level=all members get
-	// activity pings; the SEPARATE mute flag suppresses both — with an
-	// unmuted thread reviving activity inside a muted channel — while
-	// mentions and DMs break through mute (handled above/below, which is
-	// why the notified-set skip matters). More specific reasons win.
+	// Channel messages resolve N-1 steps 2–3 in one pass over the F-17
+	// deliverability set — O(actual reasons), never O(members). Candidates
+	// are the channel's reason-1 (follows a thread here) and reason-2
+	// (level=all) rows; their mute/level/follow SETTINGS are re-verified
+	// LIVE per candidate below (the set caches candidacy, never settings,
+	// so a stale-extra row costs one wasted scan and can never mint a
+	// wrong notification). Semantics are unchanged: followed threads boost
+	// (and override the channel level); level=all members get activity
+	// pings; the SEPARATE mute flag suppresses both — with an unmuted
+	// thread reviving activity inside a muted channel — while mentions and
+	// DMs break through mute (handled above/below, which is why the
+	// notified-set skip matters). More specific reasons win.
 	if p.ChannelID != 0 && p.ThreadID != 0 && ev.Verb == "message.created" {
 		rows, err := r.pool.Query(ctx, `
-			SELECT cm.user_id,
-			       CASE WHEN COALESCE(ts.state, 0) = 1 THEN true ELSE false END
-			FROM channel_member cm
+			SELECT DISTINCT cd.user_id, cm.muted, cm.level,
+			       COALESCE(ts.state, 0::smallint)
+			FROM channel_deliverability cd
+			JOIN channel_member cm ON cm.channel_id = cd.channel_id
+			     AND cm.user_id = cd.user_id AND cm.unsubscribed_at IS NULL
 			LEFT JOIN thread_subscription ts
-			  ON ts.thread_id = $2 AND ts.user_id = cm.user_id
-			WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL
-			  AND cm.user_id <> $3
-			  AND (
-			    (COALESCE(ts.state, 0) = 1 AND NOT cm.muted)
-			    OR (cm.level = 1 AND COALESCE(ts.state, 0) <> 2
-			        AND (NOT cm.muted OR COALESCE(ts.state, 0) = 3))
-			  )`, p.ChannelID, p.ThreadID, author)
+			  ON ts.thread_id = $2 AND ts.user_id = cd.user_id
+			WHERE cd.channel_id = $1 AND cd.reason IN (1, 2) AND cd.medium = 1
+			  AND cd.user_id <> $3`, p.ChannelID, p.ThreadID, author)
 		if err != nil {
 			return err
 		}
 		type rec struct {
-			uid      int64
-			followed bool
+			uid     int64
+			muted   bool
+			level   int16
+			tsState int16
 		}
 		var recs []rec
 		for rows.Next() {
 			var x rec
-			if rows.Scan(&x.uid, &x.followed) == nil {
+			if rows.Scan(&x.uid, &x.muted, &x.level, &x.tsState) == nil {
+				r.scanned.Add(1) // once per candidate row scanned
 				recs = append(recs, x)
 			}
 		}
 		rows.Close()
-		r.scanned.Add(float64(len(recs)))
 		for _, x := range recs {
+			followed := x.tsState == 1
+			// The live settings filter — exactly the decisions the
+			// pre-F-17 channel_member join made in SQL.
+			if !((followed && !x.muted) ||
+				(x.level == 1 && x.tsState != 2 && (!x.muted || x.tsState == 3))) {
+				continue
+			}
 			if mentioned[x.uid] {
 				continue // the more specific reason already fired
 			}
 			kind := int16(KindChannelActivity)
-			if x.followed {
+			if followed {
 				kind = KindFollowedThread
 			} else if keyworded[x.uid] {
 				kind = KindKeyword // a keyword upgrades plain activity
 			}
 			delete(keyworded, x.uid)
-			if err := r.insert(ctx, ev, p, x.uid, kind, author); err != nil {
+			if err := r.insert(ctx, ev, p, x.uid, kind, author, batchID); err != nil {
 				return err
 			}
 		}
@@ -257,7 +343,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	// Remaining keyword matches (members outside the level/follow pass, or
 	// edits that newly introduced a word) get the kind-4 row.
 	for uid := range keyworded {
-		if err := r.insert(ctx, ev, p, uid, KindKeyword, author); err != nil {
+		if err := r.insert(ctx, ev, p, uid, KindKeyword, author, batchID); err != nil {
 			return err
 		}
 	}
@@ -283,7 +369,7 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 			if uid == author || mentioned[uid] {
 				continue
 			}
-			if err := r.insert(ctx, ev, p, uid, KindDM, author); err != nil {
+			if err := r.insert(ctx, ev, p, uid, KindDM, author, batchID); err != nil {
 				return err
 			}
 		}
@@ -296,20 +382,32 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 // mention must not leak the channel's existence), DM and space threads use
 // their own containment (participants were just resolved; space threads are
 // org-visible in the v1 slice).
-func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, userID int64, kind int16, author int64) error {
+//
+// A non-nil batchID (F-17b) switches to digest mode: the row lands once
+// per (user, kind, batch) — the batch dedupe key — so a bulk operation's
+// N item events fold into ONE row per recipient. The conflict target is
+// left open there because a batched insert may legitimately hit EITHER
+// unique key (the entity dedupe on replay, the batch key on coalesce) and
+// both mean "already recorded"; the unbatched path keeps the explicit
+// 0010 target.
+func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, userID int64, kind int16, author int64, batchID *int64) error {
 	var actorID *int64
 	if author != 0 {
 		actorID = &author
 	}
+	conflict := `ON CONFLICT (user_id, kind, entity_type, entity_id) DO NOTHING`
+	if batchID != nil {
+		conflict = `ON CONFLICT DO NOTHING`
+	}
 	ct, err := r.pool.Exec(ctx, `
-		INSERT INTO notification (org_id, user_id, kind, entity_type, entity_id, actor_id, created_at)
-		SELECT $1, $2, $3, $4, $5, $6, $7
+		INSERT INTO notification (org_id, user_id, kind, entity_type, entity_id, actor_id, created_at, batch_id)
+		SELECT $1, $2, $3, $4, $5, $6, $7, $9
 		WHERE $8 = 0 OR EXISTS (
 		    SELECT 1 FROM channel_member
 		    WHERE channel_id = $8 AND user_id = $2 AND unsubscribed_at IS NULL)
-		ON CONFLICT (user_id, kind, entity_type, entity_id) DO NOTHING`,
+		`+conflict,
 		ev.OrgID, userID, kind, int16(enum.EntityMessage), p.MessageID,
-		actorID, ev.RecordedAt, p.ChannelID)
+		actorID, ev.RecordedAt, p.ChannelID, batchID)
 	if err != nil {
 		return err
 	}
@@ -356,12 +454,14 @@ func dndSuppressed(ctx context.Context, pool *pgxpool.Pool, userID, author int64
 	return suppressed, nil
 }
 
-// keywordMatches finds channel members whose alert words appear in the
-// message (kind 4): a cheap substring prefilter in SQL over the channel's
-// members' words, refined to WORD boundaries in Go. Mute-respecting like
-// plain activity (a muted thread suppresses; an unmuted thread revives
-// inside a muted channel) — keywords do not break through mute the way
-// mentions do. Users already notified for this message are excluded (the
+// keywordMatches finds alert-word pings (kind 4), candidates bounded by
+// the F-17 set (reason 3 = alert-word holders in this channel, never a
+// channel_member walk): a cheap substring prefilter in SQL over the
+// candidates' words, refined to WORD boundaries in Go, with membership
+// and mute state re-verified live. Mute-respecting like plain activity
+// (a muted thread suppresses; an unmuted thread revives inside a muted
+// channel) — keywords do not break through mute the way mentions do.
+// Users already notified for this message are excluded (the
 // message.edited path must not double-ping), and DMs are skipped: the DM
 // row itself already pings every participant.
 func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messagePayload, author int64) (map[int64]bool, error) {
@@ -376,12 +476,14 @@ func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messageP
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT aw.user_id, aw.word
-		FROM alert_word aw
-		JOIN channel_member cm ON cm.user_id = aw.user_id
+		FROM channel_deliverability cd
+		JOIN alert_word aw ON aw.user_id = cd.user_id
+		JOIN channel_member cm ON cm.channel_id = cd.channel_id
+		     AND cm.user_id = cd.user_id AND cm.unsubscribed_at IS NULL
 		LEFT JOIN thread_subscription ts
-		  ON ts.thread_id = $2 AND ts.user_id = aw.user_id
-		WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL
-		  AND aw.user_id <> $3
+		  ON ts.thread_id = $2 AND ts.user_id = cd.user_id
+		WHERE cd.channel_id = $1 AND cd.reason = 3 AND cd.medium = 1
+		  AND cd.user_id <> $3
 		  AND COALESCE(ts.state, 0) <> 2
 		  AND (NOT cm.muted OR COALESCE(ts.state, 0) = 3)
 		  AND position(aw.word IN lower($4)) > 0
@@ -401,6 +503,7 @@ func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messageP
 		if rows.Scan(&uid, &word) != nil {
 			continue
 		}
+		r.scanned.Add(1) // once per candidate row scanned
 		if matched[uid] {
 			continue
 		}

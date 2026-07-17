@@ -43,10 +43,14 @@ func TestAlertWords(t *testing.T) {
 	hub := gateway.NewHub(pool, slog.Default())
 	go hub.Run(ctx)
 	permsSvc := perms.New(pool)
+	msgSvc := messaging.New(pool, permsSvc)
+	// F-17: level changes must patch the deliverability set the
+	// materializer resolves from (the production main.go wiring).
+	msgSvc.SetDeliverability(notification.NewDeliverability(pool, slog.Default()))
 	ts := httptest.NewServer(Handler(ctx, Deps{
 		Pool: pool, Hub: hub, Log: slog.Default(),
 		Identity:      identity.New(pool, permsSvc),
-		Messaging:     messaging.New(pool, permsSvc),
+		Messaging:     msgSvc,
 		DM:            dm.New(pool),
 		Notifications: notification.New(pool),
 	}))
