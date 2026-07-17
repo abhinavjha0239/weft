@@ -9,8 +9,8 @@
 // defaults so normal orgs never hit it).
 //
 // Owns tables: user_group, user_group_member, user_group_subgroup,
-// user_group_closure, closure_current_version, permission_assignment,
-// permission_profile*.
+// user_group_closure, closure_current_version, closure_rebuild_job,
+// permission_assignment, permission_profile*.
 package perms
 
 import (

@@ -3,6 +3,7 @@ package perms
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 	"github.com/abhinavjha0239/weft/internal/platform/metrics"
@@ -515,6 +517,170 @@ func TestClosureVersionFence(t *testing.T) {
 	if _, err := pool.Exec(ctx,
 		`DELETE FROM user_group_closure WHERE version = $1`, half); err != nil {
 		t.Fatalf("cleanup: %v", err)
+	}
+	closureParity(t, pool, f.orgID)
+}
+
+// TestClosureRebuildWorker: the async lane end-to-end. An importer-shaped
+// bulk write (raw membership rows + EnqueueRebuild in one tx) leaves the
+// closure honestly stale until the worker drains the queue and flips the
+// fence; repeat enqueues coalesce into the pending job; a poisoned org
+// records a failed job with its reason while the lane keeps settling other
+// orgs; and settled jobs never re-run.
+func TestClosureRebuildWorker(t *testing.T) {
+	pool := testPool(t)
+	f := setup(t, pool)
+	ctx := context.Background()
+	svc := f.svc
+	worker := NewRebuildWorker(pool, svc, slog.Default())
+
+	var membersGID int64
+	if err := inTx(t, pool, func(tx pgx.Tx) error {
+		var err error
+		membersGID, err = svc.SystemGroupID(ctx, tx, f.orgID, GroupMembers)
+		return err
+	}); err != nil {
+		t.Fatalf("members group: %v", err)
+	}
+
+	// The importer shape: raw group writes bypassing the service, plus the
+	// enqueue, atomic in one tx.
+	imported := makeUser(t, pool, f.orgID, "imported@t.test")
+	if err := inTx(t, pool, func(tx pgx.Tx) error {
+		if _, err := tx.Exec(ctx,
+			`INSERT INTO user_group_member (group_id, user_id) VALUES ($1, $2)`,
+			membersGID, imported); err != nil {
+			return err
+		}
+		return svc.EnqueueRebuild(ctx, tx, f.orgID)
+	}); err != nil {
+		t.Fatalf("bulk write + enqueue: %v", err)
+	}
+	importedActor := auth.Identity{UserID: imported, OrgID: f.orgID}
+	if err := f.require(t, pool, importedActor, VerbSendMessage); apperr.KindOf(err) != apperr.KindForbidden {
+		t.Fatalf("pre-drain: the bulk membership must not resolve yet (async gap), got %v", err)
+	}
+
+	// Coalescing: a second enqueue while one is pending mints nothing.
+	if err := inTx(t, pool, func(tx pgx.Tx) error {
+		return svc.EnqueueRebuild(ctx, tx, f.orgID)
+	}); err != nil {
+		t.Fatalf("re-enqueue: %v", err)
+	}
+	var pending int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM closure_rebuild_job WHERE org_id = $1 AND status = 1`,
+		f.orgID).Scan(&pending); err != nil {
+		t.Fatalf("pending count: %v", err)
+	}
+	if pending != 1 {
+		t.Fatalf("pending jobs = %d, want 1 (coalesced)", pending)
+	}
+
+	// Drain: the rebuild lands, the fence flips, membership resolves.
+	if n, err := worker.RunOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("drain = %d jobs (%v), want 1", n, err)
+	}
+	if err := f.require(t, pool, importedActor, VerbSendMessage); err != nil {
+		t.Fatalf("post-drain: imported member must resolve, got %v", err)
+	}
+	closureParity(t, pool, f.orgID)
+	var status int16
+	var finished *time.Time
+	var jobErr string
+	if err := pool.QueryRow(ctx, `
+		SELECT status, finished_at, error FROM closure_rebuild_job
+		WHERE org_id = $1 ORDER BY id DESC LIMIT 1`,
+		f.orgID).Scan(&status, &finished, &jobErr); err != nil {
+		t.Fatalf("job row: %v", err)
+	}
+	if status != 2 || finished == nil || jobErr != "" {
+		t.Fatalf("job = status %d finished %v err %q, want done", status, finished, jobErr)
+	}
+	// Settled queue: nothing claimable.
+	if n, err := worker.RunOnce(ctx); err != nil || n != 0 {
+		t.Fatalf("idle drain = %d (%v), want 0", n, err)
+	}
+
+	// Failure isolation: poison org1's NEXT version with a planted row (the
+	// rebuild's insert will hit the PK), and enqueue a healthy second org
+	// behind it — the lane records the failure with its reason and still
+	// settles the healthy org.
+	var org2, owner2 int64
+	if err := inTx(t, pool, func(tx pgx.Tx) error {
+		if err := tx.QueryRow(ctx,
+			`INSERT INTO org (name, slug) VALUES ('T2', 't2') RETURNING id`).Scan(&org2); err != nil {
+			return err
+		}
+		if err := tx.QueryRow(ctx, `
+			INSERT INTO user_account (org_id, kind, email, full_name)
+			VALUES ($1, 1, 'o2@t.test', 'Owner Two') RETURNING id`, org2).Scan(&owner2); err != nil {
+			return err
+		}
+		return svc.SeedOrg(ctx, tx, org2, owner2)
+	}); err != nil {
+		t.Fatalf("second org: %v", err)
+	}
+	var v1 int64
+	if err := pool.QueryRow(ctx,
+		`SELECT version FROM closure_current_version WHERE org_id = $1`,
+		f.orgID).Scan(&v1); err != nil {
+		t.Fatalf("org1 version: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_group_closure (group_id, user_id, version)
+		VALUES ($1, $2, $3)`, membersGID, imported, v1+1); err != nil {
+		t.Fatalf("poison: %v", err)
+	}
+	if err := inTx(t, pool, func(tx pgx.Tx) error {
+		if err := svc.EnqueueRebuild(ctx, tx, f.orgID); err != nil {
+			return err
+		}
+		return svc.EnqueueRebuild(ctx, tx, org2)
+	}); err != nil {
+		t.Fatalf("enqueue both: %v", err)
+	}
+	if n, err := worker.RunOnce(ctx); err != nil || n != 2 {
+		t.Fatalf("drain with poison = %d (%v), want 2 settled (1 failed + 1 done)", n, err)
+	}
+	var failStatus int16
+	var failErr string
+	if err := pool.QueryRow(ctx, `
+		SELECT status, error FROM closure_rebuild_job
+		WHERE org_id = $1 ORDER BY id DESC LIMIT 1`,
+		f.orgID).Scan(&failStatus, &failErr); err != nil {
+		t.Fatalf("failed job row: %v", err)
+	}
+	if failStatus != 3 || failErr == "" {
+		t.Fatalf("poisoned job = status %d err %q, want failed with a recorded reason", failStatus, failErr)
+	}
+	var okStatus int16
+	if err := pool.QueryRow(ctx, `
+		SELECT status FROM closure_rebuild_job
+		WHERE org_id = $1 ORDER BY id DESC LIMIT 1`, org2).Scan(&okStatus); err != nil {
+		t.Fatalf("org2 job row: %v", err)
+	}
+	if okStatus != 2 {
+		t.Fatalf("healthy org's job = status %d, want done despite the neighbor's failure", okStatus)
+	}
+	// The failed attempt rolled back: org1's live closure is untouched and
+	// still correct.
+	if err := f.require(t, pool, importedActor, VerbSendMessage); err != nil {
+		t.Fatalf("failed rebuild must not damage the live closure: %v", err)
+	}
+
+	// Recovery: clear the poison, re-enqueue, drain — done.
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM user_group_closure WHERE version = $1`, v1+1); err != nil {
+		t.Fatalf("heal: %v", err)
+	}
+	if err := inTx(t, pool, func(tx pgx.Tx) error {
+		return svc.EnqueueRebuild(ctx, tx, f.orgID)
+	}); err != nil {
+		t.Fatalf("re-enqueue after heal: %v", err)
+	}
+	if n, err := worker.RunOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("recovery drain = %d (%v), want 1", n, err)
 	}
 	closureParity(t, pool, f.orgID)
 }

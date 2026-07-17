@@ -873,11 +873,16 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}
 	}
 
-	// Role grants and group writes above bypass the perms service, so the
-	// flattened closure is rebuilt once here (same recursive CTE the
-	// service uses).
-	if err := perms.New(s.pool).RebuildClosure(ctx, tx, orgID); err != nil {
-		return fmt.Errorf("closure rebuild: %w", err)
+	// Role grants and group writes above bypass the perms service, so a full
+	// closure recompute is REQUIRED — but never in this transaction: at
+	// import scale that is the S2 async case. The enqueue commits atomically
+	// with the import's writes; the rebuild worker fills a new closure
+	// version and flips the fence after we commit. Until that flip, imported
+	// users resolve permissions through the pre-import closure — the
+	// documented async gap the import CLI closes by draining the queue
+	// before it exits (tests drive RunOnce the same way).
+	if err := perms.New(s.pool).EnqueueRebuild(ctx, tx, orgID); err != nil {
+		return fmt.Errorf("closure rebuild enqueue: %w", err)
 	}
 	return nil
 }

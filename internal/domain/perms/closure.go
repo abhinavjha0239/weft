@@ -237,3 +237,24 @@ func (s *Service) RemoveSubgroup(ctx context.Context, tx pgx.Tx, orgID, groupID,
 	}
 	return nil
 }
+
+// EnqueueRebuild queues an async full-org closure rebuild in the CALLER's
+// transaction — the bulk-write replacement for an in-tx recompute (the
+// importer's lane). Taking the org closure lock first orders the enqueue
+// against an in-flight rebuild: if a worker holds the lock we wait, its job
+// finishes, and our insert mints a FRESH pending job that will see our
+// writes; if we hold it first, a waiting worker's per-statement snapshots
+// run after our commit — coalescing into a pending job can never lose the
+// writes that requested it. One pending row per org (the 0022 partial
+// unique index).
+func (s *Service) EnqueueRebuild(ctx context.Context, tx pgx.Tx, orgID int64) error {
+	if _, err := lockOrgClosure(ctx, tx, orgID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO closure_rebuild_job (org_id) VALUES ($1)
+		ON CONFLICT (org_id) WHERE status = 1 DO NOTHING`, orgID); err != nil {
+		return apperr.Internal("enqueue closure rebuild", err)
+	}
+	return nil
+}

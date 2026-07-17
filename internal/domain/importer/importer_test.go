@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -210,6 +211,11 @@ func TestZulipImportShowcase(t *testing.T) {
 	rep, err := svc.Run(ctx, orgID, dir, false)
 	if err != nil {
 		t.Fatalf("import: %v", err)
+	}
+	// S2: the import ENQUEUES its closure rebuild rather than recomputing
+	// in-tx; the worker drives it here exactly as the import CLI does.
+	if n, err := perms.NewRebuildWorker(pool, perms.New(pool), slog.Default()).RunOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("closure rebuild drain = %d jobs (%v), want 1", n, err)
 	}
 	if rep.Users != 2 || rep.Channels != 2 || rep.Threads != 3 ||
 		rep.Messages != 4 || rep.Reactions != 1 || rep.Subscriptions != 3 {
@@ -469,6 +475,11 @@ func TestZulipImportShowcase(t *testing.T) {
 	rep2, err := svc.Run(ctx, orgID, dir, false)
 	if err != nil {
 		t.Fatalf("re-run: %v", err)
+	}
+	// The first job settled, so the re-run minted a FRESH one (no coalescing
+	// with done rows) — drain it and the rebuild stays a no-op.
+	if n, err := perms.NewRebuildWorker(pool, perms.New(pool), slog.Default()).RunOnce(ctx); err != nil || n != 1 {
+		t.Fatalf("re-run closure drain = %d jobs (%v), want 1", n, err)
 	}
 	if rep2.Messages != 0 || rep2.Users != 0 || rep2.Channels != 0 ||
 		rep2.Threads != 0 || rep2.Groups != 0 || rep2.GroupMembers != 0 ||
