@@ -229,11 +229,13 @@ func (s *Service) UpdateAuthProvider(ctx context.Context, actor auth.Identity, p
 				return apperr.Unprocessable("provider discovery failed: " + err.Error())
 			}
 		}
+		// Org-pinned even though the FOR UPDATE load above already proved
+		// ownership: no auth_provider write is safe to read (or copy) bare.
 		if _, err := tx.Exec(ctx, `
 			UPDATE auth_provider
 			SET issuer = $2, client_id = $3, client_secret = $4, enabled = $5
-			WHERE id = $1`,
-			providerID, newIssuer, newClientID, newSecret, newEnabled); err != nil {
+			WHERE id = $1 AND org_id = $6`,
+			providerID, newIssuer, newClientID, newSecret, newEnabled, actor.OrgID); err != nil {
 			return apperr.Internal("update auth provider", err)
 		}
 		_, err = eventlog.Append(ctx, tx, eventlog.Event{
@@ -278,7 +280,8 @@ func (s *Service) DeleteAuthProvider(ctx context.Context, actor auth.Identity, p
 			return apperr.Internal("clear oidc flows", err)
 		}
 		if _, err := tx.Exec(ctx,
-			`DELETE FROM auth_provider WHERE id = $1`, providerID); err != nil {
+			`DELETE FROM auth_provider WHERE id = $1 AND org_id = $2`,
+			providerID, actor.OrgID); err != nil {
 			var pgErr *pgconn.PgError
 			if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
 				return apperr.Conflict("provider still has linked identities")
