@@ -151,8 +151,10 @@ with its scale-tier replacement designed:
   with cross-instance sharing T2; `shared_channel.peer_instance` is the seam.
 - **Hash-chain head + SIEM stream config** (ADR-013 AD-2, v1-hook) — one tiny
   table each when the compliance surfaces land.
-- **Search-side stores** (pgvector embeddings, cross-entity search index,
-  materialized notification deliverability sets — F-16/F-17) — implementation-
-  stage caches/indexes owned by their milestones; the source columns exist.
+- **Search-side stores** (pgvector embeddings, cross-entity search index —
+  F-16) — implementation-stage caches/indexes owned by their milestones; the
+  source columns exist. The F-17 deliverability set graduated from this list
+  in 0021 (`channel_deliverability`, a lazily built cache of derivable truth
+  maintained by rare-event invalidation).
 - **SSO/SCIM/2FA tables** — M4+ per MILESTONES.md; `user_credential` +
   `auth_session` are deliberately minimal for M0.
