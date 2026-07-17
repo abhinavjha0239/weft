@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
@@ -16,6 +17,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 )
 
 // TestInvites: the onboarding lane. Capability tokens shown once and
@@ -177,5 +179,122 @@ func TestInvites(t *testing.T) {
 	if code := postJSONStatus(t, ts.URL+"/api/v1/invites", gina.Token,
 		map[string]any{}); code != http.StatusForbidden {
 		t.Fatalf("guest minting invites = %d, want 403", code)
+	}
+}
+
+// gaugeSetCounter is a metrics.Registry that counts Gauge.Set invocations per
+// metric name — the S0 seam reused as a test probe: RebuildClosure sets
+// closure_rebuild_seconds exactly once per full-org rebuild, so the Set count
+// IS the rebuild count.
+type gaugeSetCounter struct {
+	mu   sync.Mutex
+	sets map[string]int
+}
+
+func (c *gaugeSetCounter) Counter(name string, labelNames ...string) metrics.Counter {
+	return metrics.Nop().Counter(name, labelNames...)
+}
+
+func (c *gaugeSetCounter) Gauge(name string, _ ...string) metrics.Gauge {
+	return &countedGauge{c: c, name: name}
+}
+
+func (c *gaugeSetCounter) count(name string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.sets[name]
+}
+
+type countedGauge struct {
+	c    *gaugeSetCounter
+	name string
+}
+
+func (g *countedGauge) Set(float64, ...string) {
+	g.c.mu.Lock()
+	defer g.c.mu.Unlock()
+	g.c.sets[g.name]++
+}
+
+// TestInviteAcceptSingleClosureRebuild: accepting an invite maintains the
+// group closure exactly ONCE — inside AddUserToGroup. The accept flow
+// historically rebuilt a second time right after (the S2 prep fix), doubling
+// the O(org) closure cost of every onboarding.
+func TestInviteAcceptSingleClosureRebuild(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	rebuilds := &gaugeSetCounter{sets: map[string]int{}}
+	permsSvc := perms.New(pool)
+	permsSvc.SetMetrics(rebuilds)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: messaging.New(pool, permsSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "one", "email": "a@one.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	base := rebuilds.count("closure_rebuild_seconds") // SeedOrg's own rebuild
+
+	var inv identity.Invite
+	postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{}, &inv)
+	var mia identity.AcceptInviteResult
+	postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+		"token": inv.Token, "email": "mia@one.test", "password": "password123",
+		"full_name": "Mia New"}, &mia)
+	if mia.Token == "" {
+		t.Fatal("accept did not provision a session")
+	}
+
+	if got := rebuilds.count("closure_rebuild_seconds") - base; got != 1 {
+		t.Fatalf("invite accept ran %d closure rebuilds, want exactly 1 (AddUserToGroup already maintains the closure)", got)
+	}
+
+	// The single maintenance pass left the closure CORRECT. End-to-end: mia
+	// resolves send_message through role:everyone — members ⊂ everyone, so
+	// this is transitive nesting, not just her direct role:members row.
+	var sent struct {
+		MessageID int64 `json:"message_id"`
+	}
+	postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
+		mia.Token, map[string]any{"content": "hello from mia"}, &sent)
+	if sent.MessageID == 0 {
+		t.Fatal("new member must send via closure transitivity")
+	}
+	// And structurally: both the direct row and the transitive row exist.
+	var direct, transitive bool
+	_ = pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_group_closure gc
+		  JOIN user_group g ON g.id = gc.group_id
+		  WHERE g.org_id = $1 AND g.name = 'role:members' AND gc.user_id = $2)`,
+		boot.OrgID, mia.UserID).Scan(&direct)
+	_ = pool.QueryRow(ctx, `
+		SELECT EXISTS (SELECT 1 FROM user_group_closure gc
+		  JOIN user_group g ON g.id = gc.group_id
+		  WHERE g.org_id = $1 AND g.name = 'role:everyone' AND gc.user_id = $2)`,
+		boot.OrgID, mia.UserID).Scan(&transitive)
+	if !direct || !transitive {
+		t.Fatalf("closure after accept: members=%v everyone=%v, want both", direct, transitive)
 	}
 }
