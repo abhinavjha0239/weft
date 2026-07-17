@@ -3,7 +3,9 @@ package blob
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
+	"io/fs"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -80,6 +82,13 @@ func (s *S3) Open(ctx context.Context, key string) (io.ReadCloser, error) {
 		Key:    aws.String(s.key(key)),
 	})
 	if err != nil {
+		// Normalize to the Store contract: a missing key is fs.ErrNotExist
+		// (the fs driver gets this from os.Open natively), so callers can
+		// tell absent from outage without importing S3 error types.
+		var nsk *types.NoSuchKey
+		if errors.As(err, &nsk) {
+			return nil, fmt.Errorf("blob: open %s: %w", key, fs.ErrNotExist)
+		}
 		return nil, err
 	}
 	return out.Body, nil
