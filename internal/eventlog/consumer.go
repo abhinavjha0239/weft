@@ -3,10 +3,12 @@ package eventlog
 import (
 	"context"
 	"fmt"
+	"strconv"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/enum"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 )
 
 // Consumer reads an org's events in id order with a durable cursor
@@ -32,6 +34,10 @@ type Consumer struct {
 	pool  *pgxpool.Pool
 	name  string
 	batch int
+	// Metrics are optional (default Nop): events counts what this consumer
+	// pulls; lag publishes its backlog. Set once at wiring, before Poll runs.
+	events metrics.Counter
+	lag    metrics.Gauge
 }
 
 // NewConsumer creates a named cursor-tracked consumer. Names are stable
@@ -41,7 +47,16 @@ func NewConsumer(pool *pgxpool.Pool, name string, batchSize int) *Consumer {
 	if batchSize <= 0 {
 		batchSize = 500
 	}
-	return &Consumer{pool: pool, name: name, batch: batchSize}
+	c := &Consumer{pool: pool, name: name, batch: batchSize}
+	c.SetMetrics(metrics.Nop())
+	return c
+}
+
+// SetMetrics wires an observability registry (S0). Optional — the default is
+// Nop, so an un-instrumented consumer pays nothing. Call once before Poll.
+func (c *Consumer) SetMetrics(reg metrics.Registry) {
+	c.events = reg.Counter("fanout_events_total", "consumer")
+	c.lag = reg.Gauge("consumer_lag", "consumer", "org")
 }
 
 // Poll returns the next batch after the cursor, respecting the txid gate.
@@ -79,7 +94,35 @@ func (c *Consumer) Poll(ctx context.Context, orgID int64) ([]Row, error) {
 		r.EntityType = enum.EntityType(entityType)
 		out = append(out, r)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	c.events.Add(float64(len(out)), c.name)
+	return out, nil
+}
+
+// Lag reports this consumer's backlog for one org — the max COMMITTED event id
+// (bounded by the SAME xmin horizon Poll respects, so a row still in flight is
+// never counted as deliverable) minus the durable cursor — and publishes it as
+// the consumer_lag{consumer,org} gauge. Lag is THE health signal of the whole
+// design (docs/ARCHITECTURE.md §6, docs/SCHEMA.md scale contract): it rises
+// when a consumer falls behind and falls to 0 when it catches up. One query
+// per (consumer, org).
+func (c *Consumer) Lag(ctx context.Context, orgID int64) (int64, error) {
+	var lag int64
+	err := c.pool.QueryRow(ctx, `
+		SELECT COALESCE(MAX(e.id), 0) - COALESCE((
+		        SELECT last_id FROM event_consumer_cursor
+		        WHERE consumer = $2 AND org_id = $1), 0)
+		FROM event_log e
+		WHERE e.org_id = $1
+		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())`,
+		orgID, c.name).Scan(&lag)
+	if err != nil {
+		return 0, fmt.Errorf("eventlog: lag: %w", err)
+	}
+	c.lag.Set(float64(lag), c.name, strconv.FormatInt(orgID, 10))
+	return lag, nil
 }
 
 // Ack durably advances the cursor. Consumers must be idempotent anyway

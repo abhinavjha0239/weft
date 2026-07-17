@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"expvar"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -32,6 +33,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
 	"github.com/abhinavjha0239/weft/internal/platform/mail"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 	"github.com/abhinavjha0239/weft/internal/platform/webpush"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
@@ -162,9 +164,19 @@ func serve(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	// Metrics seam (S0): config-picked driver, Nop by default. Wired into the
+	// four instrumented hot sites below so consumer lag and fan-out cost are
+	// observable at /debug/vars when the operator picks the expvar driver.
+	reg, err := metrics.Open(cfg.MetricsDriver)
+	if err != nil {
+		return err
+	}
 	hub := gateway.NewHub(pool, log)
+	hub.SetMetrics(reg)
 	go hub.Run(ctx)
-	go notification.NewRunner(pool, hub, log).Run(ctx)
+	notifRunner := notification.NewRunner(pool, hub, log)
+	notifRunner.SetMetrics(reg)
+	go notifRunner.Run(ctx)
 	sender, err := mail.Open(cfg.MailDriver, cfg.SMTPAddr, cfg.SMTPFrom,
 		cfg.SMTPUser, cfg.SMTPPass, log)
 	if err != nil {
@@ -200,6 +212,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 		go pushWorker.Run(ctx)
 	}
 	permsSvc := perms.New(pool)
+	permsSvc.SetMetrics(reg)
 	identitySvc := identity.New(pool, permsSvc)
 	identitySvc.SetMailer(sender) // P-35 password-reset mail via the mail seam
 	// P-30: OIDC discovery, JWKS, and token exchange ride the SSRF-guarded
@@ -257,6 +270,11 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 	root := http.NewServeMux()
 	root.Handle("/api/", apiHandler)
+	// The expvar driver publishes to /debug/vars; mount it only when that driver
+	// is active so the default (noop) server exposes no ops endpoint.
+	if cfg.MetricsDriver == "expvar" {
+		root.Handle("/debug/vars", expvar.Handler())
+	}
 	root.Handle("/", ui)
 
 	srv := &http.Server{

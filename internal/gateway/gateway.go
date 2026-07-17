@@ -23,6 +23,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 )
 
 const (
@@ -72,11 +73,28 @@ type Hub struct {
 	// Per-user derived presence (connection count + last activity + idle
 	// flag); per-process, never stored (the UNLOGGED presence table is unused).
 	userConns map[int64]map[int64]*userPresence
+
+	// Metrics (S0), optional (default Nop). pumpQueries is THE S3 signal — one
+	// catch-up query PER connection PER wake, so it scales with connection
+	// count until per-org multicast lands (docs/PERF.md). Set once at wiring.
+	pumpQueries metrics.Counter
+	deliveries  metrics.Counter
+	connections metrics.Gauge
 }
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
-	return &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
+	h := &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
 		conns: map[int64]map[*client]struct{}{}}
+	h.SetMetrics(metrics.Nop())
+	return h
+}
+
+// SetMetrics wires an observability registry (S0). Optional — the default is
+// Nop, so an un-instrumented hub pays nothing. Call once before Run/Serve.
+func (h *Hub) SetMetrics(reg metrics.Registry) {
+	h.pumpQueries = reg.Counter("gateway_pump_queries_total")
+	h.deliveries = reg.Counter("fanout_deliveries_total")
+	h.connections = reg.Gauge("gateway_connections", "org")
 }
 
 // SetMarkReader wires the durable read-state service (rest layer adapts
@@ -184,6 +202,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		h.conns[id.OrgID] = map[*client]struct{}{}
 	}
 	h.conns[id.OrgID][c] = struct{}{}
+	h.connections.Set(float64(len(h.conns[id.OrgID])), strconv.FormatInt(id.OrgID, 10))
 	announce := h.trackConnect(id.OrgID, id.UserID, time.Now())
 	h.mu.Unlock()
 	if announce {
@@ -195,6 +214,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		if len(h.conns[id.OrgID]) == 0 {
 			delete(h.conns, id.OrgID)
 		}
+		h.connections.Set(float64(len(h.conns[id.OrgID])), strconv.FormatInt(id.OrgID, 10))
 		wentOffline := h.trackDisconnect(id.OrgID, id.UserID)
 		h.mu.Unlock()
 		if wentOffline {
@@ -253,6 +273,10 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 // pump drains rows after the client's cursor, ACL-filtered, until caught up.
 func (h *Hub) pump(ctx context.Context, c *client) error {
 	for {
+		// One catch-up query PER connection PER wake: this counter is THE S3
+		// blowup signal — it scales with connection count until per-org
+		// multicast replaces it (docs/PERF.md), and S0 makes that measurable.
+		h.pumpQueries.Add(1)
 		rows, err := h.pool.Query(ctx, `
 			SELECT e.id, e.verb, e.payload
 			FROM event_log e
@@ -298,6 +322,7 @@ func (h *Hub) pump(ctx context.Context, c *client) error {
 				}); err != nil {
 					return err
 				}
+				h.deliveries.Add(1)
 			}
 			// The cursor advances past filtered events too — gaps in seq are
 			// expected by the protocol (F-2).
