@@ -335,9 +335,6 @@ func (s *Service) AcceptInvite(ctx context.Context, p AcceptInviteParams) (Accep
 		if err := s.perms.AddUserToGroup(ctx, tx, orgID, groupID, out.UserID); err != nil {
 			return err
 		}
-		if err := s.perms.RebuildClosure(ctx, tx, orgID); err != nil {
-			return err
-		}
 		// Pre-join the invite's channels — the invite IS the authorization
 		// (private channels included, that's the point of inviting).
 		explicit := make(map[int64]bool, len(channelIDs))

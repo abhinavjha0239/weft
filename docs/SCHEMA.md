@@ -46,9 +46,14 @@ updates HOT (heap-only tuples — no index churn).
 
 ## Permission checks: one join, not a recursion (F-16)
 
-`user_group_closure` flattens nested group membership on group edits (a
-background rebuild on org-wide edits), so every ACL check — search, files,
-gateway fan-out — is one indexed lookup. `channel_member.history_from` is the
+`user_group_closure` flattens nested group membership, so every ACL check —
+search, files, gateway fan-out — is one indexed lookup. Group edits patch it
+INCREMENTALLY (S2: deltas bounded by the org's group graph, never
+membership); the rare full recompute (bulk import) runs as a background
+`closure_rebuild_job` behind a per-org version fence — readers pin
+`version = current` while the rebuild fills the next version and flips the
+`closure_current_version` pointer atomically, so a rebuild never blocks or
+half-shows. `channel_member.history_from` is the
 protected-history floor evaluated as a plain column predicate (F-16b).
 `capability_grant` narrows (never extends) group permissions — CC-6.
 

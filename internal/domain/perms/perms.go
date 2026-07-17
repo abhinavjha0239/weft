@@ -9,7 +9,8 @@
 // defaults so normal orgs never hit it).
 //
 // Owns tables: user_group, user_group_member, user_group_subgroup,
-// user_group_closure, permission_assignment, permission_profile*.
+// user_group_closure, closure_current_version, closure_rebuild_job,
+// permission_assignment, permission_profile*.
 package perms
 
 import (
@@ -98,6 +99,11 @@ func (s *Service) Require(ctx context.Context, tx pgx.Tx, actor auth.Identity, v
 		types[i] = int16(sc.Type)
 		ids[i] = sc.ID
 	}
+	// The version predicate is the S2 fence: readers pin the org's CURRENT
+	// closure version, so an in-flight rebuild (filling the next version) is
+	// invisible until its atomic pointer flip — never a half-built read,
+	// never a block. No fence row (impossible after SeedOrg) reads as no
+	// closure: deny, the secure default.
 	var allowed bool
 	err := tx.QueryRow(ctx, `
 		WITH chain AS (
@@ -114,6 +120,7 @@ func (s *Service) Require(ctx context.Context, tx pgx.Tx, actor auth.Identity, v
 		SELECT EXISTS (
 		  SELECT 1 FROM best b
 		  JOIN user_group_closure gc ON gc.group_id = b.group_id AND gc.user_id = $5
+		   AND gc.version = (SELECT version FROM closure_current_version WHERE org_id = $1)
 		)`,
 		actor.OrgID, verb, types, ids, actor.UserID).Scan(&allowed)
 	if err != nil {
@@ -165,13 +172,18 @@ func (s *Service) HoldersAt(ctx context.Context, tx pgx.Tx, orgID int64, verb st
 	if err != nil {
 		return nil, apperr.Internal("resolve holders assignment", err)
 	}
+	// Same S2 fence as Require: expand through the CURRENT closure version
+	// only. Liveness (deactivated_at, kind) stays a LIVE user_account join —
+	// user state is not versioned, so holders reflect deactivations
+	// immediately regardless of closure version.
 	rows, err := tx.Query(ctx, `
 		SELECT c.user_id
 		FROM user_group_closure c
 		JOIN user_account u ON u.id = c.user_id
 		  AND u.deactivated_at IS NULL AND u.kind = 1
 		WHERE c.group_id = $1
-		ORDER BY c.user_id`, groupID)
+		  AND c.version = (SELECT version FROM closure_current_version WHERE org_id = $2)
+		ORDER BY c.user_id`, groupID, orgID)
 	if err != nil {
 		return nil, apperr.Internal("expand holders", err)
 	}
@@ -233,33 +245,50 @@ func (s *Service) SeedOrg(ctx context.Context, tx pgx.Tx, orgID, ownerUserID int
 	return s.RebuildClosure(ctx, tx, orgID)
 }
 
-// AddUserToGroup adds membership and maintains the closure.
+// AddUserToGroup adds membership and maintains the closure INCREMENTALLY
+// (S2): the new member's rows for the group and its ancestors — O(the org's
+// group graph), never O(org membership). The delta lands in the CURRENT
+// closure version under the org closure lock (closure.go), so it can never be
+// lost to a concurrent full rebuild's version flip. Foreign and absent groups
+// answer an oracle-free 404 (cell invariant).
 func (s *Service) AddUserToGroup(ctx context.Context, tx pgx.Tx, orgID, groupID, userID int64) error {
+	if err := requireOrgGroup(ctx, tx, orgID, groupID); err != nil {
+		return err
+	}
+	version, err := lockOrgClosure(ctx, tx, orgID)
+	if err != nil {
+		return err
+	}
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO user_group_member (group_id, user_id) VALUES ($1, $2)
 		ON CONFLICT DO NOTHING`, groupID, userID); err != nil {
 		return apperr.Internal("add group member", err)
 	}
-	return s.RebuildClosure(ctx, tx, orgID)
+	return addMemberClosure(ctx, tx, orgID, groupID, userID, version)
 }
 
-// RebuildClosure recomputes the org's flattened closure with a recursive CTE.
+// RebuildClosure recomputes the org's flattened closure with a recursive CTE
+// — the FULL recompute, reserved for bulk graph rewrites (org seeding, the
+// import queue's jobs). Group edits do NOT call this anymore; they patch
+// incrementally (S2, closure.go).
 //
-// Scale note (docs/SCHEMA.md contract): a full-org rebuild on every group
-// edit is the accepted first tier — correct and simple. The scale-tier
-// replacement (incremental delta maintenance, or async rebuild behind a
-// version fence) keeps this exact table and call site.
+// Version fence: the recompute fills version current+1 while readers keep
+// answering from current, then the pointer flip + old-version prune commit
+// atomically with the caller's transaction — a reader never sees a half-built
+// closure and never blocks, however long the rebuild runs. The org closure
+// lock (held to commit) parks concurrent group edits so their deltas apply
+// after the flip, to the version that survives. Keeps the exact table and
+// call sites the docs/SCHEMA.md contract pins.
 func (s *Service) RebuildClosure(ctx context.Context, tx pgx.Tx, orgID int64) error {
-	// Record the wall-time (S0): a full-org rebuild is O(org group graph), so
-	// this gauge is what the scale-tier incremental/async rebuild must beat.
+	// Record the wall-time (S0): a full-org rebuild is O(org group graph) —
+	// the cost the version fence moves OFF the request path.
 	start := time.Now()
 	defer func() { s.rebuildSeconds.Set(time.Since(start).Seconds()) }()
-	if _, err := tx.Exec(ctx, `
-		DELETE FROM user_group_closure gc
-		USING user_group g
-		WHERE gc.group_id = g.id AND g.org_id = $1`, orgID); err != nil {
-		return apperr.Internal("clear closure", err)
+	current, err := lockOrgClosure(ctx, tx, orgID)
+	if err != nil {
+		return err
 	}
+	next := current + 1
 	if _, err := tx.Exec(ctx, `
 		WITH RECURSIVE reach (group_id, via_group) AS (
 		  SELECT id, id FROM user_group WHERE org_id = $1
@@ -268,11 +297,23 @@ func (s *Service) RebuildClosure(ctx context.Context, tx pgx.Tx, orgID int64) er
 		  FROM reach r
 		  JOIN user_group_subgroup s ON s.group_id = r.via_group
 		)
-		INSERT INTO user_group_closure (group_id, user_id)
-		SELECT DISTINCT r.group_id, m.user_id
+		INSERT INTO user_group_closure (group_id, user_id, version)
+		SELECT DISTINCT r.group_id, m.user_id, $2::bigint
 		FROM reach r
-		JOIN user_group_member m ON m.group_id = r.via_group`, orgID); err != nil {
+		JOIN user_group_member m ON m.group_id = r.via_group`, orgID, next); err != nil {
 		return apperr.Internal("rebuild closure", err)
+	}
+	if _, err := tx.Exec(ctx,
+		`UPDATE closure_current_version SET version = $2 WHERE org_id = $1`,
+		orgID, next); err != nil {
+		return apperr.Internal("flip closure version", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		DELETE FROM user_group_closure gc
+		USING user_group g
+		WHERE gc.group_id = g.id AND g.org_id = $1 AND gc.version <> $2`,
+		orgID, next); err != nil {
+		return apperr.Internal("prune closure versions", err)
 	}
 	return nil
 }

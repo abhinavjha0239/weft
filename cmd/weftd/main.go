@@ -144,6 +144,15 @@ func importZulip(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	if !*dryRun {
+		// The import ENQUEUED its closure rebuild (S2 — never in the import
+		// tx). This process is already off any request path, so drain the
+		// queue before returning: imported users resolve permissions the
+		// moment the command exits.
+		if _, err := perms.NewRebuildWorker(pool, perms.New(pool), slog.Default()).RunOnce(ctx); err != nil {
+			return err
+		}
+	}
 	out, _ := json.MarshalIndent(rep, "", "  ")
 	fmt.Println(string(out))
 	return nil
@@ -213,6 +222,10 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 	permsSvc := perms.New(pool)
 	permsSvc.SetMetrics(reg)
+	// S2: the async closure-rebuild lane — bulk imports enqueue, this worker
+	// recomputes behind the version fence (readers stay on the old closure
+	// until the atomic flip).
+	go perms.NewRebuildWorker(pool, permsSvc, log).Run(ctx)
 	identitySvc := identity.New(pool, permsSvc)
 	identitySvc.SetMailer(sender) // P-35 password-reset mail via the mail seam
 	// P-30: OIDC discovery, JWKS, and token exchange ride the SSRF-guarded
