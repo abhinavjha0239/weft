@@ -20,9 +20,12 @@ import (
 //     loop — because unread is "every live container member except the author",
 //     which is NOT the O(reasons) notification deliverability set. That cost lands
 //     on the async consumer, never messaging.Send, and turns the READ into O(1).
-//   - RESET rides MarkRead (resetContainerUnread, same tx as the watermark write):
-//     the counter is recomputed from the live aggregate — the exact truth after
-//     the new watermark — and SET.
+//   - DECREMENT-ON-READ rides MarkRead (applyMarkReadDelta, same tx as the
+//     watermark write): the counter drops by exactly the marked thread's
+//     messages between the old and new watermark — O(the slice just read),
+//     never a container-wide recompute (mark-read is the highest-volume user
+//     action; an O(container-history) aggregate there would hand the removed
+//     read-path O(N) back on the write path).
 //   - DECREMENT rides DeleteMessage (decrementUnreadOnDelete, same tx as the
 //     scrub): a deleted message stops counting, so members who had not read it
 //     lose one unread.
@@ -38,9 +41,10 @@ import (
 // Idempotency: the consumer delivers at-least-once (a crash between processing
 // and cursor-ack replays a batch). Each counter row carries last_event_id, and
 // an increment applies only WHERE last_event_id < the event's id, so a replay of
-// an already-counted event is a no-op. MarkRead advances last_event_id to the
-// org's current max event id (GREATEST), so a message already reflected in the
-// recompute is not re-counted when the consumer later reaches its create event.
+// an already-counted event is a no-op. A message the user marks read BEFORE the
+// consumer counts it is subtracted first and incremented later (+1 drift for
+// one consumer-lag window, floored at 0, healed by the sweep) — the bounded
+// price of keeping mark-read O(delta); see applyMarkReadDelta.
 //
 // mention_count wakes ChannelUnread.Mentioned. It is incremented for mentioned
 // members on the consumer pass; MarkRead/delete/reconcile hold the invariant
@@ -153,43 +157,49 @@ func (s *Service) ApplyMessageUnread(ctx context.Context, orgID, channelID, dmSp
 	return nil
 }
 
-// resetContainerUnread recomputes ONE (user, container)'s unread from the live
-// aggregate and SETs the counter, inside MarkRead's transaction (after the
-// watermark write, so it reads the applied watermark). last_event_id is
-// advanced to the org's current max event id so a message already reflected in
-// this recompute is not re-counted when the consumer later processes its create
-// event; GREATEST never rewinds a higher watermark a concurrent increment set.
-// mention_count is clamped to the fresh unread (a full read → 0 clears the
-// badge) — a new row starts with 0 mentions.
-func (s *Service) resetContainerUnread(ctx context.Context, tx pgx.Tx, orgID, userID, channelID, dmSpaceID int64) error {
-	unread, err := recomputeContainerUnread(ctx, tx, userID, channelID, dmSpaceID)
-	if err != nil {
-		return err
+// applyMarkReadDelta decrements ONE (user, container)'s unread by exactly the
+// messages the mark just covered — this thread's rows in (oldWM, applied],
+// authored by someone else, still visible — inside MarkRead's transaction.
+// Cost is O(the marked slice), never O(container history): mark-read is among
+// the highest-volume user actions, so a container-wide recompute here would
+// hand back on the write path the O(N) the S6 counter removed from the read
+// path. mention_count rides the LEAST clamp (unread→0 always clears the
+// badge). A user with no counter row (pre-counter history, nothing new since)
+// has nothing to decrement — the row appears with the next counted message.
+//
+// Bounded drift, healed by the hourly reconcile sweep (the counter is a
+// CACHE): (1) a message the user read BEFORE the consumer counted it is
+// subtracted here (floored at 0) and incremented later — +1 until the sweep;
+// the window is the consumer lag, which S0 makes observable. (2) two
+// concurrent FIRST-EVER marks of one thread can both see oldWM=0 (no row to
+// FOR-UPDATE yet) and overlap their deltas — floored at 0, likewise swept.
+func (s *Service) applyMarkReadDelta(ctx context.Context, tx pgx.Tx, userID, channelID, dmSpaceID, threadID, oldWM, applied int64) error {
+	if applied <= oldWM {
+		return nil // monotone clamp: nothing newly read
 	}
-	var maxEvent int64
-	if err := tx.QueryRow(ctx,
-		`SELECT COALESCE(MAX(id), 0) FROM event_log WHERE org_id = $1`, orgID).Scan(&maxEvent); err != nil {
-		return fmt.Errorf("unread: reset max event: %w", err)
+	var delta int
+	if err := tx.QueryRow(ctx, `
+		SELECT count(*) FROM message
+		WHERE thread_id = $1 AND id > $2 AND id <= $3
+		  AND author_id <> $4 AND deleted_at IS NULL`,
+		threadID, oldWM, applied, userID).Scan(&delta); err != nil {
+		return fmt.Errorf("unread: mark-read delta: %w", err)
 	}
-	var col string
-	var containerID int64
-	if channelID != 0 {
-		col, containerID = "channel_id", channelID
-	} else {
+	if delta == 0 {
+		return nil
+	}
+	col, containerID := "channel_id", channelID
+	if channelID == 0 {
 		col, containerID = "dm_space_id", dmSpaceID
 	}
-	_, err = tx.Exec(ctx, fmt.Sprintf(`
-		INSERT INTO container_unread_counter
-			(user_id, %[1]s, org_id, unread_count, mention_count, last_event_id)
-		VALUES ($1, $2, $3, $4, 0, $5)
-		ON CONFLICT (user_id, %[1]s) WHERE %[1]s IS NOT NULL
-		DO UPDATE SET
-		    unread_count  = EXCLUDED.unread_count,
-		    mention_count = LEAST(container_unread_counter.mention_count, EXCLUDED.unread_count),
-		    last_event_id = GREATEST(container_unread_counter.last_event_id, EXCLUDED.last_event_id)`, col),
-		userID, containerID, orgID, unread, maxEvent)
+	_, err := tx.Exec(ctx, fmt.Sprintf(`
+		UPDATE container_unread_counter
+		SET unread_count  = GREATEST(unread_count - $3, 0),
+		    mention_count = LEAST(mention_count, GREATEST(unread_count - $3, 0))
+		WHERE user_id = $1 AND %s = $2`, col),
+		userID, containerID, delta)
 	if err != nil {
-		return fmt.Errorf("unread: reset: %w", err)
+		return fmt.Errorf("unread: mark-read decrement: %w", err)
 	}
 	return nil
 }
