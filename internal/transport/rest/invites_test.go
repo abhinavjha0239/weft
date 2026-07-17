@@ -217,9 +217,12 @@ func (g *countedGauge) Set(float64, ...string) {
 }
 
 // TestInviteAcceptSingleClosureRebuild: accepting an invite maintains the
-// group closure exactly ONCE — inside AddUserToGroup. The accept flow
-// historically rebuilt a second time right after (the S2 prep fix), doubling
-// the O(org) closure cost of every onboarding.
+// group closure in ONE pass — AddUserToGroup's incremental delta — and never
+// pays a full-org rebuild. The pin's history IS the S2 arc: the accept flow
+// originally rebuilt TWICE (AddUserToGroup + an explicit second call, the
+// prep fix), then once, and now zero — the delta patches the closure, so any
+// full rebuild reappearing on the accept path is the O(org) regression this
+// guard exists to catch.
 func TestInviteAcceptSingleClosureRebuild(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -267,8 +270,8 @@ func TestInviteAcceptSingleClosureRebuild(t *testing.T) {
 		t.Fatal("accept did not provision a session")
 	}
 
-	if got := rebuilds.count("closure_rebuild_seconds") - base; got != 1 {
-		t.Fatalf("invite accept ran %d closure rebuilds, want exactly 1 (AddUserToGroup already maintains the closure)", got)
+	if got := rebuilds.count("closure_rebuild_seconds") - base; got != 0 {
+		t.Fatalf("invite accept ran %d full closure rebuilds, want 0 (the membership delta maintains the closure)", got)
 	}
 
 	// The single maintenance pass left the closure CORRECT. End-to-end: mia
