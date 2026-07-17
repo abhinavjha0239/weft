@@ -228,3 +228,135 @@ func contains(s, sub string) bool {
 	}
 	return false
 }
+
+// TestPromoteThreadMask: the recorded P-34 residual, closed — promotion must
+// never confirm a hidden thread exists. Every answer about a thread in a
+// private channel the prober cannot see (the membership 403, the root-thread
+// 400, the already-promoted 409) collapses to ONE 404, byte-identical to a
+// nonexistent id; a public channel's non-member keeps the honest 403; a
+// member's promote is untouched. RED/GREEN: flip the mask's private branch
+// back to Forbidden (red at the hidden-discussion probe) or move the shape
+// 400s back above the access check (red at the hidden-root probe).
+func TestPromoteThreadMask(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	permsSvc := perms.New(pool)
+	msgSvc := messaging.New(pool, permsSvc)
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:  identity.New(pool, permsSvc),
+		Messaging: msgSvc,
+		Worktrack: worktrack.New(pool, permsSvc, msgSvc),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "pmk", "email": "a@pmk.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@pmk.test", "Bob Ray", "bobpmktok")
+	var space struct {
+		ID int64 `json:"id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/spaces", boot.Token,
+		map[string]any{"key": "pmk", "name": "Mask"}, &space)
+
+	// Alice's private channel holds three probe shapes a non-member must not
+	// distinguish: a plain discussion (pre-mask: 403), the channel ROOT
+	// (pre-mask: the kind-2 400 fired before any access check), and a thread
+	// alice ALREADY promoted (pre-mask: 409 for a member — reachable order
+	// leaks aside, any non-404 confirms existence).
+	var vault struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+		map[string]any{"name": "vault", "visibility": "private"}, &vault)
+	if vault.ChannelID == 0 {
+		t.Fatal("private channel create failed")
+	}
+	mkThread := func(channelID int64, title string) int64 {
+		t.Helper()
+		var th struct {
+			ThreadID int64 `json:"thread_id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, channelID),
+			boot.Token, map[string]any{"title": title, "content": "body"}, &th)
+		if th.ThreadID == 0 {
+			t.Fatalf("thread create in channel %d failed", channelID)
+		}
+		return th.ThreadID
+	}
+	hidden := mkThread(vault.ChannelID, "secret plan")
+	already := mkThread(vault.ChannelID, "already tracked")
+	if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/threads/%d/promote", ts.URL, already),
+		boot.Token, map[string]any{"space_id": space.ID}); code != http.StatusCreated {
+		t.Fatalf("alice promote = %d, want 201", code)
+	}
+	var vaultRoot int64
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM thread WHERE channel_id = $1 AND kind = 2`,
+		vault.ChannelID).Scan(&vaultRoot); err != nil {
+		t.Fatalf("vault root thread: %v", err)
+	}
+
+	// Absent-id baseline; every hidden shape must match it byte-for-byte.
+	body := map[string]any{"space_id": space.ID}
+	promoteURL := func(id int64) string {
+		return fmt.Sprintf("%s/api/v1/threads/%d/promote", ts.URL, id)
+	}
+	absentCode, absentBody := authRaw(t, "POST", promoteURL(999999), bobTok, body)
+	if absentCode != http.StatusNotFound {
+		t.Fatalf("absent promote = %d, want 404", absentCode)
+	}
+	probes := []struct {
+		name string
+		id   int64
+	}{
+		{"hidden discussion", hidden},
+		{"hidden root", vaultRoot},
+		{"hidden promoted", already},
+	}
+	for _, p := range probes {
+		code, respBody := authRaw(t, "POST", promoteURL(p.id), bobTok, body)
+		if code != absentCode || respBody != absentBody {
+			t.Fatalf("%s probe = %d %q, want byte-identical to absent (%d %q) — existence oracle",
+				p.name, code, respBody, absentCode, absentBody)
+		}
+	}
+
+	// A PUBLIC channel's thread keeps the honest 403 for a non-member —
+	// existence is org-knowable, the P-34 decision table's other branch.
+	var town struct {
+		ChannelID int64 `json:"channel_id"`
+	}
+	postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{"name": "town"}, &town)
+	pub := mkThread(town.ChannelID, "open plan")
+	if code := postJSONStatus(t, promoteURL(pub), bobTok, body); code != http.StatusForbidden {
+		t.Fatalf("public non-member promote = %d, want 403", code)
+	}
+
+	// The mask never blocks a member: bob promotes in his own channel.
+	mine := mkThread(boot.ChannelID, "bob can see this")
+	if code := postJSONStatus(t, promoteURL(mine), bobTok, body); code != http.StatusCreated {
+		t.Fatalf("member promote = %d, want 201", code)
+	}
+}
