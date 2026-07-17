@@ -69,6 +69,20 @@ func (s *Service) MarkRead(ctx context.Context, actor auth.Identity, threadID, u
 			actor.UserID, threadID, upTo).Scan(&applied); err != nil {
 			return apperr.Internal("mark read", err)
 		}
+		// S6: reset the O(1) unread counter for this container to the exact
+		// post-watermark truth, in the SAME tx as the watermark write. A space
+		// thread has no counter (rejected above), so exactly one of the two is
+		// set here.
+		cid, did := int64(0), int64(0)
+		if channelID != nil {
+			cid = *channelID
+		}
+		if dmSpaceID != nil {
+			did = *dmSpaceID
+		}
+		if err := s.resetContainerUnread(ctx, tx, actor.OrgID, actor.UserID, cid, did); err != nil {
+			return err
+		}
 		return nil
 	})
 	if err != nil {
@@ -89,21 +103,16 @@ type DMUnread struct {
 }
 
 // DMUnreads mirrors Unreads over the DM plane: per-conversation counts of
-// messages after the watermark, authored by someone else.
+// messages after the watermark, authored by someone else. S6: a plain O(1)
+// index scan of the dm_space leg of the counter (the live aggregate survives
+// as recomputeContainerUnread, the reconciliation truth).
 func (s *Service) DMUnreads(ctx context.Context, actor auth.Identity) ([]DMUnread, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT m.dm_space_id, count(*) AS unread
-		FROM dm_participant dp
-		JOIN message m
-		  ON m.dm_space_id = dp.dm_space_id
-		 AND m.author_id <> dp.user_id
-		 AND m.deleted_at IS NULL
-		LEFT JOIN thread_read_watermark w
-		  ON w.user_id = dp.user_id AND w.thread_id = m.thread_id
-		WHERE dp.user_id = $1
-		  AND m.id > COALESCE(w.last_read_message_id, 0)
-		GROUP BY m.dm_space_id`,
-		actor.UserID)
+		SELECT dm_space_id, unread_count
+		FROM container_unread_counter
+		WHERE user_id = $1 AND org_id = $2
+		  AND dm_space_id IS NOT NULL AND unread_count > 0`,
+		actor.UserID, actor.OrgID)
 	if err != nil {
 		return nil, apperr.Internal("dm unreads", err)
 	}
@@ -123,25 +132,20 @@ func (s *Service) DMUnreads(ctx context.Context, actor auth.Identity) ([]DMUnrea
 // subscribed channels. Unread messages are those after each thread's watermark
 // (or all, if never read), excluding the user's own and deleted messages.
 //
-// Scale note (docs/SCHEMA.md): this is a per-request aggregate over the user's
-// channels. It reads live here for correctness; the scale-tier design keeps a
-// maintained per-(user,channel) counter updated on the notification path
-// (F-17 deliverability sets) — same result, O(1) read. Documented, not built.
+// S6 (the F-17 twin the scale note reserved, now built): this is a plain O(1)
+// index scan of the maintained per-(user,channel) counter — O(the user's
+// channels), never a re-aggregation over messages. The counter is kept current
+// off the notification consumer pass (ApplyMessageUnread), MarkRead, and delete;
+// the live aggregate that used to run HERE survives only as
+// recomputeContainerUnread, the reconciliation truth. mention_count wakes the
+// long-declared Mentioned badge (ChannelUnread.Mentioned).
 func (s *Service) Unreads(ctx context.Context, actor auth.Identity) ([]ChannelUnread, error) {
 	rows, err := s.pool.Query(ctx, `
-		SELECT m.channel_id, count(*) AS unread
-		FROM channel_member cm
-		JOIN message m
-		  ON m.channel_id = cm.channel_id
-		 AND m.author_id <> cm.user_id
-		 AND m.deleted_at IS NULL
-		LEFT JOIN thread_read_watermark w
-		  ON w.user_id = cm.user_id AND w.thread_id = m.thread_id
-		WHERE cm.user_id = $1
-		  AND cm.unsubscribed_at IS NULL
-		  AND m.id > COALESCE(w.last_read_message_id, 0)
-		GROUP BY m.channel_id`,
-		actor.UserID)
+		SELECT channel_id, unread_count, mention_count
+		FROM container_unread_counter
+		WHERE user_id = $1 AND org_id = $2
+		  AND channel_id IS NOT NULL AND unread_count > 0`,
+		actor.UserID, actor.OrgID)
 	if err != nil {
 		return nil, apperr.Internal("unreads", err)
 	}
@@ -149,9 +153,11 @@ func (s *Service) Unreads(ctx context.Context, actor auth.Identity) ([]ChannelUn
 	var out []ChannelUnread
 	for rows.Next() {
 		var u ChannelUnread
-		if err := rows.Scan(&u.ChannelID, &u.UnreadCount); err != nil {
+		var mention int
+		if err := rows.Scan(&u.ChannelID, &u.UnreadCount, &mention); err != nil {
 			return nil, apperr.Internal("scan unread", err)
 		}
+		u.Mentioned = mention > 0
 		out = append(out, u)
 	}
 	return out, rows.Err()

@@ -6,6 +6,7 @@ package messaging
 import (
 	"context"
 	"errors"
+	"log/slog"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -42,6 +43,7 @@ type Service struct {
 	perms *perms.Service
 	files FileAttacher
 	deliv DeliverabilityPatcher
+	log   *slog.Logger
 }
 
 // SetFiles wires the attachment hook (same pattern as the gateway's
@@ -52,8 +54,17 @@ func (s *Service) SetFiles(f FileAttacher) { s.files = f }
 // pattern — set at composition time).
 func (s *Service) SetDeliverability(d DeliverabilityPatcher) { s.deliv = d }
 
+// SetLogger wires the logger the S6 unread-counter reconciliation sweep
+// Warn-logs divergence through (the SetFiles seam pattern). Default is
+// slog.Default(); nil is ignored.
+func (s *Service) SetLogger(l *slog.Logger) {
+	if l != nil {
+		s.log = l
+	}
+}
+
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
-	return &Service{pool: pool, perms: p}
+	return &Service{pool: pool, perms: p, log: slog.Default()}
 }
 
 type SendParams struct {

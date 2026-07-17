@@ -390,6 +390,58 @@ func TestZulipImportShowcase(t *testing.T) {
 	if dmWM != weft107 {
 		t.Fatalf("hamlet dm watermark = %d, want %d", dmWM, weft107)
 	}
+	// S6: the O(1) unread counters were seeded from the imported read state
+	// in the import tx (imported events are importer-actor, so the consumer
+	// never counts them — without the seed, real imported unread state would
+	// be invisible to the counter read). Assert three ways so the check can
+	// go red: every counter row equals the live aggregate, at least one row
+	// is nonzero (Hamlet's coarsened-unread launch-plan message guarantees
+	// one), and no (user, container) with live unread is missing its row.
+	var seedMismatch, seedNonzero int
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  count(*) FILTER (WHERE c.unread_count <> live.n),
+		  count(*) FILTER (WHERE c.unread_count > 0)
+		FROM container_unread_counter c
+		JOIN LATERAL (
+		  SELECT count(*) AS n
+		  FROM message m
+		  LEFT JOIN thread_read_watermark w
+		    ON w.user_id = c.user_id AND w.thread_id = m.thread_id
+		  WHERE m.deleted_at IS NULL AND m.author_id <> c.user_id
+		    AND m.id > COALESCE(w.last_read_message_id, 0)
+		    AND ((c.channel_id IS NOT NULL AND m.channel_id = c.channel_id)
+		      OR (c.dm_space_id IS NOT NULL AND m.dm_space_id = c.dm_space_id))
+		) live ON true
+		WHERE c.org_id = $1`, orgID).Scan(&seedMismatch, &seedNonzero); err != nil {
+		t.Fatalf("unread counter seed check: %v", err)
+	}
+	if seedMismatch != 0 || seedNonzero == 0 {
+		t.Fatalf("unread counters not seeded from imported read state: mismatched=%d nonzero=%d",
+			seedMismatch, seedNonzero)
+	}
+	var seedMissing int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM (
+		  SELECT cm.user_id, cm.channel_id
+		  FROM channel_member cm
+		  JOIN channel ch ON ch.id = cm.channel_id AND ch.org_id = $1
+		  JOIN message m ON m.channel_id = cm.channel_id
+		   AND m.author_id <> cm.user_id AND m.deleted_at IS NULL
+		  LEFT JOIN thread_read_watermark w
+		    ON w.user_id = cm.user_id AND w.thread_id = m.thread_id
+		  WHERE cm.unsubscribed_at IS NULL
+		    AND m.id > COALESCE(w.last_read_message_id, 0)
+		  GROUP BY cm.user_id, cm.channel_id
+		) x
+		LEFT JOIN container_unread_counter c
+		  ON c.user_id = x.user_id AND c.channel_id = x.channel_id
+		WHERE c.user_id IS NULL`, orgID).Scan(&seedMissing); err != nil {
+		t.Fatalf("unread counter missing-row check: %v", err)
+	}
+	if seedMissing != 0 {
+		t.Fatalf("%d imported (user, channel) unread states have no counter row", seedMissing)
+	}
 	// The self-DM imported as kind 3; the bot huddle imported NOTHING.
 	var selfCount, spaces int
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM dm_space WHERE org_id = $1 AND kind = 3`, orgID).Scan(&selfCount)

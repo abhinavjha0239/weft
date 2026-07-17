@@ -197,6 +197,19 @@ func (s *Service) DeleteMessage(ctx context.Context, actor auth.Identity, msgID 
 			WHERE id = $1 AND kind = 1`, m.threadID); err != nil {
 			return apperr.Internal("thread count", err)
 		}
+		// S6: a deleted message stops counting toward unread — drop one from
+		// every member who had not read it, in this same tx (the sweep is the
+		// backstop for the create/delete commit race).
+		cid, did := int64(0), int64(0)
+		if m.channelID != nil {
+			cid = *m.channelID
+		}
+		if m.dmSpaceID != nil {
+			did = *m.dmSpaceID
+		}
+		if err := s.decrementUnreadOnDelete(ctx, tx, cid, did, m.threadID, msgID, authorID); err != nil {
+			return err
+		}
 		payload := map[string]any{"message_id": msgID, "thread_id": m.threadID}
 		if m.channelID != nil {
 			payload["channel_id"] = *m.channelID

@@ -18,6 +18,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/content"
 	"github.com/abhinavjha0239/weft/internal/domain/files"
+	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/eventlog"
@@ -883,6 +884,14 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	// before it exits (tests drive RunOnce the same way).
 	if err := perms.New(s.pool).EnqueueRebuild(ctx, tx, orgID); err != nil {
 		return fmt.Errorf("closure rebuild enqueue: %w", err)
+	}
+	// Imported messages ride importer-actor events the notification consumer
+	// deliberately skips (backfills never notify), so the S6 O(1) unread
+	// counters would read 0 against real imported unread state. Seed them
+	// from the just-imported watermarks in the same tx — import fidelity
+	// includes the unread badge.
+	if err := messaging.SeedUnreadCounters(ctx, tx, orgID); err != nil {
+		return fmt.Errorf("unread counter seed: %w", err)
 	}
 	return nil
 }
