@@ -215,6 +215,73 @@ func TestUnreadCounters(t *testing.T) {
 		}
 	})
 
+	t.Run("markread_o_delta", func(t *testing.T) {
+		if c2 == 0 {
+			t.Skip("bulk channel not built (o1 subtest did not run)")
+		}
+		// A small thread inside the bulk channel: marking IT read must cost
+		// O(its slice), even though the channel's root thread holds bulkN
+		// unread messages — an O(container-history) recompute inside the
+		// MarkRead tx is the RED this pin guards (mark-read is the
+		// highest-volume user action).
+		var th struct {
+			ThreadID int64 `json:"thread_id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, c2),
+			boot.Token, map[string]any{"title": "delta", "content": "d1"}, &th)
+		d2 := sendThread(t, ts.URL, boot.Token, th.ThreadID, "d2")
+		_ = sendThread(t, ts.URL, boot.Token, th.ThreadID, "d3")
+		drain()
+		if u, _ := counterRow(t, ctx, pool, bobID, c2); u != bulkN+3 {
+			t.Fatalf("bulk counter before mark = %d, want %d", u, bulkN+3)
+		}
+
+		// Trace the ACTUAL MarkRead the service runs (partial mark, up to d2:
+		// a 2-message delta) and EXPLAIN its reads: message-relation rows
+		// touched must be O(the marked slice) — the thread-head lookup plus
+		// the delta count — never the container's history.
+		cap := &sqlCapture{}
+		tcfg, err := pgxpool.ParseConfig(dbURL)
+		if err != nil {
+			t.Fatalf("trace cfg: %v", err)
+		}
+		tcfg.ConnConfig.Tracer = cap
+		tracedPool, err := pgxpool.NewWithConfig(ctx, tcfg)
+		if err != nil {
+			t.Fatalf("trace pool: %v", err)
+		}
+		defer tracedPool.Close()
+		tracedMsg := messaging.New(tracedPool, perms.New(tracedPool))
+		bobActor := auth.Identity{UserID: bobID, OrgID: boot.OrgID}
+		cap.reset()
+		if _, err := tracedMsg.MarkRead(ctx, bobActor, th.ThreadID, d2); err != nil {
+			t.Fatalf("traced mark-read: %v", err)
+		}
+		scanned := 0
+		for _, q := range cap.queries {
+			if strings.HasPrefix(strings.TrimSpace(strings.ToUpper(q.sql)), "SELECT") {
+				scanned += messageRowsScanned(t, ctx, pool, q.sql, q.args)
+			}
+		}
+		if scanned > 10 {
+			t.Fatalf("MarkRead scanned %d message rows for a 2-message delta in a "+
+				"%d-message channel, want O(delta) <= 10 (an O(container-history) "+
+				"recompute crept back into the mark-read tx)", scanned, bulkN+3)
+		}
+		// Correctness of the delta: 2 read → bulkN+1 remain, equal to the
+		// independently-computed live aggregate.
+		if u, _ := counterRow(t, ctx, pool, bobID, c2); u != bulkN+1 {
+			t.Fatalf("bulk counter after partial mark = %d, want %d", u, bulkN+1)
+		}
+		assertLiveEquals(t, ctx, pool, bobID, c2, bulkN+1)
+		// Full mark of the thread (monotone, to head) → back to bulkN.
+		markRead(t, ts.URL, bobTok, th.ThreadID, 0)
+		if u, _ := counterRow(t, ctx, pool, bobID, c2); u != bulkN {
+			t.Fatalf("bulk counter after full mark = %d, want %d", u, bulkN)
+		}
+		assertLiveEquals(t, ctx, pool, bobID, c2, bulkN)
+	})
+
 	t.Run("reconcile_repairs_and_warns", func(t *testing.T) {
 		if c2 == 0 {
 			t.Skip("bulk channel not built (o1 subtest did not run)")

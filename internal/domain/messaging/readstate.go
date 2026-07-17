@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"errors"
 
 	"github.com/jackc/pgx/v5"
 
@@ -57,6 +58,17 @@ func (s *Service) MarkRead(ctx context.Context, actor auth.Identity, threadID, u
 		if upTo <= 0 || upTo > newest {
 			upTo = newest
 		}
+		// The pre-mark watermark, row-locked so concurrent marks on the same
+		// (user, thread) serialize and their unread deltas cover disjoint
+		// ranges. Absent row = never read = 0.
+		var oldWM int64
+		if err := tx.QueryRow(ctx, `
+			SELECT last_read_message_id FROM thread_read_watermark
+			WHERE user_id = $1 AND thread_id = $2
+			FOR UPDATE`, actor.UserID, threadID).Scan(&oldWM); err != nil &&
+			!errors.Is(err, pgx.ErrNoRows) {
+			return apperr.Internal("read watermark", err)
+		}
 		// Monotone upsert (GREATEST): concurrent/out-of-order marks never rewind.
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO thread_read_watermark (user_id, thread_id, last_read_message_id, updated_at)
@@ -69,10 +81,13 @@ func (s *Service) MarkRead(ctx context.Context, actor auth.Identity, threadID, u
 			actor.UserID, threadID, upTo).Scan(&applied); err != nil {
 			return apperr.Internal("mark read", err)
 		}
-		// S6: reset the O(1) unread counter for this container to the exact
-		// post-watermark truth, in the SAME tx as the watermark write. A space
-		// thread has no counter (rejected above), so exactly one of the two is
-		// set here.
+		// S6: decrement the O(1) unread counter by the marked DELTA — only
+		// this thread's messages between the old and new watermark — in the
+		// SAME tx as the watermark write. Never a container-wide recompute:
+		// mark-read is among the highest-volume user actions (see the package
+		// note), so its cost must be O(what was just read), not O(container
+		// history). A space thread has no counter (rejected above), so exactly
+		// one of the two is set here.
 		cid, did := int64(0), int64(0)
 		if channelID != nil {
 			cid = *channelID
@@ -80,7 +95,8 @@ func (s *Service) MarkRead(ctx context.Context, actor auth.Identity, threadID, u
 		if dmSpaceID != nil {
 			did = *dmSpaceID
 		}
-		if err := s.resetContainerUnread(ctx, tx, actor.OrgID, actor.UserID, cid, did); err != nil {
+		if err := s.applyMarkReadDelta(ctx, tx, actor.UserID, cid, did,
+			threadID, oldWM, applied); err != nil {
 			return err
 		}
 		return nil
