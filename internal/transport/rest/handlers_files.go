@@ -113,6 +113,9 @@ func (a *api) handleThumbnail(w http.ResponseWriter, r *http.Request, id auth.Id
 	h.Set("Content-Type", "image/jpeg")
 	h.Set("X-Content-Type-Options", "nosniff")
 	h.Set("Cache-Control", "private, max-age=3600")
+	// The response varies by bearer token (the ACL). "private" already bars
+	// shared caches; Vary makes even a misconfigured one key per credential.
+	h.Set("Vary", "Authorization")
 	h.Set("Content-Disposition", "inline")
 	h.Set("X-Image-Width", strconv.Itoa(meta.SrcW))
 	h.Set("X-Image-Height", strconv.Itoa(meta.SrcH))

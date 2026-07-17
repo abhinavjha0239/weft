@@ -17,6 +17,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -51,10 +52,20 @@ type Service struct {
 	// P-18 thumbnail generation. Wired via SetLogger; nil falls back to
 	// slog.Default() (the logger() accessor).
 	log *slog.Logger
+	// thumbSem bounds concurrent renders and thumbOutcomes memoizes per-key
+	// render/describe results — the P-18 DoS hardening (thumbnail.go).
+	thumbSem      chan struct{}
+	thumbMu       sync.Mutex
+	thumbOutcomes map[string]thumbOutcome
 }
 
 func New(pool *pgxpool.Pool, store blob.Store) *Service {
-	return &Service{pool: pool, store: store}
+	return &Service{
+		pool:          pool,
+		store:         store,
+		thumbSem:      make(chan struct{}, renderConcurrency),
+		thumbOutcomes: make(map[string]thumbOutcome),
+	}
 }
 
 type File struct {
@@ -171,7 +182,9 @@ func (s *Service) Upload(ctx context.Context, actor auth.Identity, name, mime st
 	// silently ignored; a corrupt image or an over-cap decompression bomb is
 	// logged and skipped. A GET can still backfill it lazily later.
 	if _, seekErr := spool.Seek(0, io.SeekStart); seekErr == nil {
-		if _, _, terr := s.renderThumbFrom(ctx, key, spool); terr != nil && !errors.Is(terr, errNotRenderable) {
+		if _, _, terr := s.renderThumbFrom(ctx, key, func() (io.ReadCloser, error) {
+			return io.NopCloser(spool), nil
+		}); terr != nil && !errors.Is(terr, errNotRenderable) {
 			s.logger().Warn("thumbnail generation failed", "file_id", out.ID, "err", terr)
 		}
 	}
