@@ -1,0 +1,235 @@
+package rest
+
+import (
+	"context"
+	"expvar"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
+	"os"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/abhinavjha0239/weft/internal/domain/identity"
+	"github.com/abhinavjha0239/weft/internal/domain/messaging"
+	"github.com/abhinavjha0239/weft/internal/domain/notification"
+	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/gateway"
+	"github.com/abhinavjha0239/weft/internal/platform/metrics"
+)
+
+// deliverabilityMembers sizes the big channel: large enough that an
+// O(members) candidate scan is unmistakable against the O(reasons) bound,
+// small enough to provision in one set-based INSERT.
+const deliverabilityMembers = 5000
+
+// scannedCandidates reads the materializer's candidate-scan counter (the
+// expvar driver publishes a label-less instrument as a bare Float).
+// The counter is process-global and monotone, so assertions use deltas.
+func scannedCandidates(t *testing.T) float64 {
+	t.Helper()
+	v := expvar.Get("notification_candidates_scanned_total")
+	if v == nil {
+		return 0
+	}
+	f, ok := v.(*expvar.Float)
+	if !ok {
+		t.Fatal("candidate counter is not an expvar.Float")
+	}
+	return f.Value()
+}
+
+// TestDeliverabilitySet: the F-17 O(1) invariant — per-message notification
+// cost is O(actual reasons on the message), independent of channel
+// membership. (1) One mention in a big channel where nobody holds a
+// non-default reason yields exactly ONE notification row and an O(reasons)
+// candidate scan, NOT O(members). (2) level=all is one set row: setting it
+// gains the row and the next message notifies; unsetting removes both.
+// Plus the pre-mortem safety net: the reconcile sweep repairs (and would
+// log) a diverged set in both directions.
+func TestDeliverabilitySet(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	hub := gateway.NewHub(pool, slog.Default())
+	go hub.Run(ctx)
+	runner := notification.NewRunner(pool, hub, slog.Default())
+	runner.SetMetrics(metrics.NewExpvar())
+	go runner.Run(ctx)
+	permsSvc := perms.New(pool)
+	msgSvc := messaging.New(pool, permsSvc)
+	msgSvc.SetDeliverability(notification.NewDeliverability(pool, slog.Default()))
+	ts := httptest.NewServer(Handler(ctx, Deps{
+		Pool: pool, Hub: hub, Log: slog.Default(),
+		Identity:      identity.New(pool, permsSvc),
+		Messaging:     msgSvc,
+		Notifications: notification.New(pool),
+	}))
+	defer ts.Close()
+
+	var boot struct {
+		OrgID     int64  `json:"org_id"`
+		UserID    int64  `json:"user_id"`
+		ChannelID int64  `json:"channel_id"`
+		Token     string `json:"token"`
+	}
+	postJSON(t, ts.URL+"/api/v1/orgs/bootstrap", "", map[string]any{
+		"org_slug": "dlv", "email": "a@dlv.test", "password": "password123",
+		"full_name": "Alice Chen",
+	}, &boot)
+	addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"bob@dlv.test", "Bob Ray", "bobdlvtok")
+	charlieTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+		"charlie@dlv.test", "Charlie Kim", "charliedlvtok")
+	var bobID, charlieID int64
+	_ = pool.QueryRow(ctx, `SELECT id FROM user_account WHERE org_id=$1 AND email='bob@dlv.test'`,
+		boot.OrgID).Scan(&bobID)
+	_ = pool.QueryRow(ctx, `SELECT id FROM user_account WHERE org_id=$1 AND email='charlie@dlv.test'`,
+		boot.OrgID).Scan(&charlieID)
+
+	// Bulk-provision the big membership set-based (these users only ever
+	// receive, so no sessions or role groups are needed). All on default
+	// settings: none of them belongs in the deliverability set.
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO user_account (org_id, kind, email, full_name, role)
+		SELECT $1, 1, 'u' || i || '@dlv.test', 'User ' || i, 40
+		FROM generate_series(1, $2) i`, boot.OrgID, deliverabilityMembers); err != nil {
+		t.Fatalf("bulk users: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO channel_member (channel_id, user_id)
+		SELECT $1, id FROM user_account
+		WHERE org_id = $2 AND email LIKE 'u%@dlv.test'`,
+		boot.ChannelID, boot.OrgID); err != nil {
+		t.Fatalf("bulk members: %v", err)
+	}
+
+	waitForConsumer := func() {
+		t.Helper()
+		drainConsumer(t, ctx, pool, "notifications", boot.OrgID, runner.ProcessOrg)
+	}
+	send := func(content string) int64 {
+		t.Helper()
+		var sent struct {
+			MessageID int64 `json:"message_id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/messages", ts.URL, boot.ChannelID),
+			boot.Token, map[string]any{"content": content}, &sent)
+		return sent.MessageID
+	}
+	rowsFor := func(msgID int64) (n int, kind int16, uid int64) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*), COALESCE(min(kind), 0), COALESCE(min(user_id), 0)
+			FROM notification
+			WHERE org_id = $1 AND entity_type = 1 AND entity_id = $2`,
+			boot.OrgID, msgID).Scan(&n, &kind, &uid); err != nil {
+			t.Fatalf("rows for %d: %v", msgID, err)
+		}
+		return n, kind, uid
+	}
+	setRows := func(userID int64, reason int16) int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*) FROM channel_deliverability
+			WHERE channel_id = $1 AND user_id = $2 AND reason = $3 AND medium = 1`,
+			boot.ChannelID, userID, reason).Scan(&n); err != nil {
+			t.Fatalf("set rows: %v", err)
+		}
+		return n
+	}
+
+	// (1) One mention among deliverabilityMembers defaults: exactly ONE
+	// notification row, and the candidate scan is O(reasons) — the set is
+	// empty, so the per-message work cannot depend on membership. (The
+	// first message also pays the one-time lazy build; the counter
+	// measures only the per-message candidate path.)
+	waitForConsumer()
+	before := scannedCandidates(t)
+	mentionMsg := send("welcome aboard @**Bob Ray**")
+	waitForConsumer()
+	if n, kind, uid := rowsFor(mentionMsg); n != 1 || kind != notification.KindMention || uid != bobID {
+		t.Fatalf("mention in big channel: rows=%d kind=%d user=%d, want exactly bob's one mention row", n, kind, uid)
+	}
+	if delta := scannedCandidates(t) - before; delta > 20 {
+		t.Fatalf("candidate scan is O(members): delta=%.0f for one message in a %d-member channel, want O(reasons) <= 20",
+			delta, deliverabilityMembers)
+	}
+	var builtAt *time.Time
+	if err := pool.QueryRow(ctx, `SELECT deliverability_built_at FROM channel WHERE id = $1`,
+		boot.ChannelID).Scan(&builtAt); err != nil || builtAt == nil {
+		t.Fatalf("lazy build did not stamp deliverability_built_at (%v, %v)", builtAt, err)
+	}
+
+	// (2) level=all is exactly one set row, added and removed by the
+	// settings patch — and resolution follows it.
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/notification", ts.URL, boot.ChannelID),
+		charlieTok, map[string]any{"level": 1}); code != http.StatusOK {
+		t.Fatalf("charlie level=all = %d", code)
+	}
+	if n := setRows(charlieID, 2); n != 1 {
+		t.Fatalf("level=all set rows = %d, want 1", n)
+	}
+	before = scannedCandidates(t)
+	activityMsg := send("routine update, no mentions")
+	waitForConsumer()
+	if n, kind, uid := rowsFor(activityMsg); n != 1 || kind != notification.KindChannelActivity || uid != charlieID {
+		t.Fatalf("level=all message: rows=%d kind=%d user=%d, want charlie's one activity row", n, kind, uid)
+	}
+	if delta := scannedCandidates(t) - before; delta < 1 || delta > 20 {
+		t.Fatalf("candidate scan delta=%.0f, want 1..20 (charlie is the only candidate)", delta)
+	}
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/notification", ts.URL, boot.ChannelID),
+		charlieTok, map[string]any{"level": 0}); code != http.StatusOK {
+		t.Fatalf("charlie level reset = %d", code)
+	}
+	if n := setRows(charlieID, 2); n != 0 {
+		t.Fatalf("set rows after level reset = %d, want 0 (row gone)", n)
+	}
+	quietMsg := send("back to defaults")
+	waitForConsumer()
+	if n, _, _ := rowsFor(quietMsg); n != 0 {
+		t.Fatalf("post-reset message minted %d rows, want 0", n)
+	}
+
+	// Reconciliation (the pre-mortem drift net): a lost row is restored
+	// and a bogus row is removed by one sweep.
+	if code := putJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/notification", ts.URL, boot.ChannelID),
+		charlieTok, map[string]any{"level": 1}); code != http.StatusOK {
+		t.Fatalf("charlie level=all again = %d", code)
+	}
+	if _, err := pool.Exec(ctx, `
+		DELETE FROM channel_deliverability
+		WHERE channel_id = $1 AND user_id = $2 AND reason = 2`,
+		boot.ChannelID, charlieID); err != nil {
+		t.Fatalf("simulate missing row: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO channel_deliverability (channel_id, user_id, reason, medium, org_id)
+		VALUES ($1, $2, 2, 1, $3)`, boot.ChannelID, bobID, boot.OrgID); err != nil {
+		t.Fatalf("simulate extra row: %v", err)
+	}
+	if err := notification.NewDeliverability(pool, slog.Default()).ReconcileOnce(ctx); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	if n := setRows(charlieID, 2); n != 1 {
+		t.Fatalf("reconcile did not restore charlie's row (rows=%d)", n)
+	}
+	if n := setRows(bobID, 2); n != 0 {
+		t.Fatalf("reconcile did not remove bob's bogus row (rows=%d)", n)
+	}
+}

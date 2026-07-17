@@ -19,6 +19,15 @@ const (
 	consumerName  = "notifications"
 	sweepInterval = 5 * time.Second
 	batchSize     = 500
+	// reconcileInterval paces the F-17 safety-net sweep (janitor cadence):
+	// it recomputes each built channel's deliverability set and repairs +
+	// reports divergence, because a missed invalidation would silently
+	// DROP notifications.
+	reconcileInterval = time.Hour
+	// candidatesScannedMetric counts candidate rows the materializer
+	// examines per message — the F-17 O(reasons)-not-O(members) invariant,
+	// observable.
+	candidatesScannedMetric = "notification_candidates_scanned_total"
 )
 
 // Fanout delivers a live in-app ping to one user's connections; the gateway
@@ -67,7 +76,7 @@ func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
 // and consumer_lag are published too). Optional — default Nop. Call once before
 // Run/ProcessOrg.
 func (r *Runner) SetMetrics(reg metrics.Registry) {
-	r.scanned = reg.Counter("notification_candidates_scanned_total")
+	r.scanned = reg.Counter(candidatesScannedMetric)
 	r.consumer.SetMetrics(reg)
 }
 
@@ -75,6 +84,7 @@ func (r *Runner) SetMetrics(reg metrics.Registry) {
 // signalled org; a sweep catches anything a missed NOTIFY left behind.
 func (r *Runner) Run(ctx context.Context) {
 	go r.sweep(ctx)
+	go r.reconcileLoop(ctx)
 	for ctx.Err() == nil {
 		if err := r.listenLoop(ctx); err != nil && ctx.Err() == nil {
 			r.log.Warn("notification: listen loop restarting", "err", err)
@@ -127,6 +137,23 @@ func (r *Runner) sweep(ctx context.Context) {
 			rows.Close()
 			for _, id := range ids {
 				_ = r.ProcessOrg(ctx, id)
+			}
+		}
+	}
+}
+
+// reconcileLoop drives the F-17 divergence sweep on the slow ticker;
+// ReconcileOnce does the per-channel work and logging.
+func (r *Runner) reconcileLoop(ctx context.Context) {
+	t := time.NewTicker(reconcileInterval)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.deliv.ReconcileOnce(ctx); err != nil && ctx.Err() == nil {
+				r.log.Warn("notification: deliverability reconcile", "err", err)
 			}
 		}
 	}
@@ -230,48 +257,60 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 			return err
 		}
 	}
-	// Channel messages resolve N-1 steps 2–3 in one pass: followed threads
-	// boost (and override the channel level); level=all members get
-	// activity pings; the SEPARATE mute flag suppresses both — with an
-	// unmuted thread reviving activity inside a muted channel — while
-	// mentions and DMs break through mute (handled above/below, which is
-	// why the notified-set skip matters). More specific reasons win.
+	// Channel messages resolve N-1 steps 2–3 in one pass over the F-17
+	// deliverability set — O(actual reasons), never O(members). Candidates
+	// are the channel's reason-1 (follows a thread here) and reason-2
+	// (level=all) rows; their mute/level/follow SETTINGS are re-verified
+	// LIVE per candidate below (the set caches candidacy, never settings,
+	// so a stale-extra row costs one wasted scan and can never mint a
+	// wrong notification). Semantics are unchanged: followed threads boost
+	// (and override the channel level); level=all members get activity
+	// pings; the SEPARATE mute flag suppresses both — with an unmuted
+	// thread reviving activity inside a muted channel — while mentions and
+	// DMs break through mute (handled above/below, which is why the
+	// notified-set skip matters). More specific reasons win.
 	if p.ChannelID != 0 && p.ThreadID != 0 && ev.Verb == "message.created" {
 		rows, err := r.pool.Query(ctx, `
-			SELECT cm.user_id,
-			       CASE WHEN COALESCE(ts.state, 0) = 1 THEN true ELSE false END
-			FROM channel_member cm
+			SELECT DISTINCT cd.user_id, cm.muted, cm.level,
+			       COALESCE(ts.state, 0::smallint)
+			FROM channel_deliverability cd
+			JOIN channel_member cm ON cm.channel_id = cd.channel_id
+			     AND cm.user_id = cd.user_id AND cm.unsubscribed_at IS NULL
 			LEFT JOIN thread_subscription ts
-			  ON ts.thread_id = $2 AND ts.user_id = cm.user_id
-			WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL
-			  AND cm.user_id <> $3
-			  AND (
-			    (COALESCE(ts.state, 0) = 1 AND NOT cm.muted)
-			    OR (cm.level = 1 AND COALESCE(ts.state, 0) <> 2
-			        AND (NOT cm.muted OR COALESCE(ts.state, 0) = 3))
-			  )`, p.ChannelID, p.ThreadID, author)
+			  ON ts.thread_id = $2 AND ts.user_id = cd.user_id
+			WHERE cd.channel_id = $1 AND cd.reason IN (1, 2) AND cd.medium = 1
+			  AND cd.user_id <> $3`, p.ChannelID, p.ThreadID, author)
 		if err != nil {
 			return err
 		}
 		type rec struct {
-			uid      int64
-			followed bool
+			uid     int64
+			muted   bool
+			level   int16
+			tsState int16
 		}
 		var recs []rec
 		for rows.Next() {
 			var x rec
-			if rows.Scan(&x.uid, &x.followed) == nil {
+			if rows.Scan(&x.uid, &x.muted, &x.level, &x.tsState) == nil {
+				r.scanned.Add(1) // once per candidate row scanned
 				recs = append(recs, x)
 			}
 		}
 		rows.Close()
-		r.scanned.Add(float64(len(recs)))
 		for _, x := range recs {
+			followed := x.tsState == 1
+			// The live settings filter — exactly the decisions the
+			// pre-F-17 channel_member join made in SQL.
+			if !((followed && !x.muted) ||
+				(x.level == 1 && x.tsState != 2 && (!x.muted || x.tsState == 3))) {
+				continue
+			}
 			if mentioned[x.uid] {
 				continue // the more specific reason already fired
 			}
 			kind := int16(KindChannelActivity)
-			if x.followed {
+			if followed {
 				kind = KindFollowedThread
 			} else if keyworded[x.uid] {
 				kind = KindKeyword // a keyword upgrades plain activity
@@ -385,12 +424,14 @@ func dndSuppressed(ctx context.Context, pool *pgxpool.Pool, userID, author int64
 	return suppressed, nil
 }
 
-// keywordMatches finds channel members whose alert words appear in the
-// message (kind 4): a cheap substring prefilter in SQL over the channel's
-// members' words, refined to WORD boundaries in Go. Mute-respecting like
-// plain activity (a muted thread suppresses; an unmuted thread revives
-// inside a muted channel) — keywords do not break through mute the way
-// mentions do. Users already notified for this message are excluded (the
+// keywordMatches finds alert-word pings (kind 4), candidates bounded by
+// the F-17 set (reason 3 = alert-word holders in this channel, never a
+// channel_member walk): a cheap substring prefilter in SQL over the
+// candidates' words, refined to WORD boundaries in Go, with membership
+// and mute state re-verified live. Mute-respecting like plain activity
+// (a muted thread suppresses; an unmuted thread revives inside a muted
+// channel) — keywords do not break through mute the way mentions do.
+// Users already notified for this message are excluded (the
 // message.edited path must not double-ping), and DMs are skipped: the DM
 // row itself already pings every participant.
 func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messagePayload, author int64) (map[int64]bool, error) {
@@ -405,12 +446,14 @@ func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messageP
 	}
 	rows, err := r.pool.Query(ctx, `
 		SELECT aw.user_id, aw.word
-		FROM alert_word aw
-		JOIN channel_member cm ON cm.user_id = aw.user_id
+		FROM channel_deliverability cd
+		JOIN alert_word aw ON aw.user_id = cd.user_id
+		JOIN channel_member cm ON cm.channel_id = cd.channel_id
+		     AND cm.user_id = cd.user_id AND cm.unsubscribed_at IS NULL
 		LEFT JOIN thread_subscription ts
-		  ON ts.thread_id = $2 AND ts.user_id = aw.user_id
-		WHERE cm.channel_id = $1 AND cm.unsubscribed_at IS NULL
-		  AND aw.user_id <> $3
+		  ON ts.thread_id = $2 AND ts.user_id = cd.user_id
+		WHERE cd.channel_id = $1 AND cd.reason = 3 AND cd.medium = 1
+		  AND cd.user_id <> $3
 		  AND COALESCE(ts.state, 0) <> 2
 		  AND (NOT cm.muted OR COALESCE(ts.state, 0) = 3)
 		  AND position(aw.word IN lower($4)) > 0
@@ -430,6 +473,7 @@ func (r *Runner) keywordMatches(ctx context.Context, ev eventlog.Row, p messageP
 		if rows.Scan(&uid, &word) != nil {
 			continue
 		}
+		r.scanned.Add(1) // once per candidate row scanned
 		if matched[uid] {
 			continue
 		}
