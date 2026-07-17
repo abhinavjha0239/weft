@@ -3,7 +3,9 @@ package blob
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
+	"io/fs"
 	"os"
 	"testing"
 )
@@ -55,5 +57,11 @@ func TestS3RoundTrip(t *testing.T) {
 	// Deleting a missing key is a no-op.
 	if err := store.Delete(ctx, key); err != nil {
 		t.Fatalf("delete missing (should tolerate): %v", err)
+	}
+	// Opening a missing key satisfies the Store contract's fs.ErrNotExist,
+	// so callers can tell absent from outage (the fs driver gets this from
+	// os.Open natively).
+	if _, err := store.Open(ctx, key); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("open missing = %v, want fs.ErrNotExist", err)
 	}
 }

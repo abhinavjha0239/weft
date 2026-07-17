@@ -20,7 +20,10 @@ type Store interface {
 	// key: a concurrent reader never sees a partial object. Writing a key
 	// that already exists is a success no-op (keys are content-addressed).
 	Put(ctx context.Context, key string, r io.Reader) error
-	// Open streams the blob; the caller closes it.
+	// Open streams the blob; the caller closes it. A missing key returns an
+	// error satisfying errors.Is(err, fs.ErrNotExist), so callers can tell
+	// "absent" (normal: purged, never written) from an outage worth alerting
+	// on — every other error is infrastructure.
 	Open(ctx context.Context, key string) (io.ReadCloser, error)
 	// Delete removes the blob; deleting a missing key is not an error.
 	Delete(ctx context.Context, key string) error
