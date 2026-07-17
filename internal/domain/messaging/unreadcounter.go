@@ -307,6 +307,74 @@ func (s *Service) repairUnread(ctx context.Context, userID, channelID, dmSpaceID
 	return nil
 }
 
+// SeedUnreadCounters materializes an org's counter rows from the live
+// aggregate — the bulk backfill for read state that never flowed through the
+// consumer path. The Zulip importer is the lane that NEEDS it: imported
+// messages carry importer-actor events the consumer deliberately skips, so
+// without a seed an imported org's real unread state (watermarks below live
+// messages) would be invisible to the O(1) read — an import-fidelity
+// regression. Two set-based statements (one per container leg) in the
+// caller's transaction; last_event_id lands on the org's current max event
+// id so later consumption never re-counts what the aggregate already
+// reflects. mention_count seeds 0 (no per-message mention truth exists — the
+// badge is creation-time best-effort, see the package note). Package-level
+// like the importer's other cross-module calls; also the operator remedy for
+// a deploy of 0023 over a live pre-counter org.
+func SeedUnreadCounters(ctx context.Context, tx pgx.Tx, orgID int64) error {
+	if _, err := tx.Exec(ctx, `
+		WITH maxev AS (
+		    SELECT COALESCE(MAX(id), 0) AS id FROM event_log WHERE org_id = $1
+		)
+		INSERT INTO container_unread_counter
+			(user_id, channel_id, org_id, unread_count, mention_count, last_event_id)
+		SELECT cm.user_id, cm.channel_id, $1, count(*), 0, (SELECT id FROM maxev)
+		FROM channel_member cm
+		JOIN channel c ON c.id = cm.channel_id AND c.org_id = $1
+		JOIN message m
+		  ON m.channel_id = cm.channel_id
+		 AND m.author_id <> cm.user_id
+		 AND m.deleted_at IS NULL
+		LEFT JOIN thread_read_watermark w
+		  ON w.user_id = cm.user_id AND w.thread_id = m.thread_id
+		WHERE cm.unsubscribed_at IS NULL
+		  AND m.id > COALESCE(w.last_read_message_id, 0)
+		GROUP BY cm.user_id, cm.channel_id
+		ON CONFLICT (user_id, channel_id) WHERE channel_id IS NOT NULL
+		DO UPDATE SET
+		    unread_count  = EXCLUDED.unread_count,
+		    mention_count = LEAST(container_unread_counter.mention_count, EXCLUDED.unread_count),
+		    last_event_id = GREATEST(container_unread_counter.last_event_id, EXCLUDED.last_event_id)`,
+		orgID); err != nil {
+		return fmt.Errorf("unread: seed channels: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `
+		WITH maxev AS (
+		    SELECT COALESCE(MAX(id), 0) AS id FROM event_log WHERE org_id = $1
+		)
+		INSERT INTO container_unread_counter
+			(user_id, dm_space_id, org_id, unread_count, mention_count, last_event_id)
+		SELECT dp.user_id, dp.dm_space_id, $1, count(*), 0, (SELECT id FROM maxev)
+		FROM dm_participant dp
+		JOIN dm_space ds ON ds.id = dp.dm_space_id AND ds.org_id = $1
+		JOIN message m
+		  ON m.dm_space_id = dp.dm_space_id
+		 AND m.author_id <> dp.user_id
+		 AND m.deleted_at IS NULL
+		LEFT JOIN thread_read_watermark w
+		  ON w.user_id = dp.user_id AND w.thread_id = m.thread_id
+		WHERE m.id > COALESCE(w.last_read_message_id, 0)
+		GROUP BY dp.user_id, dp.dm_space_id
+		ON CONFLICT (user_id, dm_space_id) WHERE dm_space_id IS NOT NULL
+		DO UPDATE SET
+		    unread_count  = EXCLUDED.unread_count,
+		    mention_count = LEAST(container_unread_counter.mention_count, EXCLUDED.unread_count),
+		    last_event_id = GREATEST(container_unread_counter.last_event_id, EXCLUDED.last_event_id)`,
+		orgID); err != nil {
+		return fmt.Errorf("unread: seed dms: %w", err)
+	}
+	return nil
+}
+
 // compile-time guard that the pool type carries QueryRow (documents the
 // queryRower contract the recompute relies on for both pool and tx).
 var _ queryRower = (*pgxpool.Pool)(nil)
