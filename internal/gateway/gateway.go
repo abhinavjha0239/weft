@@ -137,6 +137,11 @@ type Hub struct {
 	pumpQueries metrics.Counter
 	deliveries  metrics.Counter
 	connections metrics.Gauge
+	// encoded counts Envelope JSON marshals — the marshal-once invariant: the
+	// live multicast lane encodes each event ONCE for the whole org, so this
+	// rises O(events), not O(connections). A regression to per-connection
+	// marshaling makes it rise ~O(connections) (the red/green pin).
+	encoded metrics.Counter
 }
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
@@ -236,6 +241,17 @@ func (h *Hub) SetMetrics(reg metrics.Registry) {
 	h.pumpQueries = reg.Counter("gateway_pump_queries_total")
 	h.deliveries = reg.Counter("fanout_deliveries_total")
 	h.connections = reg.Gauge("gateway_connections", "org")
+	h.encoded = reg.Counter("gateway_envelopes_encoded_total")
+}
+
+// encodeEnvelope is the SINGLE Envelope-marshal choke point, so the encoded
+// counter measures exactly how many times an event was JSON-encoded. The live
+// multicast lane calls this once per event for the whole org (marshal-once);
+// the resume-lane fallback calls it once per delivered row. Default Nop
+// registry makes the count a no-op when metrics are off.
+func (h *Hub) encodeEnvelope(e Envelope) ([]byte, error) {
+	h.encoded.Add(1)
+	return json.Marshal(e)
 }
 
 // SetMarkReader wires the durable read-state service (rest layer adapts
@@ -468,6 +484,18 @@ func (h *Hub) multicast(ctx context.Context, sh *orgShard) (more bool, err error
 	}
 	maxID := batch[len(batch)-1].id
 
+	// Marshal each row's Envelope ONCE here, in the single reader goroutine,
+	// before fanning: the bytes are identical for every connection in the org,
+	// so the per-connection deliver reuses them (marshal-once — the CPU twin of
+	// the O(1) read above). The channel send in feed establishes happens-before,
+	// so the connection goroutines read enc safely.
+	for i := range batch {
+		batch[i].enc, _ = h.encodeEnvelope(Envelope{
+			Seq: batch[i].id, Type: batch[i].verb,
+			OrgID: sh.orgID, Payload: batch[i].payload,
+		})
+	}
+
 	sh.mu.Lock()
 	live := make([]*client, 0, len(sh.conns))
 	for c := range sh.conns {
@@ -505,6 +533,13 @@ type eventRow struct {
 	id      int64
 	verb    string
 	payload json.RawMessage
+	// enc is the row's Envelope pre-marshaled ONCE by the multicast reader
+	// (the Envelope is identical for every connection in the org — same seq,
+	// verb, payload, org id), so the fan reuses these bytes instead of
+	// re-encoding per connection: O(1) marshal per event, not O(connections).
+	// nil on the resume lane (per-connection pump), where deliverShared
+	// marshals its own fallback — rare, bounded by the replay gap.
+	enc []byte
 }
 
 // readEvents reads an org's committed event-log rows after afterID (ascending,
@@ -578,9 +613,17 @@ func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) er
 			}
 		}
 		if deliver {
-			if err := h.send(ctx, c, Envelope{
-				Seq: r.id, Type: r.verb, OrgID: c.id.OrgID, Payload: r.payload,
-			}); err != nil {
+			// Live lane: reuse the reader's marshal-once bytes. Resume lane
+			// (enc nil) marshals its own — rare, bounded by the replay gap.
+			var err error
+			if r.enc != nil {
+				err = h.sendRaw(c, r.enc)
+			} else {
+				err = h.send(ctx, c, Envelope{
+					Seq: r.id, Type: r.verb, OrgID: c.id.OrgID, Payload: r.payload,
+				})
+			}
+			if err != nil {
 				return err
 			}
 			h.deliveries.Add(1)
@@ -702,10 +745,17 @@ func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
 // fan-out). The write uses a fresh timeout (not the caller's context) so
 // cross-connection fan-out is never cancelled by the sender disconnecting.
 func (h *Hub) send(_ context.Context, c *client, e Envelope) error {
-	data, err := json.Marshal(e)
+	data, err := h.encodeEnvelope(e)
 	if err != nil {
 		return err
 	}
+	return h.sendRaw(c, data)
+}
+
+// sendRaw writes already-marshaled Envelope bytes to one connection. The live
+// multicast lane passes the reader's marshal-once bytes here so an event is
+// encoded ONCE per org, not once per connection (the CPU side of S3).
+func (h *Hub) sendRaw(c *client, data []byte) error {
 	c.writeMu.Lock()
 	defer c.writeMu.Unlock()
 	wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)

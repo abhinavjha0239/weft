@@ -90,6 +90,7 @@ func TestGatewayMulticast(t *testing.T) {
 	}
 
 	before := readPumpQueries(t)
+	encBefore := readEncoded(t)
 	msgID := sendChannel(t, ts.URL, boot.Token, boot.ChannelID, "one to many")
 	// Every LIVE member sees the one send, with the right id.
 	for i, s := range subs {
@@ -103,11 +104,27 @@ func TestGatewayMulticast(t *testing.T) {
 		}
 	}
 	after := readPumpQueries(t)
+	encAfter := readEncoded(t)
 
 	// ACL carry-over: the outsider is a live fan target too (it received the
 	// shared batch), but its own filter drops the channel event — so it stays
 	// silent while every member got it.
 	outsider.expectSilence(t, "message.created", 500*time.Millisecond)
+
+	// THE marshal-once pin: the per-org reader encodes the event ONCE for the
+	// whole org, so gateway_envelopes_encoded_total rises O(events) (~1 here),
+	// NOT O(connections). Reverting deliverShared to marshal per connection
+	// makes this delta ~conns — the red state this assertion guards (the CPU
+	// twin of the pump-query O(1) pin above).
+	encDelta := encAfter - encBefore
+	if encDelta > float64(conns)/4 {
+		t.Fatalf("envelope encodes rose by %g for one send to %d connections; want marshal-once O(events), not O(connections)",
+			encDelta, conns)
+	}
+	if encDelta < 1 {
+		t.Fatalf("envelope encodes did not rise (%g); the event must be marshaled once for the fan", encDelta)
+	}
+	t.Logf("marshal-once: 1 send → %d deliveries, envelope-encodes +%g (O(events))", conns, encDelta)
 
 	// THE S3 pin: one send to `conns` live connections cost O(1) reads. The
 	// per-org multicast reader runs ~once; per-connection pump would have run
@@ -171,6 +188,21 @@ func readPumpQueries(t *testing.T) float64 {
 	f, ok := v.(*expvar.Float)
 	if !ok {
 		t.Fatalf("gateway_pump_queries_total is %T, want *expvar.Float", v)
+	}
+	return f.Value()
+}
+
+// readEncoded reads the process-global gateway_envelopes_encoded_total counter
+// — the marshal-once signal, read in-process for a before/after delta.
+func readEncoded(t *testing.T) float64 {
+	t.Helper()
+	v := expvar.Get("gateway_envelopes_encoded_total")
+	if v == nil {
+		return 0
+	}
+	f, ok := v.(*expvar.Float)
+	if !ok {
+		t.Fatalf("gateway_envelopes_encoded_total is %T, want *expvar.Float", v)
 	}
 	return f.Value()
 }
