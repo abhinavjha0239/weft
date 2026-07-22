@@ -2202,7 +2202,7 @@ dossier):**
 
 ---
 
-### P-36 (S0) `scale: 100k-org proof harness + consumer-lag metrics.` — L — **[~] in flight (Opus executor)**
+### P-36 (S0) `scale: 100k-org proof harness + consumer-lag metrics.` — L — **[x] shipped #113** (Opus-executed; consumer-lag gauge + mega-org loadgen; expvar no-dep metrics driver behind a seam)
 
 **What & why.** The cluster's whole point is designed→built+**PROVEN**.
 Today there is no way to prove any scale guard: no lag metric
@@ -2305,7 +2305,7 @@ CI smoke, and the operator procedure for the real number.
 
 ---
 
-### P-37 (S1) `notification: Materialized deliverability set + batch coalescing (F-17).` — L — migration 0021 — **[~] in flight (Fable executor)**
+### P-37 (S1) `notification: Materialized deliverability set + batch coalescing (F-17).` — L — migration 0021 — **[x] shipped #114** (Fable-executed; live per-message channel_member join → O(reasons); red/green-proven)
 
 **What & why.** The materializer joins ALL ~100k `channel_member` rows
 for EVERY message in a big channel (`runner.go:195-207`). F-17
@@ -2410,7 +2410,7 @@ channel is bounded, not eliminated.
 
 ---
 
-### P-38 (S2) `perms: Async closure rebuild behind a version fence.` — L — migration 0022 — **[ ] (Fable execution — correctness-critical)**
+### P-38 (S2) `perms: Async closure rebuild behind a version fence.` — L — migration 0022 — **[x] shipped #116** (Fable-executed, correctness-critical; incremental delta + version fence; diamond-nesting parity + flat-rebuild red/green-proven)
 
 **What & why.** A 100k-member org-wide group edit rebuilds the ENTIRE
 `user_group_closure` synchronously in the writer's transaction
@@ -2496,7 +2496,7 @@ changes.
 
 ---
 
-### P-39 (S3) `gateway: Per-org multicast — one query per event, fan in memory.` — L — no migration — **[ ]**
+### P-39 (S3) `gateway: Per-org multicast — one query per event, fan in memory.` — L — no migration — **[x] shipped #115** (O(connections) event reads → O(1) per org; +#119 marshal-once)
 
 **What & why.** One message to a 100k-connection org triggers ~100k
 independent `event_log` queries — each connection runs its own catch-up
@@ -2577,7 +2577,7 @@ plane, not this slice).
 
 ---
 
-### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[ ] (Fable execution — all-consumer contract; its own serial window)**
+### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[ ] PARKED — awaiting the `pglogrepl` new-dependency decision (go-oidc-class exception vs the no-dep per-org commit-fence fallback). Fable execution — all-consumer contract, its own serial window**
 
 **What & why.** The `txid < pg_snapshot_xmin(...)` gate
 (`consumer.go:60`) is DATABASE-GLOBAL: one long write tx anywhere
@@ -2652,7 +2652,7 @@ per-org commit-fence fallback stays recorded in the dossier.
 
 ---
 
-### P-41 (S5) `gateway: Multi-node shared presence plane.` — M — no migration (wakes the dormant `presence` table) — **[ ]**
+### P-41 (S5) `gateway: Multi-node shared presence plane.` — M — no migration (wakes the dormant `presence` table) — **[x] shipped #120** (Opus-drafted, reviewer-completed after a watchdog stall; shared plane via the dormant table + LISTEN/NOTIFY, no dep; cross-node red/green-proven; node-crash staleness recorded as a follow-up)
 
 **What & why.** Presence is per-process (`presence.go:9-26`): with 100k
 connections across N gateway nodes, each node knows only its own
@@ -2718,7 +2718,7 @@ the external-cache driver.
 
 ---
 
-### P-42 (S6) `messaging: O(1) unread counters (F-17 twin).` — M — migration 0023 — **[ ]**
+### P-42 (S6) `messaging: O(1) unread counters (F-17 twin).` — M — migration 0023 — **[x] shipped #117** (maintained per-(user,channel) counter off the notification pass; +#118 MarkRead O(delta))
 
 **What & why.** `Unreads` (`readstate.go:130-158`) is an O(user's
 channels × messages-since-watermark) aggregate per request — its own
