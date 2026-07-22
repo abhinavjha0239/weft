@@ -34,6 +34,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
 	"github.com/abhinavjha0239/weft/internal/platform/mail"
 	"github.com/abhinavjha0239/weft/internal/platform/metrics"
+	"github.com/abhinavjha0239/weft/internal/platform/presence"
 	"github.com/abhinavjha0239/weft/internal/platform/webpush"
 	"github.com/abhinavjha0239/weft/internal/transport/rest"
 	"github.com/abhinavjha0239/weft/internal/webui"
@@ -182,6 +183,14 @@ func serve(ctx context.Context, cfg config.Config) error {
 	}
 	hub := gateway.NewHub(pool, log)
 	hub.SetMetrics(reg)
+	// Presence plane seam (S5): the pg driver (default) shares presence across
+	// this cell's gateway nodes via the UNLOGGED presence table + LISTEN/NOTIFY;
+	// "local" keeps it in-process for a single-node deployment.
+	plane, err := presence.Open(cfg.PresenceDriver, pool, log)
+	if err != nil {
+		return err
+	}
+	hub.SetPresencePlane(plane)
 	go hub.Run(ctx)
 	notifRunner := notification.NewRunner(pool, hub, log)
 	notifRunner.SetMetrics(reg)

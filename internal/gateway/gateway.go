@@ -29,6 +29,7 @@ import (
 
 	"github.com/abhinavjha0239/weft/internal/auth"
 	"github.com/abhinavjha0239/weft/internal/platform/metrics"
+	"github.com/abhinavjha0239/weft/internal/platform/presence"
 )
 
 const (
@@ -112,6 +113,13 @@ type Hub struct {
 	// (nil = signal ignored), set via SetMarkReader at wiring time.
 	markReader MarkReader
 
+	// plane is the cross-node shared presence plane (the platform/presence
+	// seam). Default = the in-process Local plane (single-node semantics); a
+	// multi-node cell wires the shared pg plane via SetPresencePlane. Presence
+	// transitions publish here, every node subscribes and fans deltas to its
+	// OWN local connections, and PresenceSnapshot reads the org-wide view.
+	plane presence.Plane
+
 	// IdleAfter is how long a connected user may be silent before presence
 	// demotes active→idle (P-05). Exported so tests shrink it; default 10min.
 	IdleAfter time.Duration
@@ -146,10 +154,18 @@ type Hub struct {
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
 	h := &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
-		orgs: map[int64]*orgShard{}, runCtx: context.Background()}
+		orgs: map[int64]*orgShard{}, runCtx: context.Background(),
+		plane: presence.Local()}
 	h.SetMetrics(metrics.Nop())
 	return h
 }
+
+// SetPresencePlane wires the cross-node presence plane (the platform/presence
+// seam). Optional — the default is the in-process Local plane, i.e. single-node
+// presence (an un-wired hub and every single-node test keep their semantics).
+// A multi-node cell wires the shared pg plane so any node sees org-wide
+// presence. Call once before Run.
+func (h *Hub) SetPresencePlane(p presence.Plane) { h.plane = p }
 
 // shard returns the org's shard, or nil when the org has no connections.
 func (h *Hub) shard(orgID int64) *orgShard {
@@ -267,6 +283,9 @@ func (h *Hub) Run(ctx context.Context) {
 	h.mu.Unlock()
 	go h.sweep(ctx)
 	go h.presenceSweep(ctx)
+	// Subscribe to the shared presence plane: every delta published on the cell
+	// (by this node or any other) is fanned to this node's own local connections.
+	go h.plane.Subscribe(ctx, h.onPresenceDelta)
 	for ctx.Err() == nil {
 		if err := h.listenLoop(ctx); err != nil && ctx.Err() == nil {
 			h.log.Warn("gateway: listen loop restarting", "err", err)
@@ -362,13 +381,13 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	}
 	announce, live := h.register(c, orgHead, time.Now())
 	if announce {
-		h.broadcastPresence(ctx, id.OrgID, id.UserID, "active")
+		h.publishPresence(ctx, id.OrgID, id.UserID, "active")
 	}
 	defer func() {
 		wentOffline := h.deregister(c)
 		if wentOffline {
-			// The request context is gone; presence still fans out.
-			h.broadcastPresence(context.Background(), id.OrgID, id.UserID, "offline")
+			// The request context is gone; presence still publishes to the plane.
+			h.publishPresence(context.Background(), id.OrgID, id.UserID, "offline")
 		}
 		ws.CloseNow()
 	}()

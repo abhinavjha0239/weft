@@ -56,6 +56,12 @@ type Config struct {
 	// served at /debug/vars). Picking expvar opts the operator into exposing
 	// that ops endpoint — the default stays off.
 	MetricsDriver string
+	// Presence plane seam (S5): "pg" (default) shares presence across a cell's
+	// gateway nodes via the UNLOGGED presence table + LISTEN/NOTIFY, so any
+	// node sees org-wide presence; "local" keeps it in-process (single-node —
+	// no cross-node view, no presence DB writes). The multi-node target wants
+	// pg; a single-node operator may opt down to local.
+	PresenceDriver string
 }
 
 func Load() (Config, error) {
@@ -89,6 +95,10 @@ func Load() (Config, error) {
 	c.VAPIDPrivateKey = os.Getenv(brand.EnvPrefix + "VAPID_PRIVATE_KEY")
 	c.PushSubject = os.Getenv(brand.EnvPrefix + "PUSH_SUBJECT")
 	c.MetricsDriver = os.Getenv(brand.EnvPrefix + "METRICS_DRIVER")
+	c.PresenceDriver = os.Getenv(brand.EnvPrefix + "PRESENCE_DRIVER")
+	if c.PresenceDriver == "" {
+		c.PresenceDriver = "pg"
+	}
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("%sDATABASE_URL is required", brand.EnvPrefix)
 	}
