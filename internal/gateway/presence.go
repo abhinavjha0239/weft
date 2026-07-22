@@ -4,21 +4,26 @@ import (
 	"context"
 	"encoding/json"
 	"time"
+
+	"github.com/abhinavjha0239/weft/internal/platform/presence"
 )
 
-// Presence is DERIVED state, not stored state: a user is connected while they
-// have at least one live gateway connection in this process, and within that
-// they are "active" or "idle" (P-05) by how recently they last signalled.
-// Transitions broadcast presence.changed on the ephemeral plane (seq=0, never
-// event-logged) with state "active"|"idle"|"offline"; clients bootstrap from
-// the REST snapshot and then apply signals. Scope note (REALITY.md): the
-// registry is per gateway process — the single-node v1 slice; a shared
-// presence plane arrives with multi-node cells.
+// Presence is DERIVED state, not stored state: a user is "active" or "idle"
+// (P-05) while they hold at least one live gateway connection on ANY node — by
+// how recently they last signalled — and "offline" once their last connection
+// across ALL nodes drops. Each node keeps a per-process registry of its OWN
+// connections; transitions publish to the shared presence plane
+// (platform/presence, S5), and every node subscribes and fans presence.changed
+// on the ephemeral plane (seq=0, never event-logged — ADR-002 P5) to its own
+// connections. Clients bootstrap from the REST snapshot — now the org-WIDE view
+// read from the plane, not just this process — and then apply signals.
 
-// userPresence is a connected user's derived state: how many live connections
-// they hold, when they last signalled (any inbound frame or a fresh
-// connection), and whether they have been demoted to idle. Presence stays in
-// process memory — the UNLOGGED presence table is deliberately unused.
+// userPresence is a connected user's derived state ON THIS NODE: how many live
+// connections they hold here, when they last signalled (any inbound frame or a
+// fresh connection), and whether they have been demoted to idle. This per-node
+// registry is the liveness source for this node's own connections; the shared
+// presence plane aggregates it across the cell (the UNLOGGED presence table
+// backs the pg driver).
 type userPresence struct {
 	conns      int
 	lastActive time.Time
@@ -86,7 +91,7 @@ func (h *Hub) recordActivity(ctx context.Context, c *client) {
 	promoted := sh.markActiveLocked(c.id.UserID, time.Now())
 	sh.mu.Unlock()
 	if promoted {
-		h.broadcastPresence(ctx, c.id.OrgID, c.id.UserID, "active")
+		h.publishPresence(ctx, c.id.OrgID, c.id.UserID, "active")
 	}
 }
 
@@ -127,39 +132,87 @@ func (h *Hub) presenceSweep(ctx context.Context) {
 				sh.mu.Unlock()
 			}
 			for _, d := range demoted {
-				h.broadcastPresence(ctx, d.orgID, d.userID, "idle")
+				h.publishPresence(ctx, d.orgID, d.userID, "idle")
 			}
 		}
 	}
 }
 
-// broadcastPresence fans a presence transition to the whole org — presence is
-// member-visible metadata, never content.
+// publishPresence puts a derived-state transition on the shared plane instead
+// of fanning it directly: every node (this one included) then receives the
+// delta via Subscribe and fans it to ITS OWN local connections. This is what
+// makes presence correct across nodes — a transition on one node reaches
+// observers on every node, and PresenceSnapshot reads the org-wide store rather
+// than one process's memory.
+func (h *Hub) publishPresence(ctx context.Context, orgID, userID int64, state string) {
+	if err := h.plane.Publish(ctx, presence.Delta{OrgID: orgID, UserID: userID, State: state}); err != nil {
+		h.log.Warn("gateway: presence publish failed",
+			"org", orgID, "user", userID, "state", state, "err", err)
+	}
+}
+
+// onPresenceDelta is the single subscriber the hub registers on the plane
+// (Run): it fans one delta to THIS node's local connections. Cross-node
+// last-writer-wins: an "offline" delta means SOME node dropped a user's last
+// LOCAL connection, but a user with a live connection on ANY node is still
+// present — so if this node still holds a connection for the user, the offline
+// is premature and we re-publish our live state (which, arriving after the
+// offline, wins). Offline only sticks when NO node re-asserts, mirroring
+// presence.go's "offline at zero connections", now distributed across the cell.
+func (h *Hub) onPresenceDelta(ctx context.Context, d presence.Delta) {
+	if d.State == "offline" {
+		if state, ok := h.localState(d.OrgID, d.UserID); ok {
+			h.publishPresence(ctx, d.OrgID, d.UserID, state)
+			return
+		}
+	}
+	h.broadcastPresence(ctx, d.OrgID, d.UserID, d.State)
+}
+
+// localState reports a user's derived state on THIS node (active/idle) and
+// whether the node holds any live connection for them — the local-liveness
+// check behind onPresenceDelta's cross-node last-writer-wins rule.
+func (h *Hub) localState(orgID, userID int64) (string, bool) {
+	sh := h.shard(orgID)
+	if sh == nil {
+		return "", false
+	}
+	sh.mu.Lock()
+	defer sh.mu.Unlock()
+	p := sh.userConns[userID]
+	if p == nil {
+		return "", false
+	}
+	if p.idle {
+		return "idle", true
+	}
+	return "active", true
+}
+
+// broadcastPresence fans a presence transition to THIS node's org connections —
+// presence is member-visible metadata, never content. Called only from
+// onPresenceDelta, so every fan (local or from another node) flows through the
+// plane: the fan touches O(local conns) on this node, never the cell-wide set.
 func (h *Hub) broadcastPresence(ctx context.Context, orgID, userID int64, state string) {
 	payload, _ := json.Marshal(map[string]any{"user_id": userID, "state": state})
 	h.fanEphemeral(ctx, orgID, Envelope{Type: "presence.changed", OrgID: orgID, Payload: payload},
 		func(*client) bool { return true })
 }
 
-// PresenceSnapshot is the REST bootstrap: every connected user in the org
-// mapped to their current state ("active" or "idle"); offline users are
-// absent. Clients read it once, then apply presence.changed signals.
+// PresenceSnapshot is the REST bootstrap: every active/idle user in the ORG
+// mapped to their state (offline absent). Sourced from the shared plane, so it
+// is the org-WIDE view across every gateway node on the cell — not just the
+// users connected to this process. Clients read it once, then apply
+// presence.changed signals.
 func (h *Hub) PresenceSnapshot(orgID int64) map[int64]string {
-	sh := h.shard(orgID)
-	if sh == nil {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	snap, err := h.plane.Snapshot(ctx, orgID)
+	if err != nil {
+		h.log.Warn("gateway: presence snapshot failed", "org", orgID, "err", err)
 		return map[int64]string{}
 	}
-	sh.mu.Lock()
-	defer sh.mu.Unlock()
-	out := make(map[int64]string, len(sh.userConns))
-	for uid, p := range sh.userConns {
-		state := "active"
-		if p.idle {
-			state = "idle"
-		}
-		out[uid] = state
-	}
-	return out
+	return snap
 }
 
 // NotifyUser fans an ephemeral notification ping to one user's connections
