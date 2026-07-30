@@ -58,8 +58,11 @@ type UnreadMaintainer interface {
 // under today's settings, which is exactly what "replay = reset cursor"
 // means for this consumer.
 type Runner struct {
-	pool     *pgxpool.Pool
-	consumer *eventlog.Consumer
+	pool *pgxpool.Pool
+	// consumer is the event feed. It is the eventlog.Feed INTERFACE, not the
+	// xmin poller concretely, so SetSource can swap the delivery mechanism
+	// (S4) with no change to anything below this line.
+	consumer eventlog.Feed
 	fan      Fanout
 	log      *slog.Logger
 	// scanned counts channel members walked by the activity/follow candidate
@@ -73,6 +76,9 @@ type Runner struct {
 	// table). Optional (nil skips): the counter rides this consumer's
 	// per-message pass and its slow reconcile ticker.
 	unread UnreadMaintainer
+	// reg is remembered so SetSource and SetMetrics compose in either order:
+	// a feed swapped in after the registry was wired still publishes.
+	reg metrics.Registry
 }
 
 func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
@@ -92,8 +98,21 @@ func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
 // and consumer_lag are published too). Optional — default Nop. Call once before
 // Run/ProcessOrg.
 func (r *Runner) SetMetrics(reg metrics.Registry) {
+	r.reg = reg
 	r.scanned = reg.Counter(candidatesScannedMetric)
 	r.consumer.SetMetrics(reg)
+}
+
+// SetSource swaps the event-feed driver (S4). Optional — the default is the
+// xmin-gated poller this runner has always used. Call once at wiring; the
+// cursor name and batch size stay this package's business, so the swap cannot
+// silently rename a durable cursor.
+func (r *Runner) SetSource(src eventlog.Source) {
+	c := src.Consumer(consumerName, batchSize)
+	if r.reg != nil {
+		c.SetMetrics(r.reg)
+	}
+	r.consumer = c
 }
 
 // SetUnread wires the S6 unread-counter maintainer (messaging). Optional — a

@@ -2678,6 +2678,37 @@ own window.
 **Deferred (honest):** NATS/Kafka broker (`ADR-003 E1`); the no-dep
 per-org commit-fence fallback stays recorded in the dossier.
 
+**Spec corrections found in execution (read these before touching the
+feed again):**
+
+1. **The gate is LOSSY, not merely slow.** `txid` is stamped at a
+   transaction's FIRST write, the event id at APPEND, so a transaction
+   with the LOWER txid can hold the HIGHER id. When it commits first
+   the gate admits it, the cursor moves past a lower id still in
+   flight, and that event is never delivered — no error, no detectable
+   gap (F-2 violated). `TestLogicalFeedNoCommitOrderSkip` demonstrates
+   it against the shipped poller. S4 is a CORRECTNESS fix, not only a
+   latency fix; the entry above and `SCHEMA.md` said "the commit-order
+   race cannot skip events", which is only true of the common case.
+2. **The named red/green as written could not go red.** "Assert org
+   B's `consumer_lag` stays ~0" passes on BOTH drivers, because the
+   xmin `Lag` query carries the SAME global horizon as the xmin `Poll`
+   — during the stall it reports 0 while events pile up. The pin had to
+   be inverted: assert that org B's event is DELIVERED and that lag
+   SEES the backlog (1, then 0 after acking). The blind gauge is
+   itself an S0 finding, recorded in REALITY.
+3. **The gateway multicast reader cannot take this feed without a wire
+   change.** Its `seq` IS the event id and `deliverShared` skips
+   `r.id <= c.lastID`, so commit-order delivery would drop
+   out-of-order-committed events at the connection. Removing its gate
+   without commit-order delivery just trades the stall for more resume
+   gaps. Either is a `seq`-contract decision, so S4 left the gateway
+   alone; a follow-up slice owns it.
+4. **A slot is single-reader per cell.** Only one connection may hold
+   it, so with N app nodes exactly one streams the feed and the others'
+   consumers report `ErrFeedNotReady`. Useful as a crude takeover
+   lease, but it is a deployment fact the runbook now states.
+
 ---
 
 ### P-41 (S5) `gateway: Multi-node shared presence plane.` — M — no migration (wakes the dormant `presence` table) — **[x] shipped #120** (Opus-drafted, reviewer-completed after a watchdog stall; shared plane via the dormant table + LISTEN/NOTIFY, no dep; cross-node red/green-proven; node-crash staleness recorded as a follow-up)

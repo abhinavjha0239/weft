@@ -74,9 +74,29 @@ jobs:
       - run: go build ./...
       - run: go vet ./...
       - run: test -z "$(gofmt -l .)"
+      # The S4 logical-decoding feed needs wal_level=logical, which is a
+      # server start-up setting. Service containers take no `command:`, so
+      # set it and bounce the container. Without this the feed pins would
+      # SKIP; TEST_LOGICAL_DECODING below turns that skip into a failure, so
+      # a broken step can never quietly disable them.
+      - name: Enable logical WAL for the event-feed pins
+        env:
+          PG: ${{ job.services.postgres.id }}
+        run: |
+          set -e
+          docker exec "$PG" psql -U postgres -c "ALTER SYSTEM SET wal_level = logical"
+          docker restart "$PG"
+          for _ in $(seq 1 30); do
+            if docker exec "$PG" pg_isready -U postgres >/dev/null 2>&1; then break; fi
+            sleep 2
+          done
+          level=$(docker exec "$PG" psql -U postgres -Atc "SHOW wal_level")
+          echo "wal_level=$level"
+          test "$level" = "logical"
       - name: Integration tests (real Postgres)
         env:
           TEST_DATABASE_URL: postgres://postgres:test@localhost:55432/postgres
+          TEST_LOGICAL_DECODING: "1"
         # -p 1: test packages share one database and each resets the schema —
         # parallel packages would clobber each other.
         # Coverage is measured ACROSS packages (-coverpkg): the domain

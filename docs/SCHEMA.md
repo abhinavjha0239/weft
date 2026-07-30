@@ -62,7 +62,12 @@ protected-history floor evaluated as a plain column predicate (F-16b).
 Partitioned by id range: retention/compaction = partition drop (ADR-003 E6);
 the DEFAULT partition means inserts never fail if partition maintenance lags.
 `txid` gates consumers behind `pg_snapshot_xmin(pg_current_snapshot())` so the
-commit-order race cannot skip events. Payload holds structural deltas +
+common commit-order race cannot skip events — but NOT all of it: `txid` is
+stamped at a transaction's first write and the id at append, so a transaction
+holding a lower txid and a higher id can commit first and carry the cursor
+past a lower id still in flight (S4 found this; `TestLogicalFeedNoCommitOrderSkip`
+demonstrates it against this driver). The logical-decoding feed removes the
+class outright — WAL order is commit order. Payload holds structural deltas +
 revision references + content hash — never the only copy of content — which is
 what makes GDPR erasure a revision-row delete (`scrub` cascade) instead of a
 log rewrite, and keeps hash-chains valid across purges.
@@ -129,10 +134,17 @@ Postgres serves the small case, org-hash sharding inside a cell is the
 intermediate step, cells are the endgame. Known accepted-for-now items, each
 with its scale-tier replacement designed:
 
-- **xmin gate is DB-global** (`eventlog.Consumer`): one long transaction
-  anywhere stalls all delivery. Contract: short write transactions +
-  `idle_in_transaction_session_timeout` + analytics on replicas. Scale tier:
-  logical-decoding feed (WAL order = commit order) behind the same interface.
+- **xmin gate is DB-global** (`eventlog.Consumer`, still the DEFAULT driver):
+  one long transaction anywhere stalls all delivery, and because `txid` is
+  stamped at a transaction's first write while the event id is stamped at
+  append, a lower-txid/higher-id transaction committing first lets the cursor
+  pass a lower id that is still in flight — that event is then skipped
+  forever. Contract for this driver: short write transactions +
+  `idle_in_transaction_session_timeout` + analytics on replicas. Scale tier —
+  BUILT (S4), opt-in: the logical-decoding feed (WAL order = commit order, no
+  gate, no crossing) behind the same `eventlog.Feed` interface,
+  `WEFT_EVENT_FEED_DRIVER=logical` plus the operator's slot + publication
+  (docs/ARCHITECTURE.md §6.1 runbook).
 - **Per-org consumption** must be NOTIFY-scheduled at runtime — idle orgs
   cost zero; a dispatcher polls only signaled orgs. Never one loop per org.
 - ~~**NOTIFY per append**~~ — DONE (S4): the wake is coalesced per
