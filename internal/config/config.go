@@ -62,6 +62,18 @@ type Config struct {
 	// no cross-node view, no presence DB writes). The multi-node target wants
 	// pg; a single-node operator may opt down to local.
 	PresenceDriver string
+	// Event-feed seam (S4): "xmin" (default) is the polling consumer gated on
+	// pg_snapshot_xmin — no replication slot, nothing for a small install or CI
+	// to configure, but the gate is DATABASE-GLOBAL (one long write transaction
+	// anywhere stalls delivery for every org, and the txid/id crossing can skip
+	// an event). "logical" is the logical-decoding feed: WAL order is commit
+	// order, so there is no gate. It requires wal_level=logical plus a
+	// replication slot and publication the OPERATOR creates (see the
+	// docs/ARCHITECTURE.md runbook) — a slot RETAINS WAL, so enabling the feed
+	// is a deliberate deployment decision with a disk cost.
+	EventFeedDriver      string
+	EventFeedSlot        string
+	EventFeedPublication string
 }
 
 func Load() (Config, error) {
@@ -99,6 +111,9 @@ func Load() (Config, error) {
 	if c.PresenceDriver == "" {
 		c.PresenceDriver = "pg"
 	}
+	c.EventFeedDriver = os.Getenv(brand.EnvPrefix + "EVENT_FEED_DRIVER")
+	c.EventFeedSlot = os.Getenv(brand.EnvPrefix + "EVENT_FEED_SLOT")
+	c.EventFeedPublication = os.Getenv(brand.EnvPrefix + "EVENT_FEED_PUBLICATION")
 	if c.DatabaseURL == "" {
 		return c, fmt.Errorf("%sDATABASE_URL is required", brand.EnvPrefix)
 	}

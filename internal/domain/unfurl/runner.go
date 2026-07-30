@@ -28,10 +28,18 @@ const (
 // consumer (the M0 Consumer pattern) on message.created. Fetches happen
 // ONLY here — the send path never waits on a remote page.
 type Runner struct {
-	pool     *pgxpool.Pool
-	svc      *Service
-	consumer *eventlog.Consumer
+	pool *pgxpool.Pool
+	svc  *Service
+	// consumer is the eventlog.Feed interface, not the xmin poller concretely,
+	// so SetSource can swap the delivery mechanism (S4) transparently.
+	consumer eventlog.Feed
 	log      *slog.Logger
+}
+
+// SetSource swaps the event-feed driver (S4). Optional — the default is the
+// xmin-gated poller. Call once at wiring.
+func (r *Runner) SetSource(src eventlog.Source) {
+	r.consumer = src.Consumer(consumerName, batchSize)
 }
 
 func NewRunner(pool *pgxpool.Pool, svc *Service, log *slog.Logger) *Runner {

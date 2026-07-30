@@ -59,8 +59,10 @@ const (
 // requires their explicit allow_rule_trigger opt-in; and cascades stop at
 // maxChainDepth with a visible throttled run.
 type Runner struct {
-	pool     *pgxpool.Pool
-	consumer *eventlog.Consumer
+	pool *pgxpool.Pool
+	// consumer is the eventlog.Feed interface, not the xmin poller concretely,
+	// so SetSource can swap the delivery mechanism (S4) transparently.
+	consumer eventlog.Feed
 	msg      *messaging.Service
 	perms    *perms.Service
 	notif    *notification.Service
@@ -81,6 +83,12 @@ func NewRunner(pool *pgxpool.Pool, msg *messaging.Service, p *perms.Service, not
 		notif:    notif,
 		log:      log,
 	}
+}
+
+// SetSource swaps the event-feed driver (S4). Optional — the default is the
+// xmin-gated poller. Call once at wiring.
+func (r *Runner) SetSource(src eventlog.Source) {
+	r.consumer = src.Consumer(consumerName, batchSize)
 }
 
 // SetEgress wires the SSRF-guarded egress client used by the delivery lane

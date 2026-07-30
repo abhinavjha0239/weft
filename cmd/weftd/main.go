@@ -29,6 +29,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/unfurl"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
@@ -181,6 +182,19 @@ func serve(ctx context.Context, cfg config.Config) error {
 	if err != nil {
 		return err
 	}
+	// Event-feed seam (S4): config-picked driver, the xmin poller by default.
+	// The logical driver needs an operator-created slot + publication, so an
+	// unknown or unprovisioned choice fails LOUDLY here rather than quietly
+	// degrading a cell to the gated poller.
+	feed, err := eventlog.Open(cfg.EventFeedDriver, pool, log, eventlog.LogicalOptions{
+		Slot:        cfg.EventFeedSlot,
+		Publication: cfg.EventFeedPublication,
+	})
+	if err != nil {
+		return err
+	}
+	feed.SetMetrics(reg)
+	go feed.Run(ctx)
 	hub := gateway.NewHub(pool, log)
 	hub.SetMetrics(reg)
 	// Presence plane seam (S5): the pg driver (default) shares presence across
@@ -194,6 +208,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go hub.Run(ctx)
 	notifRunner := notification.NewRunner(pool, hub, log)
 	notifRunner.SetMetrics(reg)
+	notifRunner.SetSource(feed)
 	go notifRunner.Run(ctx)
 	sender, err := mail.Open(cfg.MailDriver, cfg.SMTPAddr, cfg.SMTPFrom,
 		cfg.SMTPUser, cfg.SMTPPass, log)
@@ -254,6 +269,7 @@ func serve(ctx context.Context, cfg config.Config) error {
 	autoSvc := automation.New(pool, permsSvc)
 	autoSvc.SetMessaging(msgSvc) // the slash-command channel-send gate
 	autoRunner := automation.NewRunner(pool, msgSvc, permsSvc, notifSvc, log)
+	autoRunner.SetSource(feed)
 	// P-24: the delivery lane's outbound webhook calls ride the SSRF-guarded
 	// egress client — the ONLY path an http_request step may dial. No test
 	// options here (production wiring never allows loopback).
@@ -280,7 +296,9 @@ func serve(ctx context.Context, cfg config.Config) error {
 	if u, err := url.Parse(cfg.BaseURL); err == nil {
 		unfurlSvc.SetBaseHost(u.Host)
 	}
-	go unfurl.NewRunner(pool, unfurlSvc, log).Run(ctx)
+	unfurlRunner := unfurl.NewRunner(pool, unfurlSvc, log)
+	unfurlRunner.SetSource(feed)
+	go unfurlRunner.Run(ctx)
 	apiHandler := rest.Handler(ctx, rest.Deps{
 		Pool: pool, Hub: hub, Log: log,
 		Identity:      identitySvc,

@@ -105,6 +105,83 @@ middleware); one Prometheus registry (`/metrics`): HTTP latency/status,
 gateway connections + queue depth, consumer lag per (consumer, org) — lag is
 THE health signal of the whole design. pprof behind a debug flag.
 
+### 6.1 Runbook — the logical-decoding event feed (S4)
+
+The event feed is a seam with two drivers, picked by
+`WEFT_EVENT_FEED_DRIVER`:
+
+- **`xmin` (default).** The polling consumer gated on
+  `pg_snapshot_xmin(pg_current_snapshot())`. Nothing to provision — a small
+  install and CI need no replication slot. The gate is DATABASE-GLOBAL: one
+  long write transaction anywhere stalls delivery for every org, and the
+  txid/id crossing described in `internal/eventlog/logical.go` can drop an
+  event undetectably.
+- **`logical`.** A logical-decoding reader. WAL order is commit order, so
+  there is no gate and no crossing. It costs a replication slot, which
+  **retains WAL** — the operator obligations below are not optional.
+
+**Enable (operator steps, in order).**
+
+1. Start Postgres with `wal_level = logical` (needs a restart) and leave
+   room in `max_replication_slots` / `max_wal_senders`.
+2. Create the publication and the slot ONCE per cell. This is deliberately
+   not a migration: migrations run on every install, including the ones
+   that never enable the feed, and a slot silently pinning WAL is not an
+   acceptable side effect of `migrate`.
+
+   ```sql
+   CREATE PUBLICATION eventlog_pub FOR TABLE event_log
+       WITH (publish_via_partition_root = true);
+   SELECT pg_create_logical_replication_slot('eventlog_feed', 'pgoutput');
+   ```
+
+   (`eventlog.ProvisionLogical` performs exactly these two statements for
+   an operator tool; `weftd serve` never calls it. Names are overridable
+   with `WEFT_EVENT_FEED_SLOT` / `WEFT_EVENT_FEED_PUBLICATION`.)
+3. Set `WEFT_EVENT_FEED_DRIVER=logical` and restart. A missing slot fails
+   the reader loudly with the SQL above; it never degrades silently back to
+   the poller.
+
+**Single reader per cell.** A replication slot allows ONE active
+connection, so exactly one process streams the feed. Other nodes retry and
+their consumers report `ErrFeedNotReady` until they win the slot, which
+makes the slot a crude but real takeover lease. Plan the feed onto one
+node, or accept that consumers only run wherever the slot is held.
+
+**Watch.** `eventlog_slot_lag_bytes{slot}` is the disk-fill risk in bytes:
+the WAL the slot is retaining because some consumer has not acked. Alarm
+well below free disk (a few GB on a small cell). `consumer_lag{consumer,
+org}` shows WHICH consumer is behind, and
+`eventlog_feed_evicted_total{org}` fires when a consumer fell further
+behind than the in-memory commit-order window and its `Poll` starts
+returning `ErrCursorTooOld`.
+
+**Stuck slot — drop and resync.** A consumer that dies (or a node that is
+never coming back holding the slot) makes `eventlog_slot_lag_bytes` climb
+without bound. The remedy, in order of preference:
+
+1. Fix or restart the consumer; the slot advances on its own.
+2. If it cannot be recovered, DROP AND RESYNC — trade replay for disk:
+
+   ```sql
+   -- 1. stop the feed process (or set the driver back to xmin and restart)
+   SELECT pg_drop_replication_slot('eventlog_feed');   -- frees the WAL now
+   -- 2. reset the stuck consumer so it replays from scratch
+   UPDATE event_consumer_cursor SET last_id = 0, lsn = NULL
+    WHERE consumer = '<name>';
+   -- 3. recreate the slot (step 2 of Enable) and start the feed again
+   ```
+
+   Resetting the cursor is the supported replay path (ADR-003 E2): a NULL
+   `lsn` sends the consumer through the bootstrap lane, which walks the
+   table in id order and then splices back onto the live feed. Consumers
+   are idempotent (the outbox rule), so replay is safe — it re-does work,
+   it does not double-apply it.
+
+**Roll back** at any time by setting `WEFT_EVENT_FEED_DRIVER=xmin` and
+dropping the slot: cursors keep their `last_id`, which is all the xmin
+driver reads.
+
 ## 7. Testing strategy (established, now written)
 
 Integration-first against real Postgres (`TEST_DATABASE_URL`, CI service,

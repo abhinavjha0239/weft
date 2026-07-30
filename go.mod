@@ -10,6 +10,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.105.0
 	github.com/coder/websocket v1.8.15
 	github.com/coreos/go-oidc/v3 v3.20.0
+	github.com/jackc/pglogrepl v0.0.0-20260401131349-e37c41485510
 	github.com/jackc/pgx/v5 v5.10.0
 	github.com/yuin/goldmark v1.8.2
 	golang.org/x/crypto v0.54.0
@@ -36,6 +37,7 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sts v1.44.0 // indirect
 	github.com/aws/smithy-go v1.27.3 // indirect
 	github.com/go-jose/go-jose/v4 v4.1.4 // indirect
+	github.com/jackc/pgio v1.0.0 // indirect
 	github.com/jackc/pgpassfile v1.0.0 // indirect
 	github.com/jackc/pgservicefile v0.0.0-20240606120523-5a60cdf6a761 // indirect
 	github.com/jackc/puddle/v2 v2.2.2 // indirect

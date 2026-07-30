@@ -69,8 +69,15 @@ is correct and stable under concurrency with zero errors.
   the current ceiling (send-only throughput matched fan-out throughput), but at
   high fan-out the dispatcher should query once per org and fan rows to that
   org's connections in memory.
-- **Event-log consumer via logical decoding** at the tier where the DB-global
-  xmin gate on polling consumers bites (SCHEMA.md scale contract).
+- ~~**Event-log consumer via logical decoding**~~ — BUILT (S4), opt-in behind
+  the `eventlog.Feed` seam: `WEFT_EVENT_FEED_DRIVER=logical` streams a
+  replication slot so WAL order (= commit order) drives delivery and the
+  DB-global xmin gate disappears. The poller stays the default (no slot, no
+  `wal_level=logical`); the slot's WAL-retention risk has metrics and a
+  drop-and-resync runbook (ARCHITECTURE.md §6.1). Measured on the pins, not
+  the rig: with a long write transaction open in org A, an unrelated org B
+  sends and consumes with lag 0 under the logical feed and is stalled to 0
+  rows under the poller.
 
 ## How to run a real capacity benchmark
 

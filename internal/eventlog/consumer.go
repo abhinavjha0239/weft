@@ -23,9 +23,17 @@ import (
 // SCALE CONTRACT (docs/SCHEMA.md "Scale contract"):
 //   - The xmin gate is DATABASE-GLOBAL: one long-running transaction anywhere
 //     stalls delivery for every org. Writers run with short transactions and
-//     idle_in_transaction_session_timeout; analytics belong on replicas. The
-//     scale-tier replacement (same Consumer interface) is a logical-decoding
-//     feed, where WAL order = commit order and no gate is needed.
+//     idle_in_transaction_session_timeout; analytics belong on replicas.
+//   - The gate does NOT close the whole skip class. txid is stamped at a
+//     transaction's FIRST write, the id at APPEND, so a transaction with the
+//     LOWER txid can hold the HIGHER id; when it commits first the gate admits
+//     it, the cursor passes a lower id still in flight, and that event is
+//     never delivered (TestLogicalFeedNoCommitOrderSkip demonstrates it).
+//   - Both are why the logical-decoding feed exists (S4, logical.go): WAL
+//     order = commit order, so no gate is needed and the crossing cannot
+//     happen. It is a driver behind the same Feed interface
+//     (WEFT_EVENT_FEED_DRIVER=logical); this poller stays the DEFAULT, so a
+//     small install needs no replication slot.
 //   - Poll is per-org because the org is the ordering domain — but the
 //     RUNTIME must be NOTIFY-driven: a dispatcher LISTENs and schedules polls
 //     only for orgs with pending signals (plus a slow sweep). Idle orgs cost
