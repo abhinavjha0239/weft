@@ -43,7 +43,15 @@ type Event struct {
 	EntityID    int64
 	Verb        string
 	Payload     json.RawMessage
-	Hint        json.RawMessage
+	// Hint is the reserved consumer side-channel (ADR-002 P1): delivery
+	// advice, never domain truth. Its only reader today is the notification
+	// materializer's F-17b batch stamp — {"batch_id": N} folds one bulk
+	// operation's N item events into ONE digest row per recipient. Mint it
+	// with notification.BatchHintForEvent and nothing else: the batch dedupe
+	// key is UNIQUE FOREVER with no time component, so stamping a stable
+	// entity id (a rule id, a sprint id) delivers the first sweep and then
+	// permanently suppresses that (user, kind) pair, silently.
+	Hint json.RawMessage
 	// OccurredAt is domain time; importers backdate it (ADR-003 E3).
 	// Zero value means now().
 	OccurredAt time.Time
