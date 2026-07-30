@@ -29,18 +29,27 @@
 -- make idleness observable would trade an hourly cost for a per-message
 -- cost and defeat the entire point.
 --
--- HONEST LIMIT, recorded rather than papered over: the signal sees only
--- drift whose cause APPENDS AN EVENT. Writes that append none — a channel
+-- settled_at is the LEASE, not decoration. The activity signal sees only
+-- drift whose cause APPENDS AN EVENT, and some writes append none: a channel
 -- level change, a thread follow toggle, an alert-word edit (deliverability),
--- and the concurrent first-ever mark-read window (unread counters) — can
--- introduce drift into an ALREADY-settled org, and that drift is then
--- repaired on the org's next pass WITH ACTIVITY rather than within the hour.
--- The exposure is bounded: both caches only ever mis-serve MESSAGES, and the
--- first message is itself the event that unsettles the org. No free signal
--- for those writes exists (channel_member carries no updated_at, alert_word
--- no timestamp at all), and touching a shared per-org row on every settings
--- write would buy an hour of latency with permanent write contention — the
--- trade the scale contract rejects.
+-- and the concurrent first-ever mark-read window (unread counters). Drift
+-- entering an ALREADY-settled org through one of those would otherwise wait
+-- for that org's next activity — which, for an org that goes quiet, means
+-- forever. So a marker older than eventlog.SettleTTL (a day) stops
+-- suppressing work and the org is swept regardless of activity. What this
+-- table buys is therefore statable in TIME, not in window counts:
+--
+--     an idle org costs nothing for up to SettleTTL, and EVERY org is fully
+--     verified at least once per SettleTTL no matter what it did.
+--
+-- No free signal for those writes exists (channel_member carries no
+-- updated_at, alert_word no timestamp at all), and touching a shared per-org
+-- row on every settings write would buy an hour of latency with permanent
+-- write contention — the trade the scale contract rejects. Recorded cost of
+-- the expiry: orgs that settle in the same window expire in the same window,
+-- so a fleet deployed at once pays one old-style full pass per SettleTTL as a
+-- cohort; spreading expiry with a per-org offset is the one-line upgrade if
+-- that ever matters.
 --
 -- Cell-safe: one row per (sweep, org), org-pinned like everything else. No
 -- cross-org state is introduced.

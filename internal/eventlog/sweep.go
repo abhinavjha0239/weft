@@ -3,6 +3,7 @@ package eventlog
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 )
@@ -114,6 +115,26 @@ func (s *Sweeper) Claim(ctx context.Context) (release func(), ok bool, err error
 	}, true, nil
 }
 
+// SettleTTL bounds how long a settled marker may suppress work: once an org's
+// settle is older than this, the next pass walks it regardless of activity.
+// The guarantee a sweep can therefore state in TIME rather than in window
+// counts is
+//
+//	an idle org costs nothing for up to SettleTTL, and EVERY org is fully
+//	verified at least once per SettleTTL no matter what it did.
+//
+// It exists because the activity signal is the event log, and not every write
+// that can move a maintained cache appends an event: the settings legs of the
+// deliverability set (channel level, thread follow, alert words) and the
+// concurrent first-ever mark-read window (#118 drift 2) append none. Without
+// an expiry, drift that entered an already-settled org through one of those
+// and then went quiet would sit there INDEFINITELY, which is not a word this
+// ledger may contain when the fix is one predicate. A day is the trade: at
+// the hourly cadence it leaves ~23 of every 24 windows free for an idle org
+// while holding worst-case repair latency to one day instead of "until
+// somebody posts".
+const SettleTTL = 24 * time.Hour
+
 // OrgPass is one org's pass-start snapshot: everything a sweep needs to
 // decide whether to walk the org at all, and what to record if the walk comes
 // back clean.
@@ -126,7 +147,9 @@ type OrgPass struct {
 	// the next window redundant, never blind.
 	HighWater int64
 	// Settled is true when a previous pass verified this org clean at exactly
-	// HighWater — nothing has happened in the org since. The sweep skips it.
+	// HighWater, RECENTLY ENOUGH (within SettleTTL) — nothing has happened in
+	// the org since, and the forced-verification deadline has not arrived. The
+	// sweep skips it.
 	Settled bool
 	// Lagging is true when the maintenance consumer has not reached
 	// HighWater. The pass should still repair, but must not settle: the
@@ -139,12 +162,20 @@ type OrgPass struct {
 // event_log_org_consume_idx (org_id, id), the cursor and the settled marker
 // are PK reads. Nothing here is a new write on any path; the activity signal
 // is state the system already maintains.
+//
+// The staleness term is what turns a settled marker from a permanent excuse
+// into a lease: a marker older than SettleTTL stops suppressing work, so a
+// full verification happens at least that often for EVERY org. Age is
+// measured in DATABASE time on both sides (settled_at is written with now()),
+// so no node's clock can extend another node's lease.
 func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT o.id,
 		       COALESCE(h.high, 0),
-		       (st.settled_event_id IS NOT NULL
-		        AND st.settled_event_id = COALESCE(h.high, 0)),
+		       COALESCE(st.settled_event_id IS NOT NULL
+		                AND st.settled_event_id = COALESCE(h.high, 0)
+		                AND st.settled_at > now() - make_interval(
+		                        secs => $3::double precision), false),
 		       COALESCE(c.last_id, 0) < COALESCE(h.high, 0)
 		FROM org o
 		LEFT JOIN LATERAL (
@@ -152,7 +183,7 @@ func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 		) h ON true
 		LEFT JOIN sweep_org_state st ON st.sweep = $1 AND st.org_id = o.id
 		LEFT JOIN event_consumer_cursor c ON c.consumer = $2 AND c.org_id = o.id
-		ORDER BY o.id`, s.id.Name, s.id.Consumer)
+		ORDER BY o.id`, s.id.Name, s.id.Consumer, SettleTTL.Seconds())
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: sweep %s orgs: %w", s.id.Name, err)
 	}
@@ -177,6 +208,10 @@ func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 // a pass that repaired or errored: an org that needed repair is precisely the
 // org whose next window must look again, and skipping repair of drift that
 // already exists is the one thing this marker must never cause.
+//
+// settled_at is stamped with DATABASE now() and is what SettleTTL ages, so
+// every settle also renews the org's lease: an org that keeps coming back
+// clean keeps being skipped, but never for longer than SettleTTL at a time.
 func (s *Sweeper) Settle(ctx context.Context, orgID, highWater int64) error {
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO sweep_org_state (sweep, org_id, settled_event_id, settled_at)

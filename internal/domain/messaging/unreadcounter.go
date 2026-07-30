@@ -279,11 +279,13 @@ var UnreadCounterSweep = eventlog.SweepID{
 // equals the mark a previous pass recorded after verifying it CLEAN, so drift
 // is never what gets skipped: a pass that repaired anything, hit any error,
 // or ran ahead of the consumer whose increments it is checking refuses to
-// settle, and the org is walked again next window. sweep_org_state (0025)
-// carries the full argument, including the one drift class this signal cannot
-// see (a write that appends no event — for this counter, the concurrent
-// first-ever mark-read window, which is repaired on the org's next active
-// pass rather than the next hour).
+// settle, and the org is walked again next window. The skip is a LEASE, never
+// a permanent excuse: a settled marker older than eventlog.SettleTTL stops
+// suppressing work, so every org is fully verified at least once per
+// SettleTTL however quiet it is. That deadline is what bounds this counter's
+// one eventless drift class — the concurrent first-ever mark-read window
+// (#118 drift 2), which appends nothing and could otherwise sit in a quiet
+// org forever. sweep_org_state (0025) carries the whole argument.
 func (s *Service) ReconcileUnreadOnce(ctx context.Context) error {
 	release, ok, err := s.unreadSweep.Claim(ctx)
 	if err != nil || !ok {

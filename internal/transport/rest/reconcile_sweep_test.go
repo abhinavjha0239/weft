@@ -411,4 +411,45 @@ func TestReconcileIdleOrgSkip(t *testing.T) {
 		t.Fatalf("counter after the reactivating send = %d, want %d", u, f.sent)
 	}
 	assertLiveEquals(t, ctx, pool, f.bobID, f.channelID, f.sent)
+
+	// (6) The settled marker is a LEASE, not a permanent excuse. Some writes
+	// that can move these caches append NO event — the deliverability settings
+	// legs, and the concurrent first-ever mark-read window (#118 drift 2) — so
+	// drift can enter an already-settled org invisibly. Within the lease that
+	// drift survives (asserted first, because it is the rung being bought and
+	// it makes the expiry pin non-vacuous); once the settle is older than
+	// eventlog.SettleTTL, the org is swept regardless of activity and repaired.
+	// Time travel is a backdated settle row, never a sleep.
+	f.seedDrift(t, ctx, 99)
+	sweepBoth(t, f.msg, f.deliv)
+	if u, _ := counterRow(t, ctx, pool, f.bobID, f.channelID); u != 99 {
+		t.Fatalf("eventless drift inside the lease was repaired (counter = %d, want the "+
+			"seeded 99); the idle skip is not actually skipping", u)
+	}
+	if _, err := pool.Exec(ctx, `
+		UPDATE sweep_org_state
+		SET settled_at = now() - make_interval(secs => $2::double precision)
+		WHERE org_id = $1`, f.orgID, (eventlog.SettleTTL + time.Hour).Seconds()); err != nil {
+		t.Fatalf("backdate settle: %v", err)
+	}
+	sweepBoth(t, f.msg, f.deliv)
+	if u, _ := counterRow(t, ctx, pool, f.bobID, f.channelID); u != f.sent {
+		t.Fatalf("counter = %d past the SettleTTL deadline, want %d; an expired settle "+
+			"must force a full verification whatever the org did", u, f.sent)
+	}
+	assertLiveEquals(t, ctx, pool, f.bobID, f.channelID, f.sent)
+	if n := f.setRows(t, ctx); n != 1 {
+		t.Fatalf("%d set rows past the SettleTTL deadline, want 1; an expired settle "+
+			"must force a full verification whatever the org did", n)
+	}
+	// The forced pass came back clean, so it renews the lease rather than
+	// leaving the org permanently unsettled.
+	nowHigh := orgHighWater(t, ctx, pool, f.orgID)
+	for _, sweep := range []string{messaging.UnreadCounterSweep.Name, notification.DeliverabilitySweep.Name} {
+		got, ok := settledMark(t, ctx, pool, sweep, f.orgID)
+		if !ok || got != nowHigh {
+			t.Fatalf("%s marker = %d (present=%v) after the forced pass, want %d "+
+				"(a clean forced pass renews the lease)", sweep, got, ok, nowHigh)
+		}
+	}
 }

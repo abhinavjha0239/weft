@@ -271,9 +271,13 @@ func (d *Deliverability) ReconcileChannel(ctx context.Context, orgID, channelID 
 // mark still equals the mark a previous pass recorded after verifying it
 // CLEAN — so drift is never what gets skipped: a pass that repaired anything,
 // hit any error, or ran ahead of the maintenance consumer refuses to settle,
-// and the org is walked again next window. See sweep_org_state (0025) for the
-// full argument and for the one class this signal cannot see (a settings
-// write that appends no event).
+// and the org is walked again next window. The skip is a LEASE, never a
+// permanent excuse: a settled marker older than eventlog.SettleTTL stops
+// suppressing work, so every org is fully verified at least once per
+// SettleTTL however quiet it is. That deadline is what bounds the drift this
+// signal cannot see — the settings legs of this set (channel level, thread
+// follow, alert words) append no event. See sweep_org_state (0025) for the
+// whole argument.
 func (d *Deliverability) ReconcileOnce(ctx context.Context) error {
 	release, ok, err := d.sweep.Claim(ctx)
 	if err != nil || !ok {

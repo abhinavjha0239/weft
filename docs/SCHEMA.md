@@ -155,7 +155,13 @@ with its scale-tier replacement designed:
   the xmin gate above) and skip any org whose event-log high-water mark has
   not moved since a pass that verified it CLEAN (`sweep_org_state`, 0025).
   A pass that repaired anything, errored, or ran ahead of its consumer does
-  not settle, so drift is never what gets skipped.
+  not settle, so drift is never what gets skipped. The settle is a LEASE: it
+  stops suppressing work after `eventlog.SettleTTL` (24h), which is what
+  bounds the drift classes the event log cannot see (writes that append no
+  event — channel level, thread follow, alert words, the concurrent
+  first-ever mark-read). The rung, stated in time: an idle org costs nothing
+  for up to 24h, and EVERY org is fully verified at least once per 24h
+  regardless of activity.
 - ~~**NOTIFY per append**~~ — DONE (S4): the wake is coalesced per
   (transaction, org) by `event_log_wake` (0024) and folded into `Append`'s
   `RETURNING`, so a transaction appending N events costs N statements and at
