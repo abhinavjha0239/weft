@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -229,4 +230,185 @@ func TestReconcileSweepClaim(t *testing.T) {
 	if n := f.setRows(t, ctx); n != 1 {
 		t.Fatalf("after the claim was released, bob holds %d set rows, want 1", n)
 	}
+}
+
+// orgHighWater is the org's event-log high-water mark, computed HERE so the
+// settled-marker assertions never read their expectation out of the code
+// under test.
+func orgHighWater(t *testing.T, ctx context.Context, pool *pgxpool.Pool, orgID int64) int64 {
+	t.Helper()
+	var high int64
+	if err := pool.QueryRow(ctx,
+		`SELECT COALESCE(max(id), 0) FROM event_log WHERE org_id = $1`, orgID).Scan(&high); err != nil {
+		t.Fatalf("high-water: %v", err)
+	}
+	return high
+}
+
+// settledMark reports a sweep's settled marker for an org: the recorded event
+// id and whether one exists at all (a missing row and a NULL both mean "never
+// verified clean").
+func settledMark(t *testing.T, ctx context.Context, pool *pgxpool.Pool, sweep string, orgID int64) (int64, bool) {
+	t.Helper()
+	var id *int64
+	err := pool.QueryRow(ctx,
+		`SELECT settled_event_id FROM sweep_org_state WHERE sweep = $1 AND org_id = $2`,
+		sweep, orgID).Scan(&id)
+	if err != nil || id == nil {
+		return 0, false
+	}
+	return *id, true
+}
+
+// countQueries counts captured statements containing marker — the per-item
+// work a skipped org must not pay for.
+func countQueries(cap *sqlCapture, marker string) int {
+	cap.mu.Lock()
+	defer cap.mu.Unlock()
+	n := 0
+	for _, q := range cap.queries {
+		if strings.Contains(q.sql, marker) {
+			n++
+		}
+	}
+	return n
+}
+
+// TestReconcileIdleOrgSkip pins the idle-org skip on both hourly sweeps, and
+// the correctness edge that makes it safe.
+//
+// The trap first: an org that went idle WHILE CARRYING DRIFT must still get
+// its repairing pass, and must keep getting one until a pass comes back
+// clean. That is why only a pass that repaired NOTHING may settle an org —
+// a repair means an invalidation/maintenance bug just fired, which is the
+// last moment to stop looking. Seeding drift twice with no events in between
+// is exactly the shape a naive "I swept it, mark it settled" would lose.
+//
+// Then the payoff, measured rather than timed: once an org IS verified clean
+// and nothing has happened since, a whole sweep pass issues ZERO statements
+// against the swept tables — and the same traced sweep issues them again as
+// soon as one message moves the org's event-log high-water mark, so the zero
+// is a skip and not a broken sweep.
+func TestReconcileIdleOrgSkip(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+	f := newSweepFixture(t, ctx, pool, "swi")
+
+	sweepBoth := func(t *testing.T, msg *messaging.Service, deliv *notification.Deliverability) {
+		t.Helper()
+		if err := msg.ReconcileUnreadOnce(ctx); err != nil {
+			t.Fatalf("unread sweep: %v", err)
+		}
+		if err := deliv.ReconcileOnce(ctx); err != nil {
+			t.Fatalf("deliverability sweep: %v", err)
+		}
+	}
+	high := orgHighWater(t, ctx, pool, f.orgID)
+	if high == 0 {
+		t.Fatal("fixture org has no events; the activity signal would be meaningless")
+	}
+
+	// (1) The org has never been verified, and it carries drift. The pass
+	// must repair — and must NOT settle, because it repaired.
+	f.seedDrift(t, ctx, 4242)
+	sweepBoth(t, f.msg, f.deliv)
+	if u, _ := counterRow(t, ctx, pool, f.bobID, f.channelID); u != f.sent {
+		t.Fatalf("first pass left counter = %d, want %d", u, f.sent)
+	}
+	if n := f.setRows(t, ctx); n != 1 {
+		t.Fatalf("first pass left %d set rows, want 1", n)
+	}
+	for _, sweep := range []string{messaging.UnreadCounterSweep.Name, notification.DeliverabilitySweep.Name} {
+		if got, ok := settledMark(t, ctx, pool, sweep, f.orgID); ok {
+			t.Fatalf("%s settled the org at %d after a pass that REPAIRED; a repaired "+
+				"org is exactly the one whose next window must look again", sweep, got)
+		}
+	}
+
+	// (2) The trap: drift seeded again with NO events in between, so the org
+	// is idle by any activity measure. It must still be repaired.
+	f.seedDrift(t, ctx, 777)
+	if now := orgHighWater(t, ctx, pool, f.orgID); now != high {
+		t.Fatalf("org high-water moved to %d (was %d); the trap needs an IDLE org", now, high)
+	}
+	sweepBoth(t, f.msg, f.deliv)
+	if u, _ := counterRow(t, ctx, pool, f.bobID, f.channelID); u != f.sent {
+		t.Fatalf("idle org carrying drift was skipped: counter = %d, want %d "+
+			"(the seeded divergence survived the sweep)", u, f.sent)
+	}
+	assertLiveEquals(t, ctx, pool, f.bobID, f.channelID, f.sent)
+	if n := f.setRows(t, ctx); n != 1 {
+		t.Fatalf("idle org carrying drift was skipped: %d set rows, want 1 "+
+			"(the seeded divergence survived the sweep)", n)
+	}
+
+	// (3) Clean and idle at last: this pass verifies and settles at the org's
+	// own high-water mark, computed independently above.
+	sweepBoth(t, f.msg, f.deliv)
+	for _, sweep := range []string{messaging.UnreadCounterSweep.Name, notification.DeliverabilitySweep.Name} {
+		got, ok := settledMark(t, ctx, pool, sweep, f.orgID)
+		if !ok || got != high {
+			t.Fatalf("%s settled marker = %d (present=%v), want %d", sweep, got, ok, high)
+		}
+	}
+
+	// (4) Measured skip: a full pass over a settled, idle org touches NEITHER
+	// swept table. The tracer captures the ACTUAL statements the sweeps issue,
+	// so this counts real work, not a self-reported number.
+	cap := &sqlCapture{}
+	tcfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		t.Fatalf("trace cfg: %v", err)
+	}
+	tcfg.ConnConfig.Tracer = cap
+	tracedPool, err := pgxpool.NewWithConfig(ctx, tcfg)
+	if err != nil {
+		t.Fatalf("trace pool: %v", err)
+	}
+	defer tracedPool.Close()
+	tracedMsg := messaging.New(tracedPool, perms.New(tracedPool))
+	tracedDeliv := notification.NewDeliverability(tracedPool, slog.Default())
+
+	cap.reset()
+	sweepBoth(t, tracedMsg, tracedDeliv)
+	for _, marker := range []string{"container_unread_counter", "thread_read_watermark",
+		"channel_deliverability", "deliverability_built_at"} {
+		if n := countQueries(cap, marker); n != 0 {
+			t.Fatalf("settled idle org still cost %d statements touching %q; an idle "+
+				"org must cost approximately nothing", n, marker)
+		}
+	}
+
+	// (5) The zero above is a skip, not an inert sweep: one message moves the
+	// org's high-water mark past the settled marker and the SAME traced pass
+	// walks the org again.
+	sendChannel(t, f.ts.URL, f.aliceTok, f.channelID, "three")
+	f.sent++
+	f.drain()
+	if now := orgHighWater(t, ctx, pool, f.orgID); now <= high {
+		t.Fatalf("high-water = %d after a send, want > %d", now, high)
+	}
+	cap.reset()
+	sweepBoth(t, tracedMsg, tracedDeliv)
+	for _, marker := range []string{"container_unread_counter", "channel_deliverability"} {
+		if n := countQueries(cap, marker); n == 0 {
+			t.Fatalf("after new activity the sweep issued 0 statements touching %q; "+
+				"the skip is permanent, not idle-scoped", marker)
+		}
+	}
+	// ...and the counter the send moved is still correct afterwards.
+	if u, _ := counterRow(t, ctx, pool, f.bobID, f.channelID); u != f.sent {
+		t.Fatalf("counter after the reactivating send = %d, want %d", u, f.sent)
+	}
+	assertLiveEquals(t, ctx, pool, f.bobID, f.channelID, f.sent)
 }

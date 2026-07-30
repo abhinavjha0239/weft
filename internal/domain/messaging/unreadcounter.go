@@ -245,10 +245,21 @@ func (s *Service) decrementUnreadOnDelete(ctx context.Context, tx pgx.Tx, channe
 }
 
 // UnreadCounterSweep is the durable identity of the S6 counter reconcile
-// sweep's cell-wide claim. Exported for the same reason a consumer name is
-// operator-visible (correlating pg_locks.objid with "who is sweeping"), and
-// append-only: changing either field is a rename, never a fix.
-var UnreadCounterSweep = eventlog.SweepID{Name: "unread_counter_reconcile", Key: 2}
+// sweep's cell-wide claim and per-org settled markers. Exported for the same
+// reason a consumer name is operator-visible (correlating pg_locks.objid or a
+// sweep_org_state row with "who is sweeping"), and append-only: changing a
+// field is a rename, never a fix.
+//
+// The counter's increments ride the notifications consumer, so that consumer's
+// progress is what gates settling an org as verified. Its name is a literal
+// here because messaging must stay free of a notification import (the
+// UnreadMaintainer seam rule); a mismatch would degrade safely rather than
+// corrupt — an unknown consumer reads cursor 0, every org looks permanently
+// behind, nothing ever settles, and the sweep simply keeps its pre-skip
+// behaviour.
+var UnreadCounterSweep = eventlog.SweepID{
+	Name: "unread_counter_reconcile", Key: 2, Consumer: "notifications",
+}
 
 // ReconcileUnreadOnce sweeps every counter row, recomputes its unread from the
 // live aggregate, and repairs + Warn-logs divergence (the F-17-style safety
@@ -262,19 +273,65 @@ var UnreadCounterSweep = eventlog.SweepID{Name: "unread_counter_reconcile", Key:
 // counter row. A node that loses the claim returns nil and waits for its own
 // next tick — at-most-once per window (see the Sweeper doc for why that is
 // the right side of the trade for a convergence sweep).
+//
+// Idle orgs then cost approximately nothing (docs/SCHEMA.md's scale
+// contract). An org is skipped only while its event-log high-water mark still
+// equals the mark a previous pass recorded after verifying it CLEAN, so drift
+// is never what gets skipped: a pass that repaired anything, hit any error,
+// or ran ahead of the consumer whose increments it is checking refuses to
+// settle, and the org is walked again next window. sweep_org_state (0025)
+// carries the full argument, including the one drift class this signal cannot
+// see (a write that appends no event — for this counter, the concurrent
+// first-ever mark-read window, which is repaired on the org's next active
+// pass rather than the next hour).
 func (s *Service) ReconcileUnreadOnce(ctx context.Context) error {
 	release, ok, err := s.unreadSweep.Claim(ctx)
 	if err != nil || !ok {
 		return err
 	}
 	defer release()
+	orgs, err := s.unreadSweep.Orgs(ctx)
+	if err != nil {
+		return err
+	}
+	for _, o := range orgs {
+		if o.Settled {
+			continue
+		}
+		clean, err := s.reconcileUnreadOrg(ctx, o.OrgID)
+		if err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			s.log.Warn("messaging: unread reconcile org", "org", o.OrgID, "err", err)
+			continue
+		}
+		if !clean || o.Lagging {
+			continue // a repaired or unverifiable org stays unsettled
+		}
+		if err := s.unreadSweep.Settle(ctx, o.OrgID, o.HighWater); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			s.log.Warn("messaging: settle unread sweep", "org", o.OrgID, "err", err)
+		}
+	}
+	return nil
+}
+
+// reconcileUnreadOrg recomputes one org's counter rows and reports whether
+// the org came back CLEAN — every row visited, none repaired, none errored.
+// Only that verdict may settle the org: a repair means maintenance missed,
+// which is the last moment to stop checking.
+func (s *Service) reconcileUnreadOrg(ctx context.Context, orgID int64) (bool, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT user_id, COALESCE(channel_id, 0), COALESCE(dm_space_id, 0),
 		       unread_count
 		FROM container_unread_counter
-		ORDER BY user_id, channel_id, dm_space_id`)
+		WHERE org_id = $1
+		ORDER BY user_id, channel_id, dm_space_id`, orgID)
 	if err != nil {
-		return fmt.Errorf("unread: reconcile list: %w", err)
+		return false, fmt.Errorf("unread: reconcile list: %w", err)
 	}
 	type counter struct {
 		userID, channelID, dmSpaceID int64
@@ -285,29 +342,32 @@ func (s *Service) ReconcileUnreadOnce(ctx context.Context) error {
 		var c counter
 		if err := rows.Scan(&c.userID, &c.channelID, &c.dmSpaceID, &c.stored); err != nil {
 			rows.Close()
-			return fmt.Errorf("unread: reconcile scan: %w", err)
+			return false, fmt.Errorf("unread: reconcile scan: %w", err)
 		}
 		counters = append(counters, c)
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
-		return fmt.Errorf("unread: reconcile list: %w", err)
+		return false, fmt.Errorf("unread: reconcile list: %w", err)
 	}
+	clean := true
 	for _, c := range counters {
 		recomputed, err := recomputeContainerUnread(ctx, s.pool, c.userID, c.channelID, c.dmSpaceID)
 		if err != nil {
 			if ctx.Err() != nil {
-				return err
+				return false, err
 			}
 			s.log.Warn("messaging: unread reconcile recompute", "user", c.userID, "err", err)
+			clean = false
 			continue
 		}
 		if recomputed == c.stored {
 			continue
 		}
+		clean = false
 		if err := s.repairUnread(ctx, c.userID, c.channelID, c.dmSpaceID, recomputed); err != nil {
 			if ctx.Err() != nil {
-				return err
+				return false, err
 			}
 			s.log.Warn("messaging: unread reconcile repair", "user", c.userID, "err", err)
 			continue
@@ -316,7 +376,7 @@ func (s *Service) ReconcileUnreadOnce(ctx context.Context) error {
 			"user", c.userID, "channel", c.channelID, "dm_space", c.dmSpaceID,
 			"stored", c.stored, "recomputed", recomputed)
 	}
-	return nil
+	return clean, nil
 }
 
 // repairUnread SETs one counter row to the recomputed unread and clamps its

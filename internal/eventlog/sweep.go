@@ -16,14 +16,22 @@ import (
 const sweepLockClass int32 = 0x53575000
 
 // SweepID is the durable identity of one cell-wide maintenance sweep. Name is
-// what an operator sees and what any per-sweep durable state is keyed by; Key
-// is its objid inside sweepLockClass. Both are APPEND-ONLY, exactly like
-// consumer names and enum values: renaming a sweep abandons whatever durable
-// state it had accumulated, and reusing a Key silently serialises two
+// what an operator sees and what the sweep's per-org state is keyed by
+// (sweep_org_state.sweep); Key is its objid inside sweepLockClass. Both are
+// APPEND-ONLY, exactly like consumer names and enum values: renaming a sweep
+// abandons its settled markers (every org reverts to "never verified", which
+// is safe but costs one full pass), and reusing a Key silently serialises two
 // unrelated sweeps against each other.
+//
+// Consumer names the event-log consumer whose progress the swept cache
+// depends on. A sweep must not declare an org verified while that consumer is
+// behind the org's head: the maintenance the cache is being checked against
+// has not happened yet, so a "clean" verdict would freeze legitimate
+// staleness. Both of today's sweeps ride the notifications consumer.
 type SweepID struct {
-	Name string
-	Key  int32
+	Name     string
+	Key      int32
+	Consumer string
 }
 
 // Sweeper gives a periodic maintenance sweep the multi-node exclusion every
@@ -104,4 +112,80 @@ func (s *Sweeper) Claim(ctx context.Context) (release func(), ok bool, err error
 		}
 		conn.Release()
 	}, true, nil
+}
+
+// OrgPass is one org's pass-start snapshot: everything a sweep needs to
+// decide whether to walk the org at all, and what to record if the walk comes
+// back clean.
+type OrgPass struct {
+	OrgID int64
+	// HighWater is max(event_log.id) for the org AT PASS START. It is
+	// deliberately read before the work rather than after: an event appended
+	// mid-pass may land behind the item the pass already visited, so settling
+	// on an end-of-pass mark could swallow it. Reading it first can only make
+	// the next window redundant, never blind.
+	HighWater int64
+	// Settled is true when a previous pass verified this org clean at exactly
+	// HighWater — nothing has happened in the org since. The sweep skips it.
+	Settled bool
+	// Lagging is true when the maintenance consumer has not reached
+	// HighWater. The pass should still repair, but must not settle: the
+	// maintenance it would be verifying has not run yet.
+	Lagging bool
+}
+
+// Orgs returns every org with its pass-start snapshot — ONE query for the
+// whole cell, all of it index work: the high-water mark per org rides
+// event_log_org_consume_idx (org_id, id), the cursor and the settled marker
+// are PK reads. Nothing here is a new write on any path; the activity signal
+// is state the system already maintains.
+func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT o.id,
+		       COALESCE(h.high, 0),
+		       (st.settled_event_id IS NOT NULL
+		        AND st.settled_event_id = COALESCE(h.high, 0)),
+		       COALESCE(c.last_id, 0) < COALESCE(h.high, 0)
+		FROM org o
+		LEFT JOIN LATERAL (
+		    SELECT max(e.id) AS high FROM event_log e WHERE e.org_id = o.id
+		) h ON true
+		LEFT JOIN sweep_org_state st ON st.sweep = $1 AND st.org_id = o.id
+		LEFT JOIN event_consumer_cursor c ON c.consumer = $2 AND c.org_id = o.id
+		ORDER BY o.id`, s.id.Name, s.id.Consumer)
+	if err != nil {
+		return nil, fmt.Errorf("eventlog: sweep %s orgs: %w", s.id.Name, err)
+	}
+	defer rows.Close()
+	var out []OrgPass
+	for rows.Next() {
+		var p OrgPass
+		if err := rows.Scan(&p.OrgID, &p.HighWater, &p.Settled, &p.Lagging); err != nil {
+			return nil, fmt.Errorf("eventlog: sweep %s scan org: %w", s.id.Name, err)
+		}
+		out = append(out, p)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("eventlog: sweep %s orgs: %w", s.id.Name, err)
+	}
+	return out, nil
+}
+
+// Settle records that this pass walked orgID completely, found NOTHING to
+// repair, and did so with the maintenance consumer caught up — the only
+// combination that may mark an org skippable. Callers must not call it after
+// a pass that repaired or errored: an org that needed repair is precisely the
+// org whose next window must look again, and skipping repair of drift that
+// already exists is the one thing this marker must never cause.
+func (s *Sweeper) Settle(ctx context.Context, orgID, highWater int64) error {
+	if _, err := s.pool.Exec(ctx, `
+		INSERT INTO sweep_org_state (sweep, org_id, settled_event_id, settled_at)
+		VALUES ($1, $2, $3, now())
+		ON CONFLICT (sweep, org_id) DO UPDATE
+		SET settled_event_id = EXCLUDED.settled_event_id,
+		    settled_at       = EXCLUDED.settled_at`,
+		s.id.Name, orgID, highWater); err != nil {
+		return fmt.Errorf("eventlog: settle sweep %s org %d: %w", s.id.Name, orgID, err)
+	}
+	return nil
 }
