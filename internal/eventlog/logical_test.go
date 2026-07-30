@@ -140,11 +140,12 @@ func drain(t *testing.T, f Feed, orgID int64) []Row {
 // TestLogicalFeedNoGlobalStall is the S4 headline pin: a long-running write
 // transaction in org A must not delay org B by one event.
 //
-// RED (observed): TEST_FEED_DRIVER=xmin — org B's committed event
-// is held behind org A's open transaction and the delivery assert fails. The
-// consumer_lag gauge does NOT catch it, which is itself a finding recorded on
-// the assert below: the xmin Lag query carries the same global horizon as the
-// xmin Poll, so during the stall it reports 0 while events pile up.
+// RED (observed): TEST_FEED_DRIVER=xmin — org B's committed event is held
+// behind org A's open transaction and the DELIVERY assert fails, before the run
+// ever reaches the lag assert. That is the whole difference between the drivers
+// and it is not fixable in the poller. What WAS fixable — and has since been
+// fixed — is that the xmin driver's Lag could not see that stall either;
+// TestConsumerLagSeesGlobalStall pins the xmin gauge on its own.
 func TestLogicalFeedNoGlobalStall(t *testing.T) {
 	pool := testPool(t)
 	requireLogicalWAL(t, pool)
@@ -199,11 +200,11 @@ func TestLogicalFeedNoGlobalStall(t *testing.T) {
 			len(rows), rowIDs(rows), idB)
 	}
 
-	// The gauge must SEE the backlog. Under the xmin driver this reads 0 during
-	// the stall — its Lag query carries the SAME global horizon as its Poll, so
-	// the one health signal the design leans on is blind to exactly the failure
-	// it exists to surface (recorded in docs/REALITY.md; it is also why the
-	// spec's "assert lag stays ~0" could not have gone red on its own).
+	// The gauge must SEE the backlog. Here that is an exact entry count against
+	// the LSN cursor; the xmin driver measures an id delta against last_id and,
+	// since the horizon came out of its Lag query, now also sees a stall instead
+	// of reporting 0 through it (TestConsumerLagSeesGlobalStall). Neither driver
+	// is allowed to call an undelivered event delivered.
 	lag, err := feed.Lag(ctx, orgB)
 	if err != nil {
 		t.Fatalf("lag B: %v", err)

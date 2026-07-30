@@ -23,7 +23,9 @@ import (
 // SCALE CONTRACT (docs/SCHEMA.md "Scale contract"):
 //   - The xmin gate is DATABASE-GLOBAL: one long-running transaction anywhere
 //     stalls delivery for every org. Writers run with short transactions and
-//     idle_in_transaction_session_timeout; analytics belong on replicas.
+//     idle_in_transaction_session_timeout; analytics belong on replicas. It is
+//     a DELIVERY gate only: Lag deliberately measures WITHOUT it, because a
+//     backlog measured through the horizon that caused the backlog reads 0.
 //   - The gate does NOT close the whole skip class. txid is stamped at a
 //     transaction's FIRST write, the id at APPEND, so a transaction with the
 //     LOWER txid can hold the HIGHER id; when it commits first the gate admits
@@ -109,13 +111,48 @@ func (c *Consumer) Poll(ctx context.Context, orgID int64) ([]Row, error) {
 	return out, nil
 }
 
-// Lag reports this consumer's backlog for one org — the max COMMITTED event id
-// (bounded by the SAME xmin horizon Poll respects, so a row still in flight is
-// never counted as deliverable) minus the durable cursor — and publishes it as
-// the consumer_lag{consumer,org} gauge. Lag is THE health signal of the whole
+// Lag reports this consumer's backlog for one org — how far the durable cursor
+// trails the org's newest COMMITTED event — and publishes it as the
+// consumer_lag{consumer,org} gauge. Lag is THE health signal of the whole
 // design (docs/ARCHITECTURE.md §6, docs/SCHEMA.md scale contract): it rises
 // when a consumer falls behind and falls to 0 when it catches up. One query
 // per (consumer, org).
+//
+// NO xmin GATE HERE, deliberately — this is the line between a health signal
+// and a flat green line. Poll's `txid < pg_snapshot_xmin(...)` is a DELIVERY
+// gate: it withholds committed rows that are not YET safe to hand over, and it
+// is DATABASE-GLOBAL, so one long write transaction anywhere freezes it.
+// Measuring the backlog through that same horizon made the numerator stop
+// advancing at exactly the moment the cursor also stopped, so during the one
+// failure this gauge exists to surface, it reported 0 while the backlog grew
+// without bound (found by S4; TestConsumerLagSeesGlobalStall pins it). Ordinary
+// MVCC visibility is the only filter a MEASUREMENT needs: MAX(e.id) on this
+// statement's snapshot counts committed rows and only committed rows, so an
+// in-flight transaction's event is still never counted (same test). Events that
+// are committed but not yet deliverable now COUNT as lag, which is what they
+// are — work this consumer owes and cannot yet do.
+//
+// Semantic change to a shipped series, accepted: under normal operation lag
+// reads transiently higher than before, by whatever committed inside the window
+// between a commit and the horizon moving past it. That is MORE CORRECT, not
+// merely different — those events are undelivered, and a number that calls them
+// delivered is wrong in the direction that hides outages. It is also the
+// reading the logical driver has always published, so the series now means the
+// same thing under both drivers.
+//
+// WHICH POSITION IT MEASURES AGAINST (the Feed contract is one number; the
+// cursor underneath is not the same object per driver):
+//   - xmin (here): event_consumer_cursor.last_id, in EVENT-ID space. The value
+//     is an id delta — the exact undelivered count over an unbroken id run, an
+//     upper bound on it when other orgs' events interleave in the shared
+//     sequence. Deliberate: MAX(id) under event_log_org_consume_idx is an index
+//     max, so the measurement stays cheap when the backlog is huge, which is
+//     precisely when an operator needs it. (Dropping the gate makes it cheaper
+//     too: txid is not in that index, so the gated form could not be an
+//     index-only max.)
+//   - logical: event_consumer_cursor.lsn, in COMMIT order — an exact count of
+//     decoded-committed-unacked entries (logical.go), or of unread history rows
+//     while a consumer is still in the bootstrap lane.
 func (c *Consumer) Lag(ctx context.Context, orgID int64) (int64, error) {
 	var lag int64
 	err := c.pool.QueryRow(ctx, `
@@ -123,8 +160,7 @@ func (c *Consumer) Lag(ctx context.Context, orgID int64) (int64, error) {
 		        SELECT last_id FROM event_consumer_cursor
 		        WHERE consumer = $2 AND org_id = $1), 0)
 		FROM event_log e
-		WHERE e.org_id = $1
-		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())`,
+		WHERE e.org_id = $1`,
 		orgID, c.name).Scan(&lag)
 	if err != nil {
 		return 0, fmt.Errorf("eventlog: lag: %w", err)
