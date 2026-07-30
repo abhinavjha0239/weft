@@ -6,6 +6,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 )
 
 // S6 (F-17 twin): maintenance of the O(1) unread counter (container_unread_counter,
@@ -242,12 +244,30 @@ func (s *Service) decrementUnreadOnDelete(ctx context.Context, tx pgx.Tx, channe
 	return nil
 }
 
+// UnreadCounterSweep is the durable identity of the S6 counter reconcile
+// sweep's cell-wide claim. Exported for the same reason a consumer name is
+// operator-visible (correlating pg_locks.objid with "who is sweeping"), and
+// append-only: changing either field is a rename, never a fix.
+var UnreadCounterSweep = eventlog.SweepID{Name: "unread_counter_reconcile", Key: 2}
+
 // ReconcileUnreadOnce sweeps every counter row, recomputes its unread from the
 // live aggregate, and repairs + Warn-logs divergence (the F-17-style safety
 // net: the counter is a cache, so a nonzero repair means a maintenance miss).
 // One short recompute per row on the runner's slow ticker; the mention clamp
 // travels with the repair. Exposed as the UnreadMaintainer seam.
+//
+// The pass is claimed cell-wide first (eventlog.Sweeper): the notification
+// runner drives this ticker on EVERY node, so without a claim an N-node cell
+// ran N redundant full passes per window, each issuing a live recompute per
+// counter row. A node that loses the claim returns nil and waits for its own
+// next tick — at-most-once per window (see the Sweeper doc for why that is
+// the right side of the trade for a convergence sweep).
 func (s *Service) ReconcileUnreadOnce(ctx context.Context) error {
+	release, ok, err := s.unreadSweep.Claim(ctx)
+	if err != nil || !ok {
+		return err
+	}
+	defer release()
 	rows, err := s.pool.Query(ctx, `
 		SELECT user_id, COALESCE(channel_id, 0), COALESCE(dm_space_id, 0),
 		       unread_count

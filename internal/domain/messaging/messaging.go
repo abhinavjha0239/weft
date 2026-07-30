@@ -15,6 +15,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/enum"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/apperr"
 )
 
@@ -44,6 +45,9 @@ type Service struct {
 	files FileAttacher
 	deliv DeliverabilityPatcher
 	log   *slog.Logger
+	// unreadSweep is the cell-wide claim for the S6 counter reconcile pass
+	// (see ReconcileUnreadOnce).
+	unreadSweep *eventlog.Sweeper
 }
 
 // SetFiles wires the attachment hook (same pattern as the gateway's
@@ -64,7 +68,10 @@ func (s *Service) SetLogger(l *slog.Logger) {
 }
 
 func New(pool *pgxpool.Pool, p *perms.Service) *Service {
-	return &Service{pool: pool, perms: p, log: slog.Default()}
+	return &Service{
+		pool: pool, perms: p, log: slog.Default(),
+		unreadSweep: eventlog.NewSweeper(pool, UnreadCounterSweep),
+	}
 }
 
 type SendParams struct {

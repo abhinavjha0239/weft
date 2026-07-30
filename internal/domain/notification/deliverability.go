@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 )
 
 // Deliverability maintains the F-17 materialized candidate set
@@ -37,15 +38,27 @@ import (
 // yet built skips the patch under the lock, because the build that follows
 // derives from post-commit truth anyway.
 type Deliverability struct {
-	pool *pgxpool.Pool
-	log  *slog.Logger
+	pool  *pgxpool.Pool
+	log   *slog.Logger
+	sweep *eventlog.Sweeper
 }
+
+// DeliverabilitySweep is the durable identity of the F-17 reconcile sweep's
+// cell-wide claim. Exported because a sweep identity is an OPERATIONAL
+// contract, the way a consumer name is: an operator correlating
+// pg_locks.objid with "who is sweeping" needs it, and it is append-only —
+// changing either field is a rename, never a fix.
+var DeliverabilitySweep = eventlog.SweepID{Name: "deliverability_reconcile", Key: 1}
 
 func NewDeliverability(pool *pgxpool.Pool, log *slog.Logger) *Deliverability {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Deliverability{pool: pool, log: log}
+	return &Deliverability{
+		pool:  pool,
+		log:   log,
+		sweep: eventlog.NewSweeper(pool, DeliverabilitySweep),
+	}
 }
 
 // derivedReasonsSQL is THE derivation of who holds a non-default delivery
@@ -239,7 +252,19 @@ func (d *Deliverability) ReconcileChannel(ctx context.Context, orgID, channelID 
 
 // ReconcileOnce sweeps every built channel, one short transaction each
 // (the janitor cadence — the runner drives this on a slow ticker).
+//
+// The pass is claimed cell-wide first (eventlog.Sweeper): every node runs its
+// own reconcileLoop, so without a claim an N-node cell performed N redundant
+// full sweeps per window, all contending on the same channel row locks that
+// the live patch path needs. A node that loses the claim returns nil and
+// waits for its next tick — at-most-once per window, which is the right side
+// of the trade for a convergence sweep (see the Sweeper doc).
 func (d *Deliverability) ReconcileOnce(ctx context.Context) error {
+	release, ok, err := d.sweep.Claim(ctx)
+	if err != nil || !ok {
+		return err
+	}
+	defer release()
 	rows, err := d.pool.Query(ctx, `
 		SELECT id, org_id FROM channel
 		WHERE deliverability_built_at IS NOT NULL ORDER BY id`)
