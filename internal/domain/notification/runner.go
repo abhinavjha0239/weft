@@ -197,14 +197,6 @@ type messagePayload struct {
 	NewMentions []int64 `json:"new_mentions"`
 }
 
-// hintPayload reads the F-17b coalescing stamp bulk producers set on the
-// event hint (the reserved field, ADR-002 P1): every item event of one
-// bulk operation carries the same batch_id, and the materializer folds a
-// recipient's N item rows into ONE digest row per (user, kind, batch).
-type hintPayload struct {
-	BatchID *int64 `json:"batch_id"`
-}
-
 // ProcessOrg drains the org's pending events into notification rows and
 // acks the cursor. Exported for tests; production calls arrive via Run.
 func (r *Runner) ProcessOrg(ctx context.Context, orgID int64) error {
@@ -264,7 +256,9 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 	}
 	// F-17b: a batch-stamped hint switches every insert for this event
 	// into digest mode. A malformed hint is ignored like a malformed
-	// payload — never a stall.
+	// payload — never a stall. Producers mint the stamp with
+	// BatchHintForEvent (batch.go), which carries the freshness contract
+	// this mode depends on.
 	var batchID *int64
 	if len(ev.Hint) > 0 {
 		var h hintPayload
@@ -430,6 +424,13 @@ func (r *Runner) processEvent(ctx context.Context, ev eventlog.Row) error {
 // unique key (the entity dedupe on replay, the batch key on coalesce) and
 // both mean "already recorded"; the unbatched path keeps the explicit
 // 0010 target.
+//
+// That open DO NOTHING is exactly why the batch id must be minted FRESH
+// per bulk operation, via BatchHintForEvent (batch.go): the batch key is
+// unique FOREVER and has no time component, so a producer stamping a
+// stable entity id (a rule id, a sprint id) would silently and permanently
+// mint ZERO rows here for every (user, kind) it had already delivered to,
+// and no reconcile would ever notice.
 func (r *Runner) insert(ctx context.Context, ev eventlog.Row, p messagePayload, userID int64, kind int16, author int64, batchID *int64) error {
 	var actorID *int64
 	if author != 0 {

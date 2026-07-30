@@ -300,4 +300,119 @@ func TestDeliverabilitySet(t *testing.T) {
 		t.Fatalf("bulk event minted %d rows total for %d items, want 2 (one digest per recipient)",
 			totalBatch, batchItems)
 	}
+
+	// (4) The batch-id FRESHNESS contract (notification.BatchHintForEvent).
+	// notification_batch_dedupe_key (user_id, kind, batch_id) is unique
+	// FOREVER with no time component, and the digest insert conflicts with an
+	// open DO NOTHING — so the two directions below are the whole contract,
+	// and a future producer that gets it wrong fails HERE instead of silently
+	// in production:
+	//   · successive bulk operations mint FRESH ids and BOTH deliver;
+	//   · the SAME id restamped coalesces into the one row already recorded.
+	// RED/GREEN: make BatchHintForEvent ignore its argument and stamp a
+	// constant — the stable-entity-id foot-gun — and the per-operation
+	// digest count drops to 1: the second operation delivers NOTHING, with
+	// no error anywhere, which is exactly the silent permanent suppression
+	// the helper exists to prevent.
+	//
+	// bulkOp emits one bulk operation the way a real producer must: the
+	// operation's OWN event first, then its item events, every one stamped
+	// with the hint minted from that trigger id. A nonzero reuse deliberately
+	// restamps an ALREADY-SPENT batch id instead (the coalescing direction).
+	bulkOp := func(sprintID, firstEntity int64, items int, reuse int64) int64 {
+		t.Helper()
+		batch := reuse
+		if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+			if batch == 0 {
+				id, err := eventlog.Append(ctx, tx, eventlog.Event{
+					OrgID: boot.OrgID, ActorKind: enum.ActorHuman, ActorID: &boot.UserID,
+					EntityType: enum.EntitySprint, EntityID: sprintID,
+					Verb: "sprint.closed",
+				})
+				if err != nil {
+					return err
+				}
+				batch = id
+			}
+			hint := notification.BatchHintForEvent(batch)
+			for i := 0; i < items; i++ {
+				entity := firstEntity + int64(i)
+				if _, err := eventlog.Append(ctx, tx, eventlog.Event{
+					OrgID: boot.OrgID, ActorKind: enum.ActorHuman, ActorID: &boot.UserID,
+					EntityType: enum.EntityMessage, EntityID: entity,
+					Verb: "message.created",
+					Payload: eventlog.MustPayload(map[string]any{
+						"message_id": entity, "thread_id": rootThread,
+						"channel_id": boot.ChannelID, "mentions": []int64{bobID}}),
+					Hint: hint,
+				}); err != nil {
+					return err
+				}
+			}
+			return nil
+		}); err != nil {
+			t.Fatalf("bulk op: %v", err)
+		}
+		return batch
+	}
+	rowsForBatch := func(userID, batch int64) (n int, entity int64) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `
+			SELECT count(*), COALESCE(min(entity_id), 0) FROM notification
+			WHERE org_id = $1 AND user_id = $2 AND batch_id = $3`,
+			boot.OrgID, userID, batch).Scan(&n, &entity); err != nil {
+			t.Fatalf("rows for batch %d: %v", batch, err)
+		}
+		return n, entity
+	}
+
+	firstOp := bulkOp(9001, 910000, 3, 0)
+	waitForConsumer()
+	secondOp := bulkOp(9002, 920000, 3, 0)
+	waitForConsumer()
+	if firstOp == secondOp || firstOp <= 0 {
+		t.Fatalf("successive operations minted batch ids %d and %d, want two distinct positive ids",
+			firstOp, secondOp)
+	}
+	// THE finding, stated without reference to the minted ids: each
+	// operation must leave the recipient exactly one digest. A producer
+	// that reused a stable id leaves ONE row total — the second sweep is
+	// suppressed permanently, silently, for this (user, kind) forever.
+	var opDigests int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM notification
+		WHERE org_id = $1 AND user_id = $2 AND entity_type = 1
+		  AND entity_id BETWEEN 910000 AND 920002`, boot.OrgID, bobID).Scan(&opDigests); err != nil {
+		t.Fatalf("per-operation digests: %v", err)
+	}
+	if opDigests != 2 {
+		t.Fatalf("two successive bulk operations left bob %d digest rows, want 2 (one per operation) — a batch id that is not minted fresh silently drops every later sweep",
+			opDigests)
+	}
+	if n, entity := rowsForBatch(bobID, firstOp); n != 1 || entity != 910000 {
+		t.Fatalf("first operation: %d rows for batch %d (anchor entity %d), want ONE digest anchored on 910000",
+			n, firstOp, entity)
+	}
+	if n, entity := rowsForBatch(bobID, secondOp); n != 1 || entity != 920000 {
+		t.Fatalf("second operation: %d rows for batch %d (anchor entity %d), want ONE digest anchored on 920000 — a fresh batch id must deliver again",
+			n, secondOp, entity)
+	}
+
+	// The coalescing direction: restamping a SPENT batch id records nothing
+	// new — that is the feature, and it is what makes reuse fatal.
+	bulkOp(0, 930000, 2, firstOp)
+	waitForConsumer()
+	if n, _ := rowsForBatch(bobID, firstOp); n != 1 {
+		t.Fatalf("restamping batch %d left %d rows, want 1 (the same batch coalesces)", firstOp, n)
+	}
+	var restamped int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM notification
+		WHERE org_id = $1 AND entity_type = 1 AND entity_id BETWEEN 930000 AND 930001`,
+		boot.OrgID).Scan(&restamped); err != nil {
+		t.Fatalf("restamped rows: %v", err)
+	}
+	if restamped != 0 {
+		t.Fatalf("restamping a spent batch minted %d new rows, want 0", restamped)
+	}
 }

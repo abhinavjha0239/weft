@@ -46,5 +46,17 @@ ALTER TABLE notification ADD COLUMN batch_id BIGINT;
 
 -- The batch-aware dedupe key: partial, so the unbatched hot path pays
 -- nothing for it.
+--
+-- CONTRACT (read this before stamping a batch_id): the key is UNIQUE
+-- FOREVER and carries NO time component, and the digest insert conflicts
+-- with an open DO NOTHING. A batch_id must therefore be minted FRESH per
+-- bulk operation. Stamping a STABLE entity id — an automation rule id, a
+-- sprint id, a retention policy id, the obvious thing to reach for —
+-- delivers the FIRST sweep and then permanently mints ZERO notifications
+-- for every (user, kind) pair it already delivered to: silently, with no
+-- error, and with no net (the hourly reconcile repairs the deliverability
+-- set, never notification rows). Derive it from the triggering EVENT id,
+-- which is monotone and never reused: notification.BatchHintForEvent is
+-- the one blessed minting path.
 CREATE UNIQUE INDEX notification_batch_dedupe_key
     ON notification (user_id, kind, batch_id) WHERE batch_id IS NOT NULL;
