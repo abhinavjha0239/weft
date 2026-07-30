@@ -2192,7 +2192,8 @@ dossier):**
 2. **S4 feed: `jackc/pglogrepl`.** A go-oidc-class justified dep
    exception (WAL replication protocol + keepalives + slot management
    are not responsibly hand-rollable; same author family as the
-   existing `pgx` dep). The written justification lands with S4's PR.
+   existing `pgx` dep). **APPROVED 2026-07-18** — the written
+   justification is in the P-40 entry.
    The no-dep per-org commit-fence fallback is recorded in the dossier.
 3. **S5 presence plane: the dormant UNLOGGED `presence` table +
    LISTEN/NOTIFY** (wakes `0006:56-62`; no new dep; cell-local). An
@@ -2577,7 +2578,7 @@ plane, not this slice).
 
 ---
 
-### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[ ] PARKED — awaiting the `pglogrepl` new-dependency decision (go-oidc-class exception vs the no-dep per-org commit-fence fallback). Fable execution — all-consumer contract, its own serial window**
+### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[ ] APPROVED (2026-07-18) — `jackc/pglogrepl` accepted as a go-oidc-class dependency exception (justification below); the no-dep per-org commit-fence fallback stays the recorded alternative. Fable execution — all-consumer contract, its own serial window**
 
 **What & why.** The `txid < pg_snapshot_xmin(...)` gate
 (`consumer.go:60`) is DATABASE-GLOBAL: one long write tx anywhere
@@ -2598,8 +2599,35 @@ scale-tier note `consumer.go:21-31`, `SCHEMA.md:127-134`. Consumers:
 `notification` (`runner.go:48`), `automations`, `unfurl`, gateway pump.
 
 **The build (decided: `jackc/pglogrepl` — the justified dep
-exception; the written justification lands with the PR).**
+exception; the written justification is below).**
 
+- **Dependency: `github.com/jackc/pglogrepl`** — the SECOND deliberate
+  exception to the no-dep bias, of exactly the go-oidc class
+  (P-30): the streaming replication protocol is not something this
+  codebase may responsibly hand-roll. It is a binary sub-protocol over
+  `COPY BOTH` — `START_REPLICATION`, `XLogData`/`PrimaryKeepalive`
+  framing, standby status updates on a deadline (miss them and the
+  walsender kills the connection AND the slot stops advancing, so WAL
+  piles up until the disk fills), the pgoutput logical message grammar
+  (Begin/Relation/Insert/Commit + the v2 streaming variants), LSN
+  arithmetic and slot lifecycle. Getting any of it subtly wrong is a
+  silent data-loss or disk-exhaustion bug, not a compile error.
+  `pglogrepl` is the reference Go client for it, from the SAME author
+  family as the `github.com/jackc/pgx/v5` this repo already depends on
+  and built on the same `pgconn` — so it shares our transport, our
+  connection-string parsing, and our TLS story rather than adding a
+  second driver stack. `go mod tidy` adds exactly this root plus ONE
+  transitive (`github.com/jackc/pgio`, buffer helpers) — no
+  cgo, no reflection framework, no vendored protocol tables. Pin
+  latest stable and say "deliberate exception" in the commit body.
+  **The alternative stays recorded, not deleted:** the no-dep per-org
+  commit-fence (a per-org fence row advanced in the writer's tx so
+  consumers gate on a per-org horizon instead of the DB-global xmin)
+  removes the cross-org stall without a new dependency, but it costs a
+  contended write per org per transaction and still cannot see commit
+  ORDER — it narrows the blast radius of the xmin gate rather than
+  removing it. If the slot operationally does not pay for itself, that
+  is the fallback to build.
 - **A logical-decoding reader** consumes the WAL via a replication slot
   + publication on `event_log`, decoding committed INSERTs in COMMIT
   order — no xmin gate because uncommitted rows never appear. The
