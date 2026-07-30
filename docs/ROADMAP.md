@@ -2600,7 +2600,7 @@ plane, not this slice).
 
 ---
 
-### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[ ] APPROVED (2026-07-18) — `jackc/pglogrepl` accepted as a go-oidc-class dependency exception (justification below); the no-dep per-org commit-fence fallback stays the recorded alternative. Fable execution — all-consumer contract, its own serial window**
+### P-40 (S4) `eventlog: Logical-decoding consumer feed behind the Consumer interface.` — L — migration 0024 — **[x] shipped #124** (Fable-executed; `jackc/pglogrepl` accepted as a go-oidc-class dependency exception — justification below — and the no-dep per-org commit-fence fallback stays the recorded alternative; xmin remains the DEFAULT driver, and the `consumer_lag` blind spot this slice surfaced in it is fixed as a review follow-up)
 
 **What & why.** The `txid < pg_snapshot_xmin(...)` gate
 (`consumer.go:60`) is DATABASE-GLOBAL: one long write tx anywhere
