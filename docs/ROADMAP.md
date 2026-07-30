@@ -2896,7 +2896,9 @@ One indexed lookup on `capability_grant_principal_idx`. Red/green:
 `TestCapabilityGrant` (no grant → denied despite group permission;
 live grant → allowed; revoked/expired → denied; RED: skip the
 intersection → the agent writes on group permission alone).
-Security-critical → Fable execution when promoted.
+Security-critical → Opus execution with the P-46 compensating
+controls (the standing model directive prohibits Fable; see CLAUDE.md
+directive 8).
 
 ---
 
@@ -3215,7 +3217,7 @@ reconnect storm (recorded separately).
 
 ---
 
-### P-46 `gateway: Complete the read ACL — history floor and visibility scope.` — M — ZERO migrations (both hooks exist) — **SPEC-READY (SECURITY-CRITICAL → Fable execution per the standing rule; do NOT dispatch to a lower tier without an explicit override)**
+### P-46 `gateway: Complete the read ACL — history floor and visibility scope.` — M — ZERO migrations (both hooks exist) — **SPEC-READY (SECURITY-CRITICAL — Opus execution per the standing model directive, with the compensating controls below MANDATORY)**
 
 **What & why.** `docs/REALITY.md` has rated this WORKS-THIN since it
 landed: *"membership-set filter + refresh on membership events. Missing:
@@ -3282,6 +3284,17 @@ membership and scope CHANGES refresh mid-connection. **RED/GREEN:**
 (1) drop the history floor → the pre-join replay assert goes red;
 (2) restore the org-wide fan for container-less events → the guest/space
 assert goes red — the load-bearing line.
+
+**COMPENSATING CONTROLS (mandatory — this slice is security-critical
+and the model tier that the old rule reserved for such work is no
+longer available, so the rigour has to come from PROCESS):**
+reviewer line-by-line review before the PR is opened, not after; a
+red/green pin for EVERY access-control claim in the commit message,
+not just the two named above; every negative test written as a live
+fan target so it cannot pass vacuously (the P-33/P-34 discipline); and
+an explicit written argument in the PR body for why each predicate
+FAILS CLOSED. If the executor cannot produce those, it must stop and
+report rather than ship.
 
 **Gaps to record:** the client-side snapshot-refetch rule (REALITY's
 third missing item — it needs a real client, so it stays recorded);
