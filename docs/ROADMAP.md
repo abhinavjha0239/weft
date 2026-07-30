@@ -2145,7 +2145,8 @@ DEFERRED.
 
 **North star.** Weft must genuinely hold a mega-org at ~100k inside a
 SINGLE Postgres cell on all three axes simultaneously: membership (100k
-members in one channel), throughput (sustained write+consume volume),
+members in one org, and 100k in one ANNOUNCEMENT channel — see the
+membership re-scope below), throughput (sustained write+consume volume),
 and connections (~100k live WebSockets). The cell model puts a whole org
 in ONE cell, so sharding cannot rescue a hot path. The non-negotiable
 invariant:
@@ -2155,6 +2156,26 @@ invariant:
 > to RARE events (joins, pref edits, group edits) and made incremental,
 > async, or coalesced there.**
 
+**Membership re-scope (decided post-S6, 2026-07-18 — the honest
+amendment, not a quiet drop).** The original wording said "100k members
+in one channel" unqualified, and S6 could not honour it. Unread is
+defined over EVERY member — unlike F-17 notification candidacy, which is
+opt-in — so for a channel keeping the full conversational contract the
+increment is irreducibly O(members) rows per message. #117 shipped that
+cost DISCLOSED (`unreadcounter.go`'s package doc states it); #118 fixed
+the undisclosed half (MarkRead's O(container-history) recompute). The
+residue is not an algorithm we have yet to find; it is the CONTRACT.
+**Decision: a 100k-member CONVERSATIONAL channel is not a goal.** It is
+unusable as a conversation (1% daily participation = ~1000 msg/day
+scrolling past) and no incumbent supports it — the real 100k channels
+are announcement channels, which is exactly why Zulip ships
+`stream_post_policy` (`zerver/models/streams.py:92-95`). The membership
+axis is therefore carried by **P-44 announcement mode**, whose REDUCED
+feature contract makes unread derivable by arithmetic at O(1) per
+message, and conversational channels stay bounded with that bound made
+honest there. S1/S2/S3/S5 are unaffected — they are org-axis and
+connection-axis work, required regardless of any channel's size.
+
 **The O(N)-blowup ledger this cluster closes:**
 
 | Axis | Blowup today | Slice |
@@ -2162,6 +2183,7 @@ invariant:
 | Connections | O(connections) `event_log` queries per message (`gateway.go:256-263`) | **S3** |
 | Membership | O(members) live join per message (`runner.go:195-207`) | **S1** |
 | Membership | O(members) unread aggregate per read (`readstate.go:131-143`) | **S6** |
+| Membership | O(members) unread counter WRITE per message (`unreadcounter.go`, S6's disclosed residue — irreducible while the full conversational contract holds) | **P-44** |
 | Membership | O(members) synchronous closure rebuild per group edit (`perms.go:235-257`), 2× per invite | **S2** |
 | Throughput | DB-global xmin stall (`consumer.go:60`); NOTIFY per append | **S4** |
 | Connections | O(connections) presence fans under one mutex; multi-node fragmentation (`presence.go`) | **S5** |
@@ -2804,6 +2826,119 @@ One indexed lookup on `capability_grant_principal_idx`. Red/green:
 live grant → allowed; revoked/expired → denied; RED: skip the
 intersection → the agent writes on group permission alone).
 Security-critical → Fable execution when promoted.
+
+---
+
+### P-44 `channels: Announcement mode — O(1) unread at unbounded membership.` — L — migration 0025 — **SPEC-READY (carries the cluster's membership axis; the constant-write pin is the load-bearing line)**
+
+**What & why.** After S6 (#117) and its follow-up (#118), the ONE
+remaining per-message cost that scales with membership is
+`ApplyMessageUnread`'s bulk UPSERT — one counter row per live member
+per message (`unreadcounter.go`, honestly disclosed in its package
+doc). It cannot be fixed by a better algorithm: unread is defined over
+EVERY member, so unlike F-17 candidacy there is no opt-in set to shrink
+to. The escape is a REDUCED CONTRACT. `channel.kind = 4 announcement`
+has been specced since ADR-008 C-1 and sitting DORMANT in the schema
+since 0003 (`migrations/0003_containers.sql:18-19`, "1 text · 2 forum ·
+3 voice · 4 announcement") with zero code reading it — this slice wakes
+it. Grounding: Zulip's `stream_post_policy`
+(`zerver/models/streams.py:92-105` — EVERYONE / ADMINS / MODERATORS /
+RESTRICT_NEW_MEMBERS) is the battle-tested precedent for the same idea.
+
+**The enabling insight (state it in the commit body).** The restriction
+IS the performance property. Send-restricted ⇒ low write rate ⇒ a
+per-channel hot counter row is SAFE — which is precisely why F-15
+banned that row for normal channels (`SCHEMA.md:30-32`, "no per-message
+hot row on the root"): the objection there is write-RATE, not
+principle. Flat (no reply threads) ⇒ no per-thread watermark scatter ⇒
+unread becomes a subtraction instead of a per-thread aggregate. Read
+`unreadcounter.go` IN FULL first (the drift ledger and the #118
+delta discipline are the model to extend, not replace), plus
+`readstate.go`, `channels.go`, `threads.go`'s send gate, and 0023.
+
+**Design (decided):**
+- **The channel counter** (migration 0025, SIBLING table
+  `channel_announce_counter (channel_id PK, org_id, live_countable_total
+  BIGINT NOT NULL DEFAULT 0)` — a sibling keeps `channel` narrow and
+  gives the hot row its own `fillfactor=70`). `+1` per posted message,
+  `-1` per delete of a live message. The column must appear in NO index
+  so every bump is HOT-eligible (the 0003 discipline).
+- **The reader position**: `container_unread_counter` (0023) gains
+  `read_total BIGINT` — the value of `live_countable_total` when that
+  reader last read. **unread = GREATEST(0, live_countable_total -
+  read_total)**, computed at READ time. O(1) per container, and NO
+  per-member write on send.
+- **Send path** (kind=4 only): ONE counter increment + set the AUTHOR's
+  own `read_total` to the new total in the same tx (an author has read
+  their own post — this replaces the `author_id <> user_id` exclusion).
+  Two row-writes per message, membership-INDEPENDENT. The kind=4 branch
+  lives INSIDE the maintainer so `messaging` stays the single owner of
+  counter writes (the LLD rule) — `ApplyMessageUnread` skips its bulk
+  UPSERT for announcement channels.
+- **MarkRead**: `read_total = live_countable_total`, one row, O(1). The
+  #118 per-thread delta logic does not apply (single thread).
+- **Mentions stay SPARSE**: a per-user `@**Name**` still writes only the
+  mentioned members' `mention_count` — O(mentioned), the blessed
+  `message_user_flag` shape (F-7). **Broadcast mentions (@channel/@here)
+  DO NOT EXIST today** (verified: `content/parse.go` implements only
+  `@**Full Name**`) and MUST NEVER be enabled for kind=4 — a structural
+  rule, not a preference: one use would be O(members) notification rows.
+- **Posting restriction**: a NEW registry verb `post_announcement`,
+  default-assigned to `role:moderators`, retargetable through the
+  existing `PUT /admin/verbs`. It resolves through the F-16 closure like
+  every other verb — one join, no new mechanism — and stays orthogonal
+  to `administer_channel` (managing a channel ≠ speaking in it).
+- **Flat by construction**: a kind=4 channel has ONLY its channel-root
+  thread (the F-15 kind-2 root). `CreateThread` against kind=4 → 400.
+- **Read receipts stay refused** (definitionally O(members)) — reject
+  the config with a clear error, the honest-rungs rule.
+
+**Drift & the sweep.** Deleting an ALREADY-READ message drops
+`live_countable_total` while that reader's `read_total` does not move →
+under-count by 1, floored at 0, healed by the existing hourly
+reconcile. This is the SAME bounded-drift class #118 established and
+must be documented the same way; announcement delete rate is ~0.
+`ReconcileUnreadOnce` needs a kind=4 arm that recomputes the
+subtraction form and must NOT "repair" those rows with the member
+aggregate (that arm would reintroduce the O(members) scan).
+
+**Edge cases:** convert regular→announcement (seed each existing
+member's `read_total` from their current unread — one-time O(members)
+at a RARE event, which the charter explicitly permits) and
+announcement→regular (seed `unread_count` from the subtraction); a
+member JOINING an announcement channel gets `read_total =
+live_countable_total`, so they start clean instead of inheriting a
+100k-message badge (matches the `history_from` protected posture);
+archived kind=4 freezes the counter; guests ride the same gates
+unchanged; the author-is-also-a-reader case is covered by the send-path
+rule above; a kind=4 channel with zero posts reads 0, never NULL.
+
+**The conversational ceiling must be made HONEST in this slice.** Either
+enforce a documented member cap on kind=1 channels with an error that
+steers to announcement mode, or — if enforcement is deferred — record
+the practical bound in REALITY WITH its O(members) per-message cost
+stated. Do NOT leave it undefined; an unstated bound is how a 40k-member
+"regular" channel reaches production unplanned.
+
+**Tests (`TestAnnouncementChannel`, real PG).** The O(1) proof is the
+load-bearing one: reuse the #117 QueryTracer/EXPLAIN pin discipline to
+assert ONE send into an announcement channel writes a CONSTANT number
+of counter rows (2) INDEPENDENT of membership — run at N=50 and N=500
+members and assert the two counts are EQUAL, not merely small. Plus:
+unread correct for a non-reader, 0 for the author, 0 after MarkRead;
+delete decrements; the mention badge stays sparse and clears on a full
+read; `post_announcement` non-holder 403 / holder 201; `CreateThread`
+400; join seeds `read_total` (no backlog); both conversion directions
+preserve per-user unread; the reconcile kind=4 arm repairs a seeded
+divergence. **RED/GREEN (pin in a comment):** delete the kind=4 branch
+so announcement sends fall back to the bulk UPSERT → the equal-counts
+assert goes red (writes scale with N again) — the load-bearing line.
+
+**Gaps to record:** a linked discussion channel for replies (the
+designed answer to "flat"); announcement scheduling/digests; per-post
+read receipts (NEVER — O(members)); Zulip's RESTRICT_NEW_MEMBERS tier;
+importer mapping of Zulip announcement-only streams → kind=4; the
+`forum` (kind=2) and `voice` (kind=3) kinds stay dormant.
 
 ---
 
