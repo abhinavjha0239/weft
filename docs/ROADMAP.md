@@ -3151,6 +3151,144 @@ prefs; shared/Connect channels (ADR-004 territory, not import).
 
 ---
 
+### P-45 `gateway: Put the multicast pump on the logical feed (the seq contract).` — M — ZERO migrations — **SPEC-READY (the LAST consumer on the xmin gate; the decision this slice needed is made below)**
+
+**What & why.** S4 (#124) moved notification, automation, and unfurl onto
+the commit-ordered feed, but **deliberately left the gateway on the old
+xmin gate**, because switching it is a WIRE-CONTRACT decision rather
+than an implementation detail. So the undetectable-skip race
+(`consumer.go` scale-contract block: a lower-txid transaction can hold a
+higher id, and its commit advances the head past a still-in-flight lower
+id) is closed for durable consumers and **still open for live fan-out**.
+This slice closes it.
+
+**The blocker, precisely.** `Envelope.Seq` IS the event id
+(`gateway.go:513`, `:642`), and the live lane treats `r.id <= c.lastID`
+as "already delivered" (`deliverShared`, `gateway.go:625`). Under
+commit-order delivery a lower id legitimately arrives AFTER a higher one
+— that is the entire point of the feed — so the existing skip would
+DROP it at the connection. Removing the skip naively instead trades the
+stall for duplicate storms and broken resume.
+
+**THE DECISION (made at spec time; this is what was blocking dispatch):**
+- **`seq` STAYS the event id.** It is the client's resume cursor and it
+  must remain QUERYABLE — resume replays with `WHERE id > seq`. A
+  decode-time delivery ordinal would order correctly but could not be
+  replayed without persisting it, which would put durable state back in
+  a gateway that ADR-002 designed to hold none. No wire-format change.
+- **What changes is the SKIP, not the ordering.** `id <= lastID` must
+  stop meaning "already sent". The live lane tracks what it has ACTUALLY
+  delivered (commit-order cursor plus a bounded recently-delivered
+  window covering the in-flight span), so a late-committing lower id is
+  DELIVERED rather than silently dropped.
+- **The protocol gains one honest requirement: clients MUST tolerate a
+  duplicate `seq`.** They already tolerate GAPS (filtered events —
+  `gateway.go:652` and the F-2 note), so the client contract moves from
+  "gaps possible" to "gaps and rare duplicates possible", bounded to the
+  live/resume hand-off. **This is the right trade and the reason to take
+  it now: the alternative is silent LOSS, duplicates are strictly easier
+  for a client to absorb than a missing event, REST remains the source
+  of truth, and `docs/REALITY.md` records that NO real client exists
+  yet — so this is the cheapest moment this contract will ever change.**
+  Document it in ADR-002's protocol section, not just in code.
+
+**Edge cases:** the live↔resume hand-off (already race-free under
+`sh.mu` — do NOT regress it); a connection resuming with a `last_id`
+above an event that commits later (the duplicate case — assert it is a
+duplicate, never a drop); the sweep's empty gated read; the xmin driver
+must keep working UNCHANGED, since it stays the default (`Open`'s
+`""`/`xmin` case) — this slice must be correct on BOTH feeds.
+
+**Tests.** Extend the S4 pins to the gateway: with the logical driver, a
+crossing commit interleave (the `TestLogicalFeedNoCommitOrderSkip`
+scenario) must reach a live WebSocket subscriber — **RED:** keep the
+`id <= lastID` skip → the late-committing lower id never arrives and the
+delivery assert goes red, which is the same undetectable loss S4 proved
+at the consumer layer, now proved at the connection. Also: no duplicate
+under steady state, at most one at the hand-off, `TestGatewayMulticast`'s
+one-read-per-org counter unchanged, and the ACL negative (the outsider
+still receives nothing) still green on the new path.
+
+**Gaps to record:** cross-node routing (S5's plane already carries
+presence; event routing stays per-cell); cohort/jittered resume for the
+reconnect storm (recorded separately).
+
+---
+
+### P-46 `gateway: Complete the read ACL — history floor and visibility scope.` — M — ZERO migrations (both hooks exist) — **SPEC-READY (SECURITY-CRITICAL → Fable execution per the standing rule; do NOT dispatch to a lower tier without an explicit override)**
+
+**What & why.** `docs/REALITY.md` has rated this WORKS-THIN since it
+landed: *"membership-set filter + refresh on membership events. Missing:
+history_mode/protected floor, VisibilityScope."* Two real holes remain
+in `client.filter` (`gateway.go:691+`):
+
+1. **No protected-history floor.** `channel_member.history_from`
+   (`0003_containers.sql:140`) is the ADR-008 C-2 protected-history
+   boundary that REST enforces. The gateway does not consult it, so a
+   member of a protected channel who RESUMES with a `last_id` from
+   before their join replays events predating their access.
+2. **Container-less events fan ORG-WIDE.** `filter`'s own doc says it:
+   space/work-item events have no channel or DM to gate on, so every
+   connection in the org receives them regardless of space access or
+   guest status. `visibility_scope` (`0005_work_tracking.sql:224`) and
+   `work_item.security_scope_id` are the dormant hooks for exactly this,
+   and `actor.IsGuest()` already gates the equivalent REST surfaces
+   (P-5).
+
+**Exposure is METADATA, not content — say so honestly and fix it
+anyway.** Event payloads carry ids and verbs, never message bodies (F-4),
+and REST re-checks every read with an oracle-free 404. But ids, verbs,
+actor ids and timing are exactly what an existence oracle is made of —
+this is the same class P-33/P-34/#107/#111 spent four slices closing on
+the REST side, and leaving the realtime plane exempt makes those slices
+partial. S3's shared per-org read also concentrated everything into this
+one predicate, so the filter is now the single choke point for the whole
+org.
+
+**Design (decided):**
+- **The history floor is TIME-based, and that is the subtle part.**
+  `history_from` is `TIMESTAMPTZ`, while the gateway orders by event id.
+  Do NOT invent an id-space floor. Carry the event's `occurred_at` on
+  `eventRow` (it is already on `event_log`) and compare against the
+  per-channel floor loaded alongside the membership set in
+  `loadChannels`, refreshed by the same membership events. State the
+  chosen comparison and its boundary semantics (inclusive/exclusive) in
+  the code — an off-by-one here is a silent leak or a silent gap.
+- **Container-less events resolve visibility instead of fanning.** Load
+  the connection's space-visibility set the way `channels`/`dms` are
+  loaded, refresh it on the events that change it, and default to
+  WITHHOLD when a scope cannot be resolved. **Fail closed** — an
+  unresolvable scope must never fall through to org-wide delivery, which
+  is precisely today's behaviour and the bug.
+- **Guests ride the same predicate**, no role branch, matching how P-34
+  handled guests (they ride the same gates, no special case).
+
+**Edge cases:** a member who left and rejoined (the `history_from`
+preserved on the surviving row — the #123 shape); an unsubscribed member
+with a live connection; work-item events with a NULL
+`security_scope_id`; a scope whose visibility changes mid-connection
+(refresh must be driven by an event, or the stale set is a leak);
+org-wide-visible space threads, which are legitimately org-wide and must
+NOT regress into over-withholding.
+
+**Tests (`TestGatewayReadACL`, real PG + real WebSockets).** The
+load-bearing shape is the NEGATIVE: an outsider connection must receive
+NOTHING, asserted the P-33/P-34 way — the outsider is a live fan target
+so the assert cannot pass vacuously. Cover: a protected-history member
+resuming from before their join receives nothing from before it, while a
+shared-history member does; a guest receives no space/work-item events
+outside their access; a non-member of a scoped space receives none;
+membership and scope CHANGES refresh mid-connection. **RED/GREEN:**
+(1) drop the history floor → the pre-join replay assert goes red;
+(2) restore the org-wide fan for container-less events → the guest/space
+assert goes red — the load-bearing line.
+
+**Gaps to record:** the client-side snapshot-refetch rule (REALITY's
+third missing item — it needs a real client, so it stays recorded);
+per-scope refresh granularity if the reload proves hot.
+
+---
+
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
 (Each needs a final-spec pass by the strongest model; the bullets below
 record the scope and the known design questions so nothing is lost.)
