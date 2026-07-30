@@ -10,6 +10,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 )
 
 // Deliverability maintains the F-17 materialized candidate set
@@ -37,15 +38,32 @@ import (
 // yet built skips the patch under the lock, because the build that follows
 // derives from post-commit truth anyway.
 type Deliverability struct {
-	pool *pgxpool.Pool
-	log  *slog.Logger
+	pool  *pgxpool.Pool
+	log   *slog.Logger
+	sweep *eventlog.Sweeper
+}
+
+// DeliverabilitySweep is the durable identity of the F-17 reconcile sweep's
+// cell-wide claim and per-org settled markers. Exported because a sweep
+// identity is an OPERATIONAL contract, the way a consumer name is: an
+// operator correlating pg_locks.objid or a sweep_org_state row with "who is
+// sweeping" needs it, and it is append-only — changing a field is a rename,
+// never a fix. The set is patched from member.joined/left off the
+// notifications consumer, so that is the consumer whose progress gates
+// settling.
+var DeliverabilitySweep = eventlog.SweepID{
+	Name: "deliverability_reconcile", Key: 1, Consumer: consumerName,
 }
 
 func NewDeliverability(pool *pgxpool.Pool, log *slog.Logger) *Deliverability {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &Deliverability{pool: pool, log: log}
+	return &Deliverability{
+		pool:  pool,
+		log:   log,
+		sweep: eventlog.NewSweeper(pool, DeliverabilitySweep),
+	}
 }
 
 // derivedReasonsSQL is THE derivation of who holds a non-default delivery
@@ -237,36 +255,103 @@ func (d *Deliverability) ReconcileChannel(ctx context.Context, orgID, channelID 
 	return missing, extra, err
 }
 
-// ReconcileOnce sweeps every built channel, one short transaction each
-// (the janitor cadence — the runner drives this on a slow ticker).
+// ReconcileOnce sweeps every built channel of every org that could have
+// changed, one short transaction each (the janitor cadence — the runner
+// drives this on a slow ticker).
+//
+// The pass is claimed cell-wide first (eventlog.Sweeper): every node runs its
+// own reconcileLoop, so without a claim an N-node cell performed N redundant
+// full sweeps per window, all contending on the same channel row locks that
+// the live patch path needs. A node that loses the claim returns nil and
+// waits for its next tick — at-most-once per window, which is the right side
+// of the trade for a convergence sweep (see the Sweeper doc).
+//
+// Idle orgs then cost approximately nothing (docs/SCHEMA.md's scale contract:
+// idle orgs cost zero). An org is skipped only while its event-log high-water
+// mark still equals the mark a previous pass recorded after verifying it
+// CLEAN — so drift is never what gets skipped: a pass that repaired anything,
+// hit any error, or ran ahead of the maintenance consumer refuses to settle,
+// and the org is walked again next window. The skip is a LEASE, never a
+// permanent excuse: a settled marker older than eventlog.SettleTTL stops
+// suppressing work, so every org is fully verified at least once per
+// SettleTTL however quiet it is. That deadline is what bounds the drift this
+// signal cannot see — the settings legs of this set (channel level, thread
+// follow, alert words) append no event. See sweep_org_state (0025) for the
+// whole argument.
 func (d *Deliverability) ReconcileOnce(ctx context.Context) error {
-	rows, err := d.pool.Query(ctx, `
-		SELECT id, org_id FROM channel
-		WHERE deliverability_built_at IS NOT NULL ORDER BY id`)
+	release, ok, err := d.sweep.Claim(ctx)
+	if err != nil || !ok {
+		return err
+	}
+	defer release()
+	orgs, err := d.sweep.Orgs(ctx)
 	if err != nil {
-		return fmt.Errorf("deliverability: list built channels: %w", err)
+		return err
 	}
-	type ch struct{ id, org int64 }
-	var chans []ch
-	for rows.Next() {
-		var c ch
-		if err := rows.Scan(&c.id, &c.org); err != nil {
-			rows.Close()
-			return fmt.Errorf("deliverability: scan channel: %w", err)
+	for _, o := range orgs {
+		if o.Settled {
+			continue
 		}
-		chans = append(chans, c)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("deliverability: list built channels: %w", err)
-	}
-	for _, c := range chans {
-		if _, _, err := d.ReconcileChannel(ctx, c.org, c.id); err != nil {
+		clean, err := d.reconcileOrg(ctx, o.OrgID)
+		if err != nil {
 			if ctx.Err() != nil {
 				return err
 			}
-			d.log.Warn("notification: reconcile channel", "channel", c.id, "err", err)
+			d.log.Warn("notification: reconcile org", "org", o.OrgID, "err", err)
+			continue
+		}
+		if !clean || o.Lagging {
+			continue // a repaired or unverifiable org stays unsettled
+		}
+		if err := d.sweep.Settle(ctx, o.OrgID, o.HighWater); err != nil {
+			if ctx.Err() != nil {
+				return err
+			}
+			d.log.Warn("notification: settle deliverability sweep", "org", o.OrgID, "err", err)
 		}
 	}
 	return nil
+}
+
+// reconcileOrg reconciles one org's built channels and reports whether the
+// whole org came back CLEAN — every channel visited, none repaired, none
+// errored. Only that verdict may settle the org: "repaired something" means
+// an invalidation bug just fired, which is the last moment to stop looking.
+func (d *Deliverability) reconcileOrg(ctx context.Context, orgID int64) (bool, error) {
+	rows, err := d.pool.Query(ctx, `
+		SELECT id FROM channel
+		WHERE org_id = $1 AND deliverability_built_at IS NOT NULL
+		ORDER BY id`, orgID)
+	if err != nil {
+		return false, fmt.Errorf("deliverability: list built channels: %w", err)
+	}
+	var ids []int64
+	for rows.Next() {
+		var id int64
+		if err := rows.Scan(&id); err != nil {
+			rows.Close()
+			return false, fmt.Errorf("deliverability: scan channel: %w", err)
+		}
+		ids = append(ids, id)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return false, fmt.Errorf("deliverability: list built channels: %w", err)
+	}
+	clean := true
+	for _, id := range ids {
+		missing, extra, err := d.ReconcileChannel(ctx, orgID, id)
+		if err != nil {
+			if ctx.Err() != nil {
+				return false, err
+			}
+			d.log.Warn("notification: reconcile channel", "channel", id, "err", err)
+			clean = false
+			continue
+		}
+		if missing+extra > 0 {
+			clean = false
+		}
+	}
+	return clean, nil
 }
