@@ -3001,6 +3001,144 @@ importer mapping of Zulip announcement-only streams → kind=4; the
 
 ---
 
+### P-27 `importer: Slack.` — L (was XL — see the sizing correction) — ZERO migrations — **SPEC-READY (the IR prep refactor is commit 1 and is what makes this tractable; `slack_incoming` split out as P-27b)**
+
+**Grounding done.** Zulip ships a mature Slack importer —
+`~/Documents/zulip/zerver/data_import/slack.py` (1951 lines) +
+`slack_message_conversion.py` — and it is the format authority for this
+slice: every export-shape claim below was read out of it, not recalled.
+Read BOTH in full before writing code, plus our
+`internal/domain/importer/{importer.go,zulip.go,importer_test.go}`.
+
+**The export format (verified in `slack.py`):** `users.json` ·
+`channels.json` (public) · `groups.json` (private) · `mpims.json`
+(group DMs) · `dms.json` (1:1) · one directory per conversation holding
+dated `.json` message files, walked by an iterator. Threading is
+`thread_ts` on replies pointing at the parent's `ts`. Reactions,
+`files`, and `subtype` ride the message objects.
+
+**SIZING CORRECTION — why this is L, not XL.** Our importer already
+splits cleanly: `zulip.go` owns PARSING (`LoadZulipExport(dir)
+(*Export, error)`) and `importer.go` owns WRITING (`Run` → `write`,
+~900 lines: upsert-by-origin, the fidelity `Report`, role mapping, DM
+landing, the attachments lane through `files.StorageKey`). A second
+source needs only a second loader — **except that `Export` is
+Zulip-SHAPED, not neutral**: `[]zulipUser`/`[]zulipStream`/
+`[]zulipMessage` plus Zulip's recipient indirection
+(`StreamByRecipient`, `PersonalTarget`, `DMGroupMembers`), none of
+which has a Slack analogue. So:
+
+- **Commit 1 is a PURE PREP REFACTOR (no behaviour change):** extract a
+  source-neutral IR that a loader produces and `write` consumes;
+  `LoadZulipExport` produces the IR. **The existing Zulip importer
+  tests, unchanged and green, ARE the no-op proof** — do not edit them
+  in this commit; if one needs editing, the refactor is not pure and
+  you must stop and report. This obeys "prep refactors separate from
+  features" and is the only way to add Slack without duplicating the
+  write path (the LLD rule: no duplicated derivations).
+- Later commits add `slack.go` — the loader only.
+
+**Design (decided):**
+- **Weft's thread model is a DIRECT fit — do NOT port Zulip's topic
+  synthesis.** Zulip has topics, not threads, so `slack.py` had to
+  invent topic names (`get_zulip_thread_topic_name`,
+  `create_topic_name_for_message`, the `convert_slack_threads` option,
+  `get_parent_user_id_from_thread_message`). Weft has first-class
+  threads, so a Slack `thread_ts` maps 1:1 onto a Weft thread and the
+  parent `ts` identifies its root. This is the single biggest
+  simplification over the reference implementation; state it in the
+  commit body so nobody ports the workaround.
+- **Containers:** `channels.json` → public channels · `groups.json` →
+  private · `mpims.json` → `dm_space` kind 2 (group) · `dms.json` →
+  kind 1 (1:1). Weft's canonical participant key already arbitrates
+  both, so no new DM machinery.
+- **Users:** `users.json`; `deleted` → deactivated; `is_admin`/
+  `is_owner` → role presets through the SAME shape as `weftRole`/
+  `roleGroup`; Slack single-channel guests → the Weft guest role,
+  honouring the P-5 role ceiling (invites mint member/guest only).
+  Bots (`is_bot`, `is_slackbot`, `is_integration_bot_message`) map to
+  the non-human user kind — never to kind=1 humans.
+- **Markup conversion** (ground in `slack_message_conversion.py`):
+  `<@U123|name>` → `@**Full Name**`; `<#C123|name>` → the channel ref;
+  `<url|label>` → a markdown link; mailto; `*bold*`/`_italic_`/
+  `~strike~` → the AST equivalents; `:emoji:`. **`@channel`/`@here`/
+  `@everyone` MUST become INERT TEXT.** Weft has no broadcast mentions
+  (verified: `content/parse.go` implements only `@**Full Name**`) and
+  P-44 bans them structurally; rendering them as anything live would
+  either lie about what the workspace can do or mint the exact
+  O(members) shape the scale cluster spent seven slices removing.
+  Slack `blocks` render best-effort to text (Zulip's `render_block` is
+  the reference); anything unrenderable is a Report bucket, never a
+  silent drop.
+- **Subtypes:** `file_share` carries its upload in `file` rather than
+  `files` — handle both. `channel_join`/`channel_leave` are noise and
+  are dropped (Zulip drops them too) but COUNTED in the Report.
+- **Files — v1 is OFFLINE, deliberately.** A standard Slack export
+  carries file METADATA with `url_private`, not bytes, and Zulip's
+  importer takes a download callback. Our Zulip importer is offline
+  (reads `uploads/` from the unpacked dir) and staying offline keeps
+  this slice free of a network+credential surface. So: if the bytes are
+  present in the export dir (pre-fetched by operator tooling), land them
+  through `files.StorageKey` exactly as the Zulip lane does; otherwise
+  record each file in the Report as skipped WITH its reason. Slack's
+  `mode: tombstone` / `hidden_by_limit` files (free-plan exports lose
+  file content permanently) must be counted explicitly — that is a real
+  fidelity loss and the Report exists so nobody discovers it later.
+  Token-authenticated fetch THROUGH the P-15/P-24 egress guard is a
+  recorded follow-up, not this slice.
+- **The importer invariants hold unchanged:** actor kind 4, so
+  backfills NEVER notify; upsert by `(org, origin_system='slack',
+  origin_id)` so re-runs count `AlreadyImported`; `dryRun` parses and
+  reports without writing; every source entity lands in exactly one
+  Report bucket (ADR-001: "nobody trusts a migrator that hides its
+  losses"). **Verify the S6 rule still holds on the new path:** the
+  importer-actor early return must precede the unread-counter call, or
+  a backfill inflates every member's badge.
+
+**Edge cases:** a `thread_ts` whose parent is missing (deleted parent,
+or a partial export) → the reply becomes a root rather than being
+dropped, counted as such; messages in a channel absent from
+`channels.json`; a DM whose participant is absent from `users.json`;
+bot messages with no author; duplicate `ts` within one channel (Slack
+permits it) — `origin_id` must stay unique, so compose it from
+(channel, ts) rather than `ts` alone; archived channels; `mpims` that
+are really 1:1 after departures.
+
+**Tests (`TestSlackImport`, fixture-driven and fully OFFLINE — the
+`importer_test.go` discipline).** Build a small hand-written export
+fixture covering: public + private channels, a 1:1 and a group DM,
+a threaded conversation, reactions, a bot message, a tombstoned file,
+a `channel_join` subtype, and one of every markup form. Assert STATE —
+row counts, thread parentage, DM participant sets, Report bucket
+totals, and that the event log carries actor kind 4 with ZERO
+notification rows minted. **RED/GREEN (pin both in comments):** (1)
+ignore `thread_ts` → replies flatten onto the channel root and the
+thread-shape assert goes red — the load-bearing line, since threading
+is the whole reason this maps better to Weft than to Zulip; (2) render
+`@channel` as a live mention → the inert-text assert goes red.
+
+**Scale.** Slack exports are commonly multi-GB with one file per
+conversation per day. v1 keeps the Zulip lane's one-transaction
+all-or-nothing shape for consistency, and inherits its SAME recorded
+follow-up (chunked streaming per messages file, which "keeps this exact
+call shape"). Say so honestly in the PR rather than implying it
+streams. Nothing here touches a per-message hot path.
+
+**Split out — P-27b `messaging: Slack-compatible incoming webhook
+(slack_incoming).`** — S. The compat endpoint is LIVE-traffic
+compatibility, not import: it accepts Slack's incoming-webhook payload
+shape so existing Slack integrations keep posting. It shares no code
+with the importer, and P-23's capability-token webhook lane already
+provides the auth model. Dispatch separately.
+
+**Gaps to record:** token-authenticated file fetch behind the egress
+guard; Slack Enterprise/compliance export shapes; canvases, huddles,
+workflows, and saved items; user custom profile fields (Zulip maps
+these — we have no counterpart surface yet); per-channel notification
+prefs; shared/Connect channels (ADR-004 territory, not import).
+
+---
+
 ## Tier 2 — scoped, but DO NOT dispatch until promoted to Tier 1
 (Each needs a final-spec pass by the strongest model; the bullets below
 record the scope and the known design questions so nothing is lost.)
@@ -3040,8 +3178,12 @@ record the scope and the known design questions so nothing is lost.)
 - **P-25** — **promoted to Tier 1** (full spec above).
 - **P-26 `automation: LLM steps + budgets + approval gates.`** XL —
   NEEDS-DESIGN: model gateway seam, budget metering, run status 8 flow.
-- **P-27 `importer: Slack.`** XL — export parsing + slack_incoming
-  compat endpoint. Ground in Slack export format docs before speccing.
+- **P-27** — **promoted to Tier 1** (full spec above; grounded in
+  Zulip's own `data_import/slack.py` rather than format docs. Sized
+  DOWN to L: the write path is already reusable, so commit 1 is a pure
+  IR prep refactor and the rest is a loader. Weft's first-class threads
+  take Slack's `thread_ts` directly — Zulip's topic-synthesis
+  workaround must NOT be ported. `slack_incoming` split out as P-27b).
 - **P-28 `importer: Jira.`** XL — deliberately last (M3 exit).
 - **P-29** — **promoted to Tier 1** (full spec above; password RESET
   split out as P-35 — it depends on P-20's mail plumbing).
