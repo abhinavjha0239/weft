@@ -105,6 +105,18 @@ middleware); one Prometheus registry (`/metrics`): HTTP latency/status,
 gateway connections + queue depth, consumer lag per (consumer, org) — lag is
 THE health signal of the whole design. pprof behind a debug flag.
 
+`consumer_lag{consumer,org}` counts what is COMMITTED and not yet acked, and
+is measured WITHOUT the driver's delivery gate — deliberately. Measuring it
+through `pg_snapshot_xmin` (as the xmin driver did until the S4 review) made
+it read 0 during the exact stall it exists to surface, because the horizon
+that stops delivery also stops the max id the query can see. A stopped
+delivery mechanism must SHOW as rising lag under either driver, and
+committed-but-not-yet-deliverable events count as lag, because that is what
+they are. The unit is a driver detail (xmin: an id delta against
+`event_consumer_cursor.last_id`; logical: an exact entry count against its
+`lsn`); the contract is "0 means caught up, and it rises when a consumer
+falls behind".
+
 ### 6.1 Runbook — the logical-decoding event feed (S4)
 
 The event feed is a seam with two drivers, picked by

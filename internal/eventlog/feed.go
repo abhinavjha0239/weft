@@ -24,8 +24,13 @@ import (
 //   - Ack durably advances the cursor. Delivery is AT-LEAST-ONCE: a crash
 //     between processing and Ack replays, so consumers must be idempotent
 //     (dedupe keys / ON CONFLICT claims — the outbox rule already requires it).
-//   - Lag reports the org's undelivered backlog and publishes it as the
-//     consumer_lag{consumer,org} gauge.
+//   - Lag reports the org's undelivered backlog — committed and not yet acked —
+//     and publishes it as the consumer_lag{consumer,org} gauge. It is measured
+//     WITHOUT the driver's own delivery gate, on purpose: a mechanism that has
+//     stopped delivering must SHOW as lag, never hide behind its own horizon.
+//     The unit is a driver detail (the xmin driver returns an id delta against
+//     last_id, the logical driver an exact entry count against lsn); "0 means
+//     caught up, and it rises when this consumer falls behind" is the contract.
 type Feed interface {
 	Poll(ctx context.Context, orgID int64) ([]Row, error)
 	Ack(ctx context.Context, orgID, lastID int64) error

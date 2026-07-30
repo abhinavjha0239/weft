@@ -67,7 +67,10 @@ stamped at a transaction's first write and the id at append, so a transaction
 holding a lower txid and a higher id can commit first and carry the cursor
 past a lower id still in flight (S4 found this; `TestLogicalFeedNoCommitOrderSkip`
 demonstrates it against this driver). The logical-decoding feed removes the
-class outright — WAL order is commit order. Payload holds structural deltas +
+class outright — WAL order is commit order. The gate is a DELIVERY gate only:
+`consumer_lag` measures the backlog WITHOUT it, because a backlog measured
+through the horizon that caused the backlog reads 0 (S4 found that; the fix is
+pinned by `TestConsumerLagSeesGlobalStall`). Payload holds structural deltas +
 revision references + content hash — never the only copy of content — which is
 what makes GDPR erasure a revision-row delete (`scrub` cascade) instead of a
 log rewrite, and keeps hash-chains valid across purges.
