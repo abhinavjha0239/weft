@@ -52,7 +52,16 @@ type Event struct {
 }
 
 // Append inserts the event within the caller's transaction and schedules a
-// commit-time NOTIFY so consumers wake without polling.
+// commit-time wake-up so consumers do not have to poll blind.
+//
+// The wake rides the INSERT's RETURNING clause (event_log_wake, migration
+// 0024): ONE statement, and at most ONE pg_notify per (transaction, org) no
+// matter how many events the transaction appends — a transaction writing N
+// events used to pay N extra round trips (S4 NOTIFY coalescing). NOTIFY is
+// transactional, so it is delivered only on commit and a waking consumer
+// always finds the row. Under the logical-decoding feed the notification is a
+// wake HINT only (the reader is pushed by the WAL); under the default xmin
+// poller it is still the primary wake path.
 func Append(ctx context.Context, tx pgx.Tx, e Event) (int64, error) {
 	if e.Verb == "" {
 		return 0, fmt.Errorf("eventlog: empty verb")
@@ -65,24 +74,23 @@ func Append(ctx context.Context, tx pgx.Tx, e Event) (int64, error) {
 		e.Payload = json.RawMessage(`{}`)
 	}
 	var id int64
+	// wakeSent reports whether THIS append issued the pg_notify — false once an
+	// earlier append in the same transaction already signalled this org. Append
+	// does not surface it (no caller has a use for it), but the RETURNING column
+	// must be scanned, and it is what makes the coalescing directly assertable.
+	var wakeSent bool
 	err := tx.QueryRow(ctx, `
 		INSERT INTO event_log
 			(org_id, workspace_id, actor_kind, actor_id, entity_type,
 			 entity_id, verb, payload, hint, occurred_at, origin)
 		VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
-		RETURNING id`,
+		RETURNING id, event_log_wake($12, org_id)`,
 		e.OrgID, e.WorkspaceID, int16(e.ActorKind), e.ActorID,
 		int16(e.EntityType), e.EntityID, e.Verb, e.Payload, e.Hint,
-		occurred, e.Origin,
-	).Scan(&id)
+		occurred, e.Origin, NotifyChannel,
+	).Scan(&id, &wakeSent)
 	if err != nil {
 		return 0, fmt.Errorf("eventlog: append: %w", err)
-	}
-	// NOTIFY is transactional: delivered only on commit, so a waking consumer
-	// always finds the row (once past the txid gate).
-	if _, err := tx.Exec(ctx,
-		`SELECT pg_notify($1, $2)`, NotifyChannel, fmt.Sprint(e.OrgID)); err != nil {
-		return 0, fmt.Errorf("eventlog: notify: %w", err)
 	}
 	return id, nil
 }

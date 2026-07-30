@@ -135,8 +135,11 @@ with its scale-tier replacement designed:
   logical-decoding feed (WAL order = commit order) behind the same interface.
 - **Per-org consumption** must be NOTIFY-scheduled at runtime — idle orgs
   cost zero; a dispatcher polls only signaled orgs. Never one loop per org.
-- **NOTIFY per append** is fine to ~10k events/s; beyond that, coalesce
-  notifications per (tx, org) — payloads are already just the org id.
+- ~~**NOTIFY per append**~~ — DONE (S4): the wake is coalesced per
+  (transaction, org) by `event_log_wake` (0024) and folded into `Append`'s
+  `RETURNING`, so a transaction appending N events costs N statements and at
+  most one `pg_notify` per org, not 2N and N. Payloads are still just the
+  org id.
 - **Fan-out ceilings** are designed away up front: read state is O(threads)
   (F-7), notification candidates come from the materialized deliverability
   set (F-17), ACL checks are one closure join (F-16) — these are the three
