@@ -2888,7 +2888,7 @@ Security-critical → Fable execution when promoted.
 
 ---
 
-### P-44 `channels: Announcement mode — O(1) unread at unbounded membership.` — L — migration 0025 — **SPEC-READY (carries the cluster's membership axis; the constant-write pin is the load-bearing line)**
+### P-44 `channels: Announcement mode — O(1) unread at unbounded membership.` — L — migration 0026 — **SPEC-READY (carries the cluster's membership axis; the constant-write pin is the load-bearing line)**
 
 **What & why.** After S6 (#117) and its follow-up (#118), the ONE
 remaining per-message cost that scales with membership is
@@ -2916,7 +2916,7 @@ delta discipline are the model to extend, not replace), plus
 `readstate.go`, `channels.go`, `threads.go`'s send gate, and 0023.
 
 **Design (decided):**
-- **The channel counter** (migration 0025, SIBLING table
+- **The channel counter** (migration 0026, SIBLING table
   `channel_announce_counter (channel_id PK, org_id, live_countable_total
   BIGINT NOT NULL DEFAULT 0)` — a sibling keeps `channel` narrow and
   gives the hot row its own `fillfactor=70`). `+1` per posted message,
