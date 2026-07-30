@@ -2678,11 +2678,23 @@ documented as an operator step. Cite ADR-003 F-1 + `consumer.go:21-31`.
 
 **Red/green proof plan.** `TestLogicalFeedNoGlobalStall`: open a
 deliberately long-running write tx in org A, then send+consume in org
-B; assert org B's `consumer_lag` (S0) stays ~0. **RED:** point the
-consumer at the old xmin-gated `Poll` → org B stalls behind org A's
-long tx and the "no cross-org stall" assert goes red (the exact blowup
-`consumer.go:22-26` describes). Plus parity: no event skipped, commit
-order preserved under the logical feed.
+B. **RED:** point the consumer at the old xmin-gated `Poll` → org B
+stalls behind org A's long tx and the DELIVERY assert goes red (the
+exact blowup `consumer.go:22-26` describes). Plus parity: no event
+skipped, commit order preserved under the logical feed.
+
+> **CORRECTED AT EXECUTION (#124), kept as a worked example.** This
+> plan originally read "assert org B's `consumer_lag` (S0) stays ~0".
+> That pin **cannot go red** — it passes on BOTH drivers, because the
+> xmin `Lag` query carried the SAME global horizon as `Poll`, so during
+> the stall the numerator froze along with the cursor and the gauge
+> reported 0 while the backlog grew. The pin was inverted to assert
+> DELIVERY, and the blind gauge became its own follow-up slice (the
+> gate is now removed from `Lag`; `TestConsumerLagSeesGlobalStall`
+> pins it). **The lesson generalises: a spec may name a pin that is
+> unfalsifiable, so an executor must PROVE red before trusting green,
+> and report rather than quietly adjusting.** Left visible here on
+> purpose — a deleted mistake teaches nobody.
 
 **Risks / pre-mortem.** (1) Replication slots retain WAL if a consumer
 dies — a stuck slot fills the disk. Mitigation: slot monitoring via S0
