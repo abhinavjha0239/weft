@@ -53,6 +53,18 @@ Where things live:
    what scans, what locks, what the recorded upgrade is.
 7. **The user approves slices.** End each PR report with the recorded
    next recommendation + alternatives, then WAIT for "continue"/"proceed".
+8. **Executor model policy: OPUS ONLY. Fable is strictly prohibited**
+   (user directive, 2026-07-31). This SUPERSEDES every "Fable
+   execution" instruction still written in `docs/ROADMAP.md` and
+   `TIMELINE.md` — those are either historical records of slices that
+   already shipped (leave them; they are accurate history) or stale
+   forward-looking markings (P-43/S7 and P-46 are corrected in place).
+   Security-critical and correctness-critical slices still exist and
+   still need extra rigour; that rigour now comes from PROCESS, not
+   model tier — see P-46's mandatory compensating controls: reviewer
+   line-by-line review BEFORE the PR is opened, a red/green pin for
+   every security claim, negative tests written so they cannot pass
+   vacuously, and a written fail-closed argument in the PR body.
 
 ## The slice loop (repeat per PR)
 
