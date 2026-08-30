@@ -2,7 +2,7 @@ module github.com/abhinavjha0239/weft
 
 go 1.25.5
 
-toolchain go1.25.12
+toolchain go1.25.13
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.42.1
