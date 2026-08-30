@@ -68,6 +68,12 @@ type client struct {
 	// rule, M0 slice).
 	channels map[int64]bool
 	dms      map[int64]bool
+	// historyFloor is the ADR-008 C-2 protected-history boundary per channel:
+	// channel_member.history_from for the channels that stamped one. Absent
+	// key = full history (a shared channel, or the protected channel's
+	// creator). Loaded and refreshed with `channels` by loadChannels, so the
+	// same membership events that widen the view also carry the floor.
+	historyFloor map[int64]time.Time
 	// Inbound signal-frame budget (typing storms, abuse).
 	frameLimit *rate.Limiter
 	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
@@ -552,6 +558,12 @@ type eventRow struct {
 	id      int64
 	verb    string
 	payload json.RawMessage
+	// occurredAt is the event's DOMAIN time (event_log.occurred_at) — the same
+	// clock message.created_at runs on, and the one importers backdate (E3).
+	// The read ACL's protected-history floor compares against it: the floor is
+	// a TIMESTAMPTZ (channel_member.history_from) while the stream is ordered
+	// by id, so there is no id-space equivalent to compare with.
+	occurredAt time.Time
 	// enc is the row's Envelope pre-marshaled ONCE by the multicast reader
 	// (the Envelope is identical for every connection in the org — same seq,
 	// verb, payload, org id), so the fan reuses these bytes instead of
@@ -566,7 +578,7 @@ type eventRow struct {
 // consumers use (F-1) so an in-flight transaction's rows never surface early.
 func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) ([]eventRow, error) {
 	rows, err := h.pool.Query(ctx, `
-		SELECT e.id, e.verb, e.payload
+		SELECT e.id, e.verb, e.payload, e.occurred_at
 		FROM event_log e
 		WHERE e.org_id = $1 AND e.id > $2
 		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())
@@ -580,7 +592,7 @@ func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) (
 	var batch []eventRow
 	for rows.Next() {
 		var r eventRow
-		if err := rows.Scan(&r.id, &r.verb, &r.payload); err != nil {
+		if err := rows.Scan(&r.id, &r.verb, &r.payload, &r.occurredAt); err != nil {
 			return nil, err
 		}
 		batch = append(batch, r)
@@ -625,7 +637,7 @@ func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) er
 		if r.id <= c.lastID {
 			continue
 		}
-		deliver, refresh := c.filter(r.verb, r.payload)
+		deliver, refresh := c.filter(r)
 		if refresh {
 			if err := c.loadChannels(ctx, h.pool); err != nil {
 				return err
@@ -684,26 +696,38 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 	return nil
 }
 
-// filter applies the read ACL: channel-scoped events require membership,
-// DM-scoped events require participation, container-less events (spaces)
-// deliver org-wide. Events about this user's own membership trigger a view
-// refresh. dm.opened and dm.participants_changed decide from their user_ids
-// list rather than current participation: dm.opened reaches the invited side
-// whose view predates the new conversation, and dm.participants_changed
-// reaches the leaver whose view must now drop it (their dm_participant row is
-// already gone, so a participation check would wrongly withhold it).
-func (c *client) filter(verb string, payload json.RawMessage) (deliver, refresh bool) {
+// filter applies the read ACL: channel-scoped events require membership AND
+// clear the channel's protected-history floor, DM-scoped events require
+// participation, container-less events (spaces) deliver org-wide. Events about
+// this user's own membership trigger a view refresh. dm.opened and
+// dm.participants_changed decide from their user_ids list rather than current
+// participation: dm.opened reaches the invited side whose view predates the new
+// conversation, and dm.participants_changed reaches the leaver whose view must
+// now drop it (their dm_participant row is already gone, so a participation
+// check would wrongly withhold it).
+//
+// The floor (ADR-008 C-2, F-16b) is the half REST already enforced and the
+// stream did not: a member of a PROTECTED channel resuming with a last_id from
+// before their join used to replay events that predate their access. The
+// comparison is deliberately TIME-based — history_from is a TIMESTAMPTZ and
+// the stream is ordered by id, so there is no id-space floor to compare with —
+// and its boundary is INCLUSIVE of history_from: an event whose occurred_at
+// EQUALS the stamp is delivered. That is exactly messaging.ListMessages'
+// `created_at >= history_from` and the negation of messaging.Get's
+// `created_at < history_from` hide-rule, so the realtime plane and the REST
+// read answer identically at the boundary instant.
+func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	var p struct {
 		ChannelID int64   `json:"channel_id"`
 		DMSpaceID int64   `json:"dm_space_id"`
 		UserID    int64   `json:"user_id"`
 		UserIDs   []int64 `json:"user_ids"`
 	}
-	_ = json.Unmarshal(payload, &p)
-	if (verb == "member.joined" || verb == "member.left") && p.UserID == c.id.UserID {
+	_ = json.Unmarshal(r.payload, &p)
+	if (r.verb == "member.joined" || r.verb == "member.left") && p.UserID == c.id.UserID {
 		refresh = true
 	}
-	if verb == "dm.opened" || verb == "dm.participants_changed" {
+	if r.verb == "dm.opened" || r.verb == "dm.participants_changed" {
 		for _, uid := range p.UserIDs {
 			if uid == c.id.UserID {
 				return true, true
@@ -712,7 +736,16 @@ func (c *client) filter(verb string, payload json.RawMessage) (deliver, refresh 
 		return false, refresh
 	}
 	if p.ChannelID != 0 {
-		return c.channels[p.ChannelID], refresh
+		if !c.channels[p.ChannelID] {
+			return false, refresh
+		}
+		// Protected-history floor. Absent key = no boundary (shared channel or
+		// the protected channel's creator) — the common case, one map miss.
+		if floor, bounded := c.historyFloor[p.ChannelID]; bounded &&
+			r.occurredAt.Before(floor) {
+			return false, refresh
+		}
+		return true, refresh
 	}
 	if p.DMSpaceID != 0 {
 		return c.dms[p.DMSpaceID], refresh
@@ -721,25 +754,43 @@ func (c *client) filter(verb string, payload json.RawMessage) (deliver, refresh 
 }
 
 func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
+	// The membership set and its protected-history floors load together, so a
+	// refresh can never widen the view without carrying the boundary that
+	// bounds it. history_from is stamped ONLY on a join to a history_mode=2
+	// channel and is never cleared (ADR-008 C-4 keeps the row across
+	// unsubscribe precisely so the boundary survives leave→rejoin), so a
+	// non-NULL stamp IS the protected boundary and is honoured unconditionally:
+	// the failure direction is a withheld event the client refetches over REST,
+	// never a delivered one REST would hide. The channel join adds the org pin
+	// the bare channel_member read lacked (cell isolation, defence in depth —
+	// a user's memberships are all in their own org today).
 	rows, err := pool.Query(ctx, `
-		SELECT channel_id FROM channel_member
-		WHERE user_id = $1 AND unsubscribed_at IS NULL`, c.id.UserID)
+		SELECT cm.channel_id, cm.history_from
+		FROM channel_member cm
+		JOIN channel c ON c.id = cm.channel_id AND c.org_id = $2
+		WHERE cm.user_id = $1 AND cm.unsubscribed_at IS NULL`,
+		c.id.UserID, c.id.OrgID)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 	set := map[int64]bool{}
+	floors := map[int64]time.Time{}
 	for rows.Next() {
 		var id int64
-		if err := rows.Scan(&id); err != nil {
+		var from *time.Time
+		if err := rows.Scan(&id, &from); err != nil {
 			return err
 		}
 		set[id] = true
+		if from != nil {
+			floors[id] = *from
+		}
 	}
-	c.channels = set
 	if err := rows.Err(); err != nil {
 		return err
 	}
+	c.channels, c.historyFloor = set, floors
 	drows, err := pool.Query(ctx,
 		`SELECT dm_space_id FROM dm_participant WHERE user_id = $1`, c.id.UserID)
 	if err != nil {
