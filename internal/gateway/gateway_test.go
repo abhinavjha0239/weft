@@ -131,18 +131,29 @@ func TestMulticastFeedErrors(t *testing.T) {
 //
 // It is here because both ways of getting this wrong are SILENT. entity_type
 // classifies a container-less event as space-scoped; left at zero it is not,
-// so scoped events fall back to the org-wide fan — a leak. occurred_at is
+// so scoped events fall back to the org-wide fan — a leak. boundaryAt is
 // compared against channel_member.history_from; left at zero it is before every
 // floor, so a protected-history member silently stops receiving. Neither is a
 // compile error and neither shows up in a delivery-count assert, so the
 // structure is one construction site (fanRows) and this is the pin on it.
 //
-// RED: drop either field from fanRows — the matching assert names it.
+// boundaryAt is the EARLIER of occurred_at and recorded_at, and this pins both
+// directions of that rule — the import shape (recorded later, so the backdated
+// domain time must win) and the clock-skew shape (recorded earlier, so an app
+// clock running ahead must not open the floor).
+//
+// RED: drop either field from fanRows, or take OccurredAt alone instead of the
+// earlier of the two — the matching assert names it.
 func TestFannedRowCarriesACLColumns(t *testing.T) {
 	when := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
+	// recorded_at LATER than occurred_at is the IMPORT shape (E3 backdates the
+	// domain time while ingest stamps the row today), so LEAST must pick
+	// occurred_at — judging recorded_at alone would stream a member the
+	// pre-join history a backfill just wrote.
 	row := eventlog.Row{
 		ID: 41, Verb: "workitem.updated", Payload: json.RawMessage(`{"a":1}`),
-		OccurredAt: when, EntityType: enum.EntityWorkItem,
+		OccurredAt: when, RecordedAt: when.Add(time.Hour),
+		EntityType: enum.EntityWorkItem,
 	}
 
 	// The helper itself.
@@ -150,9 +161,20 @@ func TestFannedRowCarriesACLColumns(t *testing.T) {
 	if len(got) != 1 {
 		t.Fatalf("fanRows produced %d rows, want 1", len(got))
 	}
-	if !got[0].occurredAt.Equal(when) {
-		t.Fatalf("occurredAt = %v, want %v: a zero domain time is BEFORE every "+
-			"protected-history floor, so members silently stop receiving", got[0].occurredAt, when)
+	if !got[0].boundaryAt.Equal(when) {
+		t.Fatalf("boundaryAt = %v, want %v: a zero domain time is BEFORE every "+
+			"protected-history floor, so members silently stop receiving", got[0].boundaryAt, when)
+	}
+	// The other direction of LEAST: an app clock running AHEAD of the DB would
+	// put an event that raced a join on the delivered side of a boundary REST
+	// hides, so the EARLIER of the two must win here too. Taking OccurredAt
+	// alone reinstates that leak (gateway_acl_test.go break 17).
+	earlier := when.Add(-time.Hour)
+	skewed := fanRows([]eventlog.Row{{ID: 42, OccurredAt: when, RecordedAt: earlier}})
+	if !skewed[0].boundaryAt.Equal(earlier) {
+		t.Fatalf("boundaryAt = %v, want the EARLIER %v: the floor must be judged on "+
+			"LEAST(occurred_at, recorded_at), not on the app clock alone",
+			skewed[0].boundaryAt, earlier)
 	}
 	if got[0].entityType != enum.EntityWorkItem {
 		t.Fatalf("entityType = %v, want %v: a zero entity type is not space-scoped, "+
@@ -172,7 +194,7 @@ func TestFannedRowCarriesACLColumns(t *testing.T) {
 	default:
 		t.Fatal("the multicast reader fanned nothing")
 	}
-	if len(fanned) != 1 || !fanned[0].occurredAt.Equal(when) ||
+	if len(fanned) != 1 || !fanned[0].boundaryAt.Equal(when) ||
 		fanned[0].entityType != enum.EntityWorkItem {
 		t.Fatalf("the live lane fanned %+v; the ACL columns did not survive the fan", fanned)
 	}
