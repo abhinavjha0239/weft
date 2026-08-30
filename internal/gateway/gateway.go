@@ -12,11 +12,23 @@
 // A connection that reconnects behind the org head runs its OWN bounded
 // catch-up (the per-connection pump) only until it reaches the head, then joins
 // the live lane; the per-connection query survives for the resume gap alone.
+//
+// Both lanes read through the event-feed seam (eventlog.Tail, P-45), so the
+// operator's driver choice reaches live fan-out too. Under the commit-ordered
+// logical driver an event with a LOWER id can legitimately arrive AFTER a
+// higher one — that is the point of that feed — so `id <= lastID` stops
+// meaning "already delivered" and a connection tracks what it has ACTUALLY
+// sent. The protocol cost is stated in ADR-002 and repeated here because it is
+// a WIRE contract: seq is still the event id and still replayable with
+// `WHERE id > seq`, sequences are still gappy (ACL filtering), and clients must
+// now also tolerate a rare DUPLICATE seq, bounded to the live/resume hand-off.
+// Duplicates are absorbable by any client; the alternative was silent LOSS.
 package gateway
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strconv"
@@ -28,6 +40,8 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/enum"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 	"github.com/abhinavjha0239/weft/internal/platform/presence"
 )
@@ -63,6 +77,13 @@ type client struct {
 	// dropped (backpressure) rather than stalling the org (F-2 resync on reconnect).
 	feed chan []eventRow
 	wake chan struct{}
+	// recent is the bounded window of event ids this connection has ACTUALLY
+	// handled — the only sound "already delivered" test under a COMMIT-ordered
+	// feed, where the cursor cannot serve as one (see client.passed). nil
+	// under an id-monotone feed (the default xmin driver), which needs no
+	// window at all, and nil until the first row is passed, so the 100k-live-
+	// connection case pays for it only on the connections that resume.
+	recent *recentIDs
 	// Membership views for ACL filtering (channels + DM participation);
 	// refreshed when a membership event for this user arrives (F-2 replay
 	// rule, M0 slice).
@@ -79,6 +100,49 @@ type client struct {
 // connections drain immediately; a stalled one is shed fast, not indulged.
 const feedBuffer = 16
 
+// recentWindow bounds the per-connection recently-delivered id window. It has
+// to cover the only span where a connection can be handed a row it already
+// sent: the resume→live hand-off, where the shared batch starts at the org's
+// reader position and the connection's own pump may already have run past it
+// (events committed DURING the drain). That span is normally a handful of
+// events; 64 covers it with 512 bytes per connection, which is what makes the
+// window affordable at the 100k-connection target.
+//
+// Overflowing it costs a DUPLICATE seq — allowed by the protocol since P-45
+// and absorbable by any client — never a drop. That asymmetry is the whole
+// reason the window may be bounded at all: the failure mode of "too small" is
+// chatter, not loss.
+const recentWindow = 64
+
+// recentIDs is a fixed ring of the ids a connection has handled most recently.
+// A ring rather than a map: 64 int64s are one linear scan of half a cache
+// line's worth of lines, it allocates once, and it is only ever SCANNED on the
+// rare path (a row at or below the cursor — see client.passed), while the
+// common forward row answers from the cursor alone.
+type recentIDs struct {
+	ring [recentWindow]int64
+	next int
+}
+
+// add records id, evicting the oldest. Event ids start at 1, so the zero value
+// can never collide with a real id.
+func (r *recentIDs) add(id int64) {
+	r.ring[r.next] = id
+	r.next++
+	if r.next == len(r.ring) {
+		r.next = 0
+	}
+}
+
+func (r *recentIDs) has(id int64) bool {
+	for _, v := range r.ring {
+		if v == id {
+			return true
+		}
+	}
+	return false
+}
+
 // orgShard is one org's slice of the hub — its live connections and its
 // per-user derived-presence registry — under a single per-org lock. The hub's
 // top-level mu only guards the orgs map; all per-org work takes the shard lock,
@@ -88,12 +152,22 @@ type orgShard struct {
 	orgID int64
 	mu    sync.Mutex
 	conns map[*client]struct{}
-	// head is the org's live event cursor: the highest event-log id the
-	// multicast reader has read for the live lane (guarded by mu). A resuming
-	// connection joins the live lane only once its own cursor reaches head, and
-	// the reader advances head under the same lock — so the resume→live hand-off
-	// is a single consistent point and no event slips through it.
+	// head is the org's live event cursor in ID space: the highest event-log id
+	// the multicast reader has fanned (guarded by mu). A resuming connection
+	// joins the live lane only once its own cursor reaches head, and the reader
+	// advances head under the same lock — so the resume→live hand-off is a
+	// single consistent point and no event slips through it. It is compared
+	// against a connection's last_id, which is an event id (ADR-002 F-2), so
+	// it must stay in id space and it must be MONOTONE: under a commit-ordered
+	// feed a batch can carry a LOWER id than one already fanned, and a head
+	// that fell back would send a still-behind connection live.
 	head int64
+	// pos is the same cursor in the FEED DRIVER's ordering domain (an event id
+	// under xmin, a commit LSN under logical) and is what the reader actually
+	// reads from. It is separate from head because commit order is not id
+	// order: under the logical driver head can stand still while pos advances
+	// past a late-committing lower id.
+	pos eventlog.Position
 	// wake signals the per-org multicast reader; buffered 1 so many event
 	// notifications for one org coalesce into a single catch-up pass.
 	wake chan struct{}
@@ -108,6 +182,18 @@ type orgShard struct {
 type Hub struct {
 	pool *pgxpool.Pool
 	log  *slog.Logger
+
+	// tail is the event source for BOTH lanes (the S4 driver seam, P-45): the
+	// per-org multicast reader's hoisted live read and the per-connection
+	// resume replay. Default = the xmin-gated tail this hub has always used,
+	// so a hub that never calls SetSource behaves exactly as before;
+	// SetSource swaps in the operator's driver.
+	tail eventlog.Tail
+	// ordered caches tail.Ordered() — read once per delivered row, and the
+	// difference between "already delivered" being a cursor comparison and
+	// being a window lookup (client.passed). Cached, not called, because it is
+	// a fixed property of the wired driver and this is the hot loop.
+	ordered bool
 
 	// Durable read-state dependency for the read_marker signal; optional
 	// (nil = signal ignored), set via SetMarkReader at wiring time.
@@ -155,9 +241,31 @@ type Hub struct {
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
 	h := &Hub{pool: pool, log: log, IdleAfter: 10 * time.Minute,
 		orgs: map[int64]*orgShard{}, runCtx: context.Background(),
-		plane: presence.Local()}
+		plane: presence.Local(), tail: eventlog.NewTail(pool), ordered: true}
 	h.SetMetrics(metrics.Nop())
 	return h
+}
+
+// SetSource swaps the event-feed driver (S4/P-45) — the runner SetSource
+// pattern, for the one consumer that reads through the CURSOR-FREE half of the
+// seam. Optional: the default is the xmin-gated tail this hub has always used,
+// which is also what keeps the default driver byte-for-byte unchanged.
+//
+// Under a commit-ordered driver the gateway also changes what it treats as
+// "already delivered" — see client.passed — so this must be called ONCE at
+// wiring, before Run/Serve, and never mid-flight: connections registered under
+// one rule must not be delivered to under the other.
+func (h *Hub) SetSource(src eventlog.Source) {
+	h.tail = src.Tail()
+	h.ordered = h.tail.Ordered()
+	// Take the driver's PUSH wake as well as the LISTEN one. Under a streaming
+	// driver the two fire at different instants and only this one is useful:
+	// Append's NOTIFY arrives at COMMIT, before the WAL reader has decoded the
+	// commit, so the woken read finds nothing and live delivery silently falls
+	// back to the 5s sweep. wakeOrg is a map lookup plus a non-blocking send,
+	// which is what the OnWake contract requires. The LISTEN path stays: it is
+	// the whole wake mechanism for the default driver.
+	h.tail.OnWake(h.wakeOrg)
 }
 
 // SetPresencePlane wires the cross-node presence plane (the platform/presence
@@ -195,12 +303,12 @@ func (h *Hub) shards() []*orgShard {
 // c starts live. Registration nests h.mu→sh.mu so a shard is never deleted by
 // a concurrent deregister between lookup and insert (which would strand the
 // connection in an orphaned shard, invisible to fan-out).
-func (h *Hub) register(c *client, orgHead int64, now time.Time) (announce, live bool) {
+func (h *Hub) register(c *client, pos eventlog.Position, orgHead int64, now time.Time) (announce, live bool) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	sh := h.orgs[c.id.OrgID]
 	if sh == nil {
-		sh = h.newShard(c.id.OrgID, orgHead)
+		sh = h.newShard(c.id.OrgID, pos, orgHead)
 		h.orgs[c.id.OrgID] = sh
 	}
 	c.shard = sh
@@ -216,13 +324,14 @@ func (h *Hub) register(c *client, orgHead int64, now time.Time) (announce, live 
 // newShard builds an org's shard and starts its multicast reader. Caller holds
 // h.mu. The reader's context derives from the hub lifetime and a per-shard
 // cancel, so it stops on hub shutdown OR the moment the org empties.
-func (h *Hub) newShard(orgID, head int64) *orgShard {
+func (h *Hub) newShard(orgID int64, pos eventlog.Position, head int64) *orgShard {
 	ctx, cancel := context.WithCancel(h.runCtx)
 	sh := &orgShard{
 		orgID:     orgID,
 		conns:     map[*client]struct{}{},
 		userConns: map[int64]*userPresence{},
 		head:      head,
+		pos:       pos,
 		wake:      make(chan struct{}, 1),
 		stop:      cancel,
 	}
@@ -347,14 +456,18 @@ func (sh *orgShard) wakeReader() {
 // Serve upgrades the request and streams events. ?last_id=N resumes.
 func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	lastID, _ := strconv.ParseInt(r.URL.Query().Get("last_id"), 10, 64)
-	// The org's current event cursor: it seeds a NEW shard's live head (so the
-	// per-org reader only ever reads fresh events) AND resolves tail mode
-	// (last_id<0 → start at head, no history replay). One query serves both — a
-	// fresh client renders state from REST, then follows the live stream.
-	var orgHead int64
-	if err := h.pool.QueryRow(r.Context(),
-		`SELECT COALESCE(MAX(id), 0) FROM event_log WHERE org_id = $1`,
-		id.OrgID).Scan(&orgHead); err != nil {
+	// The org's current event cursor, from the feed driver: the POSITION seeds
+	// a NEW shard's live reader (so it only ever reads fresh events) and the id
+	// resolves tail mode (last_id<0 → start at head, no history replay). One
+	// call serves both, and it samples them in the order that cannot lose an
+	// event — see eventlog.Tail.Head. A fresh client renders state from REST,
+	// then follows the live stream.
+	pos, orgHead, err := h.tail.Head(r.Context(), id.OrgID)
+	if err != nil {
+		// Includes ErrFeedNotReady on a logical cell whose WAL reader has not
+		// started yet: the client retries, which is the same answer every
+		// other consumer of that driver gets. Never a silent fallback to the
+		// gated poller, which would hide a misconfigured cell.
 		http.Error(w, "head lookup failed", http.StatusInternalServerError)
 		return
 	}
@@ -379,7 +492,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		ws.Close(websocket.StatusInternalError, "membership load failed")
 		return
 	}
-	announce, live := h.register(c, orgHead, time.Now())
+	announce, live := h.register(c, pos, orgHead, time.Now())
 	if announce {
 		h.publishPresence(ctx, id.OrgID, id.UserID, "active")
 	}
@@ -487,32 +600,52 @@ func (h *Hub) runReader(ctx context.Context, sh *orgShard) {
 // whether the batch was full, so the reader drains a backlog to completion.
 func (h *Hub) multicast(ctx context.Context, sh *orgShard) (more bool, err error) {
 	sh.mu.Lock()
-	head := sh.head
+	pos := sh.pos
 	sh.mu.Unlock()
 
-	// THE S3 read: one hoisted org-scope catch-up query per event-batch. This
+	// THE S3 read: one hoisted org-scope catch-up read per event-batch. This
 	// counter used to rise once PER connection PER wake (the blowup); now it
 	// rises once per org per batch (plus rare resume pumps) — docs/PERF.md.
 	h.pumpQueries.Add(1)
-	batch, err := h.readEvents(ctx, sh.orgID, head, batchLimit)
+	rows, next, err := h.tail.Next(ctx, sh.orgID, pos, batchLimit)
 	if err != nil {
+		if errors.Is(err, eventlog.ErrFeedNotReady) {
+			// The driver's WAL reader is not streaming (starting up, or another
+			// node holds the single per-cell slot). Nothing to do; the sweep
+			// retries. Not a warning — it is a documented normal condition.
+			return false, nil
+		}
+		if errors.Is(err, eventlog.ErrCursorTooOld) {
+			h.resync(sh)
+			return false, nil
+		}
 		return false, err
 	}
-	if len(batch) == 0 {
+	if len(rows) == 0 {
+		// Still persist the position: a driver may advance past a window whose
+		// bodies are gone (a retention partition dropped between decode and
+		// read), and a reader that did not record that would re-read the dead
+		// span on every wake forever. head does not move, so the resume→live
+		// hand-off is untouched.
+		sh.mu.Lock()
+		sh.pos = next
+		sh.mu.Unlock()
 		return false, nil
 	}
-	maxID := batch[len(batch)-1].id
-
 	// Marshal each row's Envelope ONCE here, in the single reader goroutine,
 	// before fanning: the bytes are identical for every connection in the org,
 	// so the per-connection deliver reuses them (marshal-once — the CPU twin of
 	// the O(1) read above). The channel send in feed establishes happens-before,
 	// so the connection goroutines read enc safely.
-	for i := range batch {
+	batch := fanRows(rows)
+	var maxID int64
+	for i, r := range rows {
 		batch[i].enc, _ = h.encodeEnvelope(Envelope{
-			Seq: batch[i].id, Type: batch[i].verb,
-			OrgID: sh.orgID, Payload: batch[i].payload,
+			Seq: r.ID, Type: r.Verb, OrgID: sh.orgID, Payload: r.Payload,
 		})
+		if r.ID > maxID {
+			maxID = r.ID
+		}
 	}
 
 	sh.mu.Lock()
@@ -522,13 +655,43 @@ func (h *Hub) multicast(ctx context.Context, sh *orgShard) (more bool, err error
 			live = append(live, c)
 		}
 	}
-	sh.head = maxID
+	sh.pos = next
+	// head only ever RISES: a commit-ordered batch may carry a lower id than
+	// one already fanned, and letting the go-live boundary fall back would
+	// promote a connection that has not covered the head yet.
+	if maxID > sh.head {
+		sh.head = maxID
+	}
 	sh.mu.Unlock()
 
 	for _, c := range live {
 		h.feed(c, batch)
 	}
-	return len(batch) == batchLimit, nil
+	// The logical driver cuts on commit boundaries and may overshoot the limit,
+	// so a full batch is >=, not ==.
+	return len(rows) >= batchLimit, nil
+}
+
+// resync drops every connection in the shard so its clients reconnect and
+// replay the gap from the log (F-2). It answers eventlog.ErrCursorTooOld: the
+// org's live position fell further behind than the feed driver's bounded
+// commit-order window, so the shared reader can no longer be served from it.
+// Reconnecting replays through the RESUME lane, an id-ordered read of the
+// table, so nothing is actually lost — while leaving the shard in place would
+// wedge the whole org's live lane on the same error forever, which is exactly
+// the undetectable stall this series exists to remove.
+func (h *Hub) resync(sh *orgShard) {
+	sh.mu.Lock()
+	conns := make([]*client, 0, len(sh.conns))
+	for c := range sh.conns {
+		conns = append(conns, c)
+	}
+	sh.mu.Unlock()
+	h.log.Warn("gateway: org fell out of the event-feed window; dropping connections to resync",
+		"org", sh.orgID, "connections", len(conns))
+	for _, c := range conns {
+		c.cancel()
+	}
 }
 
 // feed hands the shared batch to one live connection's lane without blocking
@@ -552,6 +715,17 @@ type eventRow struct {
 	id      int64
 	verb    string
 	payload json.RawMessage
+	// occurredAt is the event's DOMAIN time and entityType its entity class —
+	// both carried straight off eventlog.Row, which every driver populates from
+	// event_log's own columns. Neither is used by THIS file's filter; they are
+	// here because the read-ACL work (P-46) gates on them, and a field that the
+	// ACL reads while a lane leaves it zero fails SILENTLY in both directions
+	// (a zero entity type is not space-scoped, so scoped events fan org-wide; a
+	// zero time is before every protected-history floor, so members stop
+	// receiving). fanRows below is the single construction site precisely so
+	// that cannot happen per lane.
+	occurredAt time.Time
+	entityType enum.EntityType
 	// enc is the row's Envelope pre-marshaled ONCE by the multicast reader
 	// (the Envelope is identical for every connection in the org — same seq,
 	// verb, payload, org id), so the fan reuses these bytes instead of
@@ -561,55 +735,50 @@ type eventRow struct {
 	enc []byte
 }
 
-// readEvents reads an org's committed event-log rows after afterID (ascending,
-// up to limit), applying the SAME txid<xmin visibility gate the durable
-// consumers use (F-1) so an in-flight transaction's rows never surface early.
-func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) ([]eventRow, error) {
-	rows, err := h.pool.Query(ctx, `
-		SELECT e.id, e.verb, e.payload
-		FROM event_log e
-		WHERE e.org_id = $1 AND e.id > $2
-		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())
-		ORDER BY e.id
-		LIMIT $3`,
-		orgID, afterID, limit)
-	if err != nil {
-		return nil, err
-	}
-	defer rows.Close()
-	var batch []eventRow
-	for rows.Next() {
-		var r eventRow
-		if err := rows.Scan(&r.id, &r.verb, &r.payload); err != nil {
-			return nil, err
+// fanRows is the ONE place an eventRow is built, from the feed driver's row.
+// Both lanes go through it — the shared multicast batch and the per-connection
+// resume batch — so a column the read ACL depends on cannot be populated on one
+// lane and left at its zero value on the other.
+func fanRows(rows []eventlog.Row) []eventRow {
+	out := make([]eventRow, len(rows))
+	for i, r := range rows {
+		out[i] = eventRow{
+			id: r.ID, verb: r.Verb, payload: r.Payload,
+			occurredAt: r.OccurredAt, entityType: r.EntityType,
 		}
-		batch = append(batch, r)
 	}
-	return batch, rows.Err()
+	return out
 }
 
 // pump is the RESUME lane: a connection behind the org head runs its OWN
 // bounded catch-up read, draining its gap batch by batch. It survives only for
 // the reconnect gap (F-2's replay window); steady-state live traffic flows
 // through the per-org multicast reader, never here.
+//
+// It reads HISTORY — id-ordered, after the client's last_id — because a resume
+// cursor is an event id, not a driver position. Whether that read is
+// visibility-gated is the driver's business (eventlog.Tail.History), not this
+// lane's.
 func (h *Hub) pump(ctx context.Context, c *client) error {
 	for {
-		// One catch-up query for THIS connection's resume gap. The reader's
+		// One catch-up read for THIS connection's resume gap. The reader's
 		// hoisted org-scope read is the steady-state path; both increment
 		// gateway_pump_queries_total, and the S3 proof tells them apart by
 		// count — O(1) per org vs the old O(connections) (docs/PERF.md).
 		h.pumpQueries.Add(1)
-		batch, err := h.readEvents(ctx, c.id.OrgID, c.lastID, batchLimit)
+		rows, err := h.tail.History(ctx, c.id.OrgID, c.lastID, batchLimit)
 		if err != nil {
 			return err
 		}
-		if len(batch) == 0 {
+		if len(rows) == 0 {
 			return nil
 		}
-		if err := h.deliverShared(ctx, c, batch); err != nil {
+		// enc stays nil: the resume lane is per-connection, so deliverShared
+		// marshals its own — rare, bounded by the replay gap.
+		if err := h.deliverShared(ctx, c, fanRows(rows)); err != nil {
 			return err
 		}
-		if len(batch) < batchLimit {
+		if len(rows) < batchLimit {
 			return nil
 		}
 	}
@@ -618,11 +787,12 @@ func (h *Hub) pump(ctx context.Context, c *client) error {
 // deliverShared applies one connection's ACL filter to a batch of rows — the
 // resume pump's own batch OR the per-org reader's SHARED batch — writing the
 // events it may see and advancing its cursor past every row (gaps in seq are
-// expected, F-2). Rows at or below the cursor are skipped, so a live connection
-// that tailed past the org head silently ignores anything it already holds.
+// expected, F-2). Rows this connection has already handled are skipped; what
+// "already handled" MEANS is the driver's ordering guarantee, not a constant —
+// see client.passed.
 func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) error {
 	for _, r := range batch {
-		if r.id <= c.lastID {
+		if c.passed(r.id, h.ordered) {
 			continue
 		}
 		deliver, refresh := c.filter(r.verb, r.payload)
@@ -649,9 +819,61 @@ func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) er
 		}
 		// The cursor advances past filtered events too — gaps in seq are
 		// expected by the protocol (F-2).
-		c.lastID = r.id
+		c.pass(r.id, h.ordered)
 	}
 	return nil
+}
+
+// passed reports whether this connection has ALREADY handled id — the skip
+// that decides, per row, between a silent DROP and a duplicate.
+//
+// `ordered` is the feed driver's own answer to "is delivery order event-id
+// monotone?" (eventlog.Tail.Ordered), and it is the whole distinction:
+//
+//   - ORDERED (the default xmin driver): the scan is ORDER BY id behind a
+//     visibility gate, so nothing at or below a delivered id can still arrive.
+//     The cursor IS the exact, unbounded answer. This is the pre-P-45 rule,
+//     unchanged, which is what keeps the default driver byte-for-byte as it
+//     was.
+//   - COMMIT-ORDERED (logical): the same test is a silent drop. txid is
+//     stamped at a transaction's first write and the id at append, so a
+//     transaction can hold the LOWER id and commit LAST; its event then
+//     arrives BELOW the cursor, legitimately, and "id <= lastID" would throw
+//     it away — the exact undetectable loss S4 removed from the durable
+//     consumers, reintroduced at the connection. So the connection consults
+//     what it has ACTUALLY sent (a bounded window) and delivers anything else.
+//
+// A row above the cursor is new under EITHER rule, which is the overwhelmingly
+// common case and answers without touching the window; only a row at or below
+// the cursor — a crossing, or the resume→live overlap — pays the scan.
+//
+// A missing window (nil, or an id evicted from it) resolves to "not handled",
+// i.e. DELIVER: the failure mode of forgetting is a duplicate seq, which the
+// protocol allows and a client absorbs, never a drop.
+func (c *client) passed(id int64, ordered bool) bool {
+	if id > c.lastID {
+		return false
+	}
+	if ordered {
+		return true
+	}
+	return c.recent != nil && c.recent.has(id)
+}
+
+// pass records that this connection has handled id: it advances the resume
+// cursor (checkpoint seq and the pump's floor, so MONOTONE — a client's
+// last_id must never go backwards) and, under a commit-ordered feed, remembers
+// the id itself, because there the cursor alone cannot answer passed().
+func (c *client) pass(id int64, ordered bool) {
+	if !ordered {
+		if c.recent == nil {
+			c.recent = &recentIDs{}
+		}
+		c.recent.add(id)
+	}
+	if id > c.lastID {
+		c.lastID = id
+	}
 }
 
 // resume drains this connection's catch-up gap (the per-connection pump) and,
