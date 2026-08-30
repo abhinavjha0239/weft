@@ -581,12 +581,28 @@ type eventRow struct {
 	id      int64
 	verb    string
 	payload json.RawMessage
-	// occurredAt is the event's DOMAIN time (event_log.occurred_at) — the same
-	// clock message.created_at runs on, and the one importers backdate (E3).
-	// The read ACL's protected-history floor compares against it: the floor is
-	// a TIMESTAMPTZ (channel_member.history_from) while the stream is ordered
-	// by id, so there is no id-space equivalent to compare with.
-	occurredAt time.Time
+	// boundaryAt is the timestamp the read ACL judges this event at for the
+	// protected-history floor — LEAST(occurred_at, recorded_at), computed in
+	// SQL. The floor is a TIMESTAMPTZ (channel_member.history_from) while the
+	// stream is ordered by id, so there is no id-space equivalent; the
+	// question is only WHICH timestamp, and neither column is right alone:
+	//
+	//   · occurred_at is DOMAIN time, but the APP clock writes it
+	//     (eventlog.Append's time.Now()), while history_from is the DB clock
+	//     (now() in the join transaction). App-ahead-of-DB skew would put an
+	//     event that raced the join on the DELIVERED side of a boundary REST
+	//     hides — the one leak-direction residual this closes.
+	//   · recorded_at is the DB clock (DEFAULT now() = the appending tx's
+	//     start), so for a live message — appended in the SAME transaction as
+	//     the INSERT — it is the identical value message.created_at got, i.e.
+	//     exactly what messaging.Get compares. But an IMPORT backdates
+	//     occurred_at and message.created_at together (E3) while recorded_at
+	//     stays at INGEST time, so recorded_at alone would stream a member the
+	//     pre-join history a backfill just wrote.
+	//
+	// LEAST is exact in both cases and errs toward WITHHOLDING in every other:
+	// a read ACL never wants the later of two candidate times.
+	boundaryAt time.Time
 	// entityType is event_log.entity_type — the event's own NOT NULL statement
 	// of what it is ABOUT. The read ACL classifies with it rather than by
 	// sniffing payload keys: a work-item event whose payload happens to carry
@@ -607,7 +623,8 @@ type eventRow struct {
 // consumers use (F-1) so an in-flight transaction's rows never surface early.
 func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) ([]eventRow, error) {
 	rows, err := h.pool.Query(ctx, `
-		SELECT e.id, e.verb, e.payload, e.occurred_at, e.entity_type
+		SELECT e.id, e.verb, e.payload,
+		       LEAST(e.occurred_at, e.recorded_at), e.entity_type
 		FROM event_log e
 		WHERE e.org_id = $1 AND e.id > $2
 		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())
@@ -621,7 +638,7 @@ func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) (
 	var batch []eventRow
 	for rows.Next() {
 		var r eventRow
-		if err := rows.Scan(&r.id, &r.verb, &r.payload, &r.occurredAt,
+		if err := rows.Scan(&r.id, &r.verb, &r.payload, &r.boundaryAt,
 			&r.entityType); err != nil {
 			return nil, err
 		}
@@ -743,11 +760,12 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 // before their join used to replay events that predate their access. The
 // comparison is deliberately TIME-based — history_from is a TIMESTAMPTZ and
 // the stream is ordered by id, so there is no id-space floor to compare with —
-// and its boundary is INCLUSIVE of history_from: an event whose occurred_at
-// EQUALS the stamp is delivered. That is exactly messaging.ListMessages'
-// `created_at >= history_from` and the negation of messaging.Get's
-// `created_at < history_from` hide-rule, so the realtime plane and the REST
-// read answer identically at the boundary instant.
+// it judges eventRow.boundaryAt (see there for WHY that is
+// LEAST(occurred_at, recorded_at) and not either column alone), and its
+// boundary is INCLUSIVE of history_from: an event AT the stamp is delivered.
+// That is exactly messaging.ListMessages' `created_at >= history_from` and the
+// negation of messaging.Get's `created_at < history_from` hide-rule, so the
+// realtime plane and the REST read answer identically at the boundary instant.
 func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	var p struct {
 		ChannelID int64   `json:"channel_id"`
@@ -793,7 +811,7 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 		// Protected-history floor. Absent key = no boundary (shared channel or
 		// the protected channel's creator) — the common case, one map miss.
 		if floor, bounded := c.historyFloor[p.ChannelID]; bounded &&
-			r.occurredAt.Before(floor) {
+			r.boundaryAt.Before(floor) {
 			return false, refresh
 		}
 	}

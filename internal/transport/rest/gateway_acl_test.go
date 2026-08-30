@@ -428,6 +428,83 @@ func TestGatewayReadACL(t *testing.T) {
 				envTypes(aliceScope))
 		}
 	})
+
+	// WHICH timestamp the protected-history floor judges. history_from is
+	// stamped by the DB clock; occurred_at is written by the APP clock and
+	// recorded_at by the DB clock, and NEITHER is right alone — so the floor
+	// judges LEAST(occurred_at, recorded_at). The two rows below are the two
+	// ways that matters, each constructed by forcing the pair on a real event
+	// (the only way to build a clock disagreement deterministically; the
+	// message, the channel, the membership and the stamp are all real).
+	//
+	// Appended as its own subtest with its own fixtures so it adds no lines to
+	// the subtests above — their pinned assertion line numbers stay valid.
+	t.Run("history floor clock", func(t *testing.T) {
+		var vault struct {
+			ChannelID int64 `json:"channel_id"`
+		}
+		postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{
+			"name": "vault", "visibility": "private", "protected": true}, &vault)
+		var inv identity.Invite
+		postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+			"role": 40, "channel_ids": []int64{vault.ChannelID}}, &inv)
+		var nate identity.AcceptInviteResult
+		postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+			"token": inv.Token, "email": "nate@acl.test", "password": "password123",
+			"full_name": "Nate Late"}, &nate)
+		var stamp *time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT history_from FROM channel_member
+			WHERE channel_id = $1 AND user_id = $2`,
+			vault.ChannelID, nate.UserID).Scan(&stamp); err != nil || stamp == nil {
+			t.Fatalf("nate history_from = %v (%v), want stamped", stamp, err)
+		}
+
+		// skewed: the message really landed BEFORE the join (recorded_at, the
+		// DB clock, is below the stamp) but an app clock running fast wrote an
+		// occurred_at above it. REST hides it (message.created_at is the DB
+		// clock); judging occurred_at alone would DELIVER it.
+		skewed := sendChannel(t, ts.URL, boot.Token, vault.ChannelID, "raced the join")
+		// backdated: an importer backfilling this protected channel AFTER the
+		// join — domain time below the stamp, ingest time above it. REST hides
+		// it (message.created_at is backdated too); judging recorded_at alone
+		// would DELIVER the whole pre-join history to the new member.
+		backdated := sendChannel(t, ts.URL, boot.Token, vault.ChannelID, "backfilled 2019")
+		// tail is unambiguously after the stamp on both clocks: the drain
+		// terminator, and the proof this connection is a live fan target.
+		tail := sendChannel(t, ts.URL, boot.Token, vault.ChannelID, "genuinely later")
+
+		forceTimes(t, ctx, pool, skewed, stamp.Add(time.Hour), stamp.Add(-time.Hour))
+		forceTimes(t, ctx, pool, backdated, stamp.Add(-time.Hour), stamp.Add(time.Hour))
+
+		nc := dialClientLast(t, ctx, ts.URL, nate.Token, "0")
+		defer nc.conn.CloseNow()
+		seen := drainMessagesUntil(t, nc, tail)
+		if slices.Contains(seen, skewed) {
+			t.Fatalf("message %d whose DB-clock time is below the stamp was delivered; app-clock skew must not open the floor. got %v",
+				skewed, seen)
+		}
+		if slices.Contains(seen, backdated) {
+			t.Fatalf("message %d backdated below the stamp was delivered; a backfill must not stream pre-join history. got %v",
+				backdated, seen)
+		}
+	})
+}
+
+// forceTimes pins an event row's two timestamps so a clock disagreement can be
+// tested deterministically. It rewrites only the message.created event for
+// msgID and fails if that is not exactly one row, so a payload-shape change
+// cannot silently turn the assertions that follow into no-ops.
+func forceTimes(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
+	msgID int64, occurred, recorded time.Time) {
+	t.Helper()
+	ct, err := pool.Exec(ctx, `
+		UPDATE event_log SET occurred_at = $2, recorded_at = $3
+		WHERE verb = 'message.created' AND (payload->>'message_id')::bigint = $1`,
+		msgID, occurred, recorded)
+	if err != nil || ct.RowsAffected() != 1 {
+		t.Fatalf("force times for message %d: %d rows (%v)", msgID, ct.RowsAffected(), err)
+	}
 }
 
 // drainMessagesUntil reads envelopes from c until the message.created carrying
