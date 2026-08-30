@@ -59,6 +59,10 @@ type Source interface {
 	// ("notifications", "automations", "unfurl") — renaming one starts its
 	// cursor over.
 	Consumer(name string, batchSize int) Feed
+	// Tail returns the driver's CURSOR-FREE reader, for a consumer that holds
+	// no durable state and must not share a cursor with other nodes — the
+	// gateway (P-45). See Tail.
+	Tail() Tail
 	// Run drives whatever background work the driver needs and blocks until ctx
 	// ends. The xmin driver has none and returns immediately; the logical driver
 	// runs its WAL reader here.

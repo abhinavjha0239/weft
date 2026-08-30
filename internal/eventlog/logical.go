@@ -121,6 +121,11 @@ type LogicalSource struct {
 	orgs  map[int64]*orgIndex
 	head  pglogrepl.LSN // the newest commit LSN the reader has processed
 	ready bool
+	// wakes are the push subscribers (AddWake): the reader calls them with an
+	// org id the moment that org's commit is DECODED, i.e. the first instant
+	// its events can be read back. See Tail.OnWake for why a NOTIFY wake is
+	// not enough under this driver.
+	wakes []func(orgID int64)
 
 	slotLag metrics.Gauge
 	evicted metrics.Counter
@@ -267,6 +272,19 @@ func (s *LogicalSource) WaitFor(ctx context.Context, orgID, id int64) error {
 		case <-time.After(5 * time.Millisecond):
 		}
 	}
+}
+
+// AddWake registers a push subscriber. Every registered callback is invoked
+// (subscribers ACCUMULATE — a second caller never silently displaces the
+// first), on the reader's own goroutine, so a callback must not block: the
+// gateway's is a map lookup plus a non-blocking channel send.
+func (s *LogicalSource) AddWake(fn func(orgID int64)) {
+	if fn == nil {
+		return
+	}
+	s.mu.Lock()
+	s.wakes = append(s.wakes, fn)
+	s.mu.Unlock()
 }
 
 func (s *LogicalSource) setReady(v bool) {
@@ -478,6 +496,10 @@ func (s *LogicalSource) applyCommit(commitLSN pglogrepl.LSN, txn []pendingInsert
 		s.head = commitLSN
 	}
 	evictions := map[int64]int{}
+	// touched is built only when someone is subscribed, so the pull-only case
+	// (no gateway on this driver) allocates nothing extra per commit.
+	var touched []int64
+	pushing := len(s.wakes) > 0
 	for _, ins := range txn {
 		orgID := ins.org
 		idx := s.orgs[orgID]
@@ -491,8 +513,12 @@ func (s *LogicalSource) applyCommit(commitLSN pglogrepl.LSN, txn []pendingInsert
 			idx.entries = append(idx.entries[:0], idx.entries[over:]...)
 			evictions[orgID] += over
 		}
+		if pushing && !containsID(touched, orgID) {
+			touched = append(touched, orgID)
+		}
 	}
 	n := len(txn)
+	wakes := s.wakes
 	s.mu.Unlock()
 
 	s.decoded.Add(float64(n))
@@ -501,6 +527,23 @@ func (s *LogicalSource) applyCommit(commitLSN pglogrepl.LSN, txn []pendingInsert
 		s.log.Warn("eventlog: logical feed window overflowed — a consumer is far behind",
 			"org", orgID, "evicted", count, "window", maxIndexEntries)
 	}
+	// The push wake fires AFTER the index is published, so a subscriber that
+	// reads synchronously always finds the events it was woken for. Outside
+	// the lock, because a callback must never be able to deadlock the reader.
+	for _, orgID := range touched {
+		for _, fn := range wakes {
+			fn(orgID)
+		}
+	}
+}
+
+func containsID(ids []int64, want int64) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }
 
 // after returns up to `limit` entries committed strictly after `cursor`, cut
@@ -715,7 +758,7 @@ func (c *logicalConsumer) Poll(ctx context.Context, orgID int64) ([]Row, error) 
 	for i, e := range ents {
 		ids[i] = e.id
 	}
-	byID, err := c.readRows(ctx, orgID, ids)
+	byID, err := c.src.readRows(ctx, orgID, ids)
 	if err != nil {
 		return nil, err
 	}
@@ -754,18 +797,7 @@ func (c *logicalConsumer) bootstrap(ctx context.Context, orgID, lastID int64) ([
 	if !ready {
 		return nil, ErrFeedNotReady
 	}
-	rows, err := c.pool().Query(ctx, `
-		SELECT e.id, e.org_id, e.workspace_id, e.actor_kind, e.actor_id,
-		       e.entity_type, e.entity_id, e.verb, e.payload, e.hint,
-		       e.occurred_at, e.recorded_at, e.origin
-		FROM event_log e
-		WHERE e.org_id = $1 AND e.id > $2
-		ORDER BY e.id
-		LIMIT $3`, orgID, lastID, c.batch)
-	if err != nil {
-		return nil, fmt.Errorf("eventlog: logical bootstrap: %w", err)
-	}
-	out, err := scanRows(rows)
+	out, err := c.src.historyRows(ctx, orgID, lastID, c.batch)
 	if err != nil {
 		return nil, err
 	}
@@ -794,10 +826,15 @@ func (c *logicalConsumer) bootstrap(ctx context.Context, orgID, lastID int64) ([
 
 func (c *logicalConsumer) pool() *pgxpool.Pool { return c.src.pool }
 
-func (c *logicalConsumer) readRows(ctx context.Context, orgID int64, ids []int64) (map[int64]Row, error) {
-	// No xmin gate, deliberately: every id here came out of the WAL, so its
-	// transaction has committed. That absence IS the fix.
-	rows, err := c.pool().Query(ctx, `
+// readRows materialises decoded ids. It lives on the SOURCE, not the consumer,
+// because both readers of the commit-order index need it (the durable
+// logicalConsumer and the ephemeral logicalTail) and one body read is the only
+// way they cannot drift.
+//
+// No xmin gate, deliberately: every id here came out of the WAL, so its
+// transaction has committed. That absence IS the fix.
+func (s *LogicalSource) readRows(ctx context.Context, orgID int64, ids []int64) (map[int64]Row, error) {
+	rows, err := s.pool.Query(ctx, `
 		SELECT e.id, e.org_id, e.workspace_id, e.actor_kind, e.actor_id,
 		       e.entity_type, e.entity_id, e.verb, e.payload, e.hint,
 		       e.occurred_at, e.recorded_at, e.origin
@@ -815,6 +852,25 @@ func (c *logicalConsumer) readRows(ctx context.Context, orgID int64, ids []int64
 		byID[r.ID] = r
 	}
 	return byID, nil
+}
+
+// historyRows is the UNGATED id-ordered walk of an org's log — the read behind
+// both history lanes: the durable consumer's bootstrap (replay from a NULL
+// LSN) and the gateway's resume replay. One query, so "what history means"
+// cannot differ between them.
+func (s *LogicalSource) historyRows(ctx context.Context, orgID, afterID int64, limit int) ([]Row, error) {
+	rows, err := s.pool.Query(ctx, `
+		SELECT e.id, e.org_id, e.workspace_id, e.actor_kind, e.actor_id,
+		       e.entity_type, e.entity_id, e.verb, e.payload, e.hint,
+		       e.occurred_at, e.recorded_at, e.origin
+		FROM event_log e
+		WHERE e.org_id = $1 AND e.id > $2
+		ORDER BY e.id
+		LIMIT $3`, orgID, afterID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("eventlog: logical history: %w", err)
+	}
+	return scanRows(rows)
 }
 
 // Ack advances the durable cursor. The event id is what the caller has (the
