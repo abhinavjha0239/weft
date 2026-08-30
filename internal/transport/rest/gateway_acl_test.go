@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
@@ -17,6 +18,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
+	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
 
@@ -36,6 +38,14 @@ import (
 //   - "membership refresh mid-connection": a live connection that joins a
 //     channel starts receiving it without reconnecting, and received nothing
 //     from it before.
+//   - "space visibility": space-scoped events (space/work item/sprint/field
+//     def) have no channel or DM to gate on and used to fan ORG-WIDE. They now
+//     resolve a Space against the connection's space set — a member gets them
+//     (after a mid-connection refresh driven by space.created), a GUEST gets
+//     none, an event whose space_id cannot be resolved gets withheld rather
+//     than fanned, and a work-item event is withheld entirely while the org
+//     defines a visibility_scope the gateway has no evaluator for, without
+//     blacking out the space events that cannot carry one.
 func TestGatewayReadACL(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
 	if dbURL == "" {
@@ -58,6 +68,7 @@ func TestGatewayReadACL(t *testing.T) {
 		Pool: pool, Hub: hub, Log: slog.Default(),
 		Identity:  identity.New(pool, permsSvc),
 		Messaging: msgSvc,
+		Worktrack: worktrack.New(pool, permsSvc, msgSvc),
 	}))
 	defer ts.Close()
 
@@ -214,6 +225,134 @@ func TestGatewayReadACL(t *testing.T) {
 			t.Fatalf("the refresh replayed pre-join traffic %d; got %v", outside, got)
 		}
 	})
+
+	// Space-scoped events have no channel or DM to gate on and used to fan
+	// ORG-WIDE regardless of space access or guest status. They now resolve a
+	// Space against the connection's own space-visibility set, and every way
+	// of failing to resolve one WITHHOLDS.
+	t.Run("space visibility", func(t *testing.T) {
+		carolTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
+			"carol@acl.test", "Carol Diaz", "acl-carol-tok")
+		// A guest lives inside one private channel and nothing else (P-5).
+		var support struct {
+			ChannelID int64 `json:"channel_id"`
+		}
+		postJSON(t, ts.URL+"/api/v1/channels", boot.Token,
+			map[string]any{"name": "support", "private": true}, &support)
+		var ginv identity.Invite
+		postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+			"role": 50, "channel_ids": []int64{support.ChannelID}}, &ginv)
+		var gina identity.AcceptInviteResult
+		postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+			"token": ginv.Token, "email": "gina@acl.test", "password": "password123",
+			"full_name": "Gina Guest"}, &gina)
+		var ginaRole int16
+		if err := pool.QueryRow(ctx, `SELECT role FROM user_account WHERE id = $1`,
+			gina.UserID).Scan(&ginaRole); err != nil || ginaRole < 50 {
+			t.Fatalf("gina role = %d (%v), want the guest ceiling; the guest half of this test would be vacuous otherwise",
+				ginaRole, err)
+		}
+
+		carol := dialClientLast(t, ctx, ts.URL, carolTok, "-1")
+		defer carol.conn.CloseNow()
+		ginaC := dialClientLast(t, ctx, ts.URL, gina.Token, "-1")
+		defer ginaC.conn.CloseNow()
+		carol.waitFor(t, "ready")
+		ginaC.waitFor(t, "ready")
+
+		// The Space is created AFTER both connections exist, so carol only
+		// receives its items if space.created refreshed her set MID-connection
+		// — the "a scope change must be driven by an event" requirement.
+		var space struct {
+			ID int64 `json:"id"`
+		}
+		postJSON(t, ts.URL+"/api/v1/spaces", boot.Token,
+			map[string]any{"key": "ops", "name": "Operations"}, &space)
+		var first, second struct {
+			ID int64 `json:"id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/spaces/%d/items", ts.URL, space.ID),
+			boot.Token, map[string]any{"title": "first"}, &first)
+		postJSON(t, fmt.Sprintf("%s/api/v1/spaces/%d/items", ts.URL, space.ID),
+			boot.Token, map[string]any{"title": "second"}, &second)
+
+		// Both connections are LIVE fan targets: each drain terminates on a
+		// message in a channel that connection IS in, which is logged AFTER
+		// the work-item events — so the work-item events were offered to both.
+		ginaPing := sendChannel(t, ts.URL, boot.Token, support.ChannelID, "guest ping")
+		carolPing := sendChannel(t, ts.URL, boot.Token, boot.ChannelID, "member ping")
+
+		carolSaw := drainUntil(t, carol, carolPing)
+		if !hasItemEvent(carolSaw, "workitem.created", second.ID) {
+			t.Fatalf("a member did not receive workitem.created for item %d; the space set must refresh on space.created. saw %v",
+				second.ID, envTypes(carolSaw))
+		}
+		ginaSaw := drainUntil(t, ginaC, ginaPing)
+		for _, e := range ginaSaw {
+			if strings.HasPrefix(e.Type, "workitem.") || strings.HasPrefix(e.Type, "space.") {
+				t.Fatalf("a guest received the space-scoped event %q; guests hold an empty space set. saw %v",
+					e.Type, envTypes(ginaSaw))
+			}
+		}
+
+		// An event whose Space cannot be RESOLVED is withheld, not fanned:
+		// workitem.reordered carries no space_id, so even a full member — who
+		// receives every other work-item event for this space — gets nothing.
+		if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/items/%d/move", ts.URL, second.ID),
+			boot.Token, map[string]any{"before_item_id": first.ID}); code != http.StatusOK {
+			t.Fatalf("move item = %d, want 200", code)
+		}
+		movePing := sendChannel(t, ts.URL, boot.Token, boot.ChannelID, "after move")
+		afterMove := drainUntil(t, carol, movePing)
+		for _, e := range afterMove {
+			if e.Type == "workitem.reordered" {
+				t.Fatalf("an event with no resolvable space_id was fanned org-wide; saw %v",
+					envTypes(afterMove))
+			}
+		}
+
+		// P-4 item security: the org defines a visibility_scope, so no
+		// work-item event can be resolved any more (there is no evaluator for
+		// the rule) and every one of them is withheld — while space-scoped
+		// events that CANNOT carry a security scope keep flowing, so the
+		// withholding is as narrow as the hook it fails closed on.
+		if _, err := pool.Exec(ctx, `
+			INSERT INTO visibility_scope (space_id, name, rule)
+			VALUES ($1, 'restricted', '{"roles":["reporter"]}'::jsonb)`,
+			space.ID); err != nil {
+			t.Fatalf("define visibility scope: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`UPDATE work_item SET security_scope_id = (SELECT id FROM visibility_scope
+			 WHERE space_id = $1) WHERE id = $2`, space.ID, first.ID); err != nil {
+			t.Fatalf("scope the item: %v", err)
+		}
+		scoped := dialClientLast(t, ctx, ts.URL, carolTok, "-1")
+		defer scoped.conn.CloseNow()
+		scoped.waitFor(t, "ready")
+
+		if code := patchJSON(t, fmt.Sprintf("%s/api/v1/items/%d", ts.URL, first.ID),
+			boot.Token, map[string]any{"title": "retitled"}); code != http.StatusOK {
+			t.Fatalf("retitle item = %d, want 200", code)
+		}
+		var sprint struct {
+			ID int64 `json:"id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/spaces/%d/sprints", ts.URL, space.ID),
+			boot.Token, map[string]any{"name": "Sprint 1"}, &sprint)
+		scopedPing := sendChannel(t, ts.URL, boot.Token, boot.ChannelID, "after scoping")
+		afterScope := drainUntil(t, scoped, scopedPing)
+		for _, e := range afterScope {
+			if strings.HasPrefix(e.Type, "workitem.") {
+				t.Fatalf("a work-item event (%q) was delivered while the org defines a visibility_scope the gateway cannot evaluate; saw %v",
+					e.Type, envTypes(afterScope))
+			}
+		}
+		if !hasEvent(afterScope, "sprint.created") {
+			t.Fatalf("item security blacked out a NON-work-item space event; sprint.created must still flow. saw %v",
+				envTypes(afterScope))
+		}
+	})
 }
 
 // drainMessagesUntil reads envelopes from c until the message.created carrying
@@ -250,4 +389,72 @@ func drainMessagesUntil(t *testing.T, c *wsClient, wantID int64) []int64 {
 			t.Fatalf("timed out waiting for message %d (saw %v)", wantID, seen)
 		}
 	}
+}
+
+// drainUntil is drainMessagesUntil for assertions about NON-message events: it
+// returns every envelope seen up to the message.created carrying wantID, so a
+// "must not arrive" claim is checked against the whole window the connection
+// was actually offered — never against silence.
+func drainUntil(t *testing.T, c *wsClient, wantID int64) []gateway.Envelope {
+	t.Helper()
+	deadline := time.After(8 * time.Second)
+	var seen []gateway.Envelope
+	for {
+		select {
+		case e, ok := <-c.events:
+			if !ok {
+				t.Fatalf("connection closed while waiting for message %d (saw %v)",
+					wantID, envTypes(seen))
+			}
+			seen = append(seen, e)
+			if e.Type != "message.created" {
+				continue
+			}
+			var p struct {
+				MessageID int64 `json:"message_id"`
+			}
+			if err := json.Unmarshal(e.Payload, &p); err != nil {
+				t.Fatalf("decode message.created payload: %v", err)
+			}
+			if p.MessageID == wantID {
+				return seen
+			}
+		case <-deadline:
+			t.Fatalf("timed out waiting for message %d (saw %v)", wantID, envTypes(seen))
+		}
+	}
+}
+
+func envTypes(evs []gateway.Envelope) []string {
+	out := make([]string, 0, len(evs))
+	for _, e := range evs {
+		out = append(out, e.Type)
+	}
+	return out
+}
+
+func hasEvent(evs []gateway.Envelope, want string) bool {
+	for _, e := range evs {
+		if e.Type == want {
+			return true
+		}
+	}
+	return false
+}
+
+// hasItemEvent matches a work-item envelope by verb AND item id, so a stray
+// event for a different item cannot satisfy the assertion.
+func hasItemEvent(evs []gateway.Envelope, want string, itemID int64) bool {
+	for _, e := range evs {
+		if e.Type != want {
+			continue
+		}
+		var p struct {
+			ItemID int64 `json:"item_id"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && p.ItemID == itemID {
+			return true
+		}
+	}
+	return false
 }

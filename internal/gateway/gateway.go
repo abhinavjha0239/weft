@@ -28,6 +28,7 @@ import (
 	"golang.org/x/time/rate"
 
 	"github.com/abhinavjha0239/weft/internal/auth"
+	"github.com/abhinavjha0239/weft/internal/enum"
 	"github.com/abhinavjha0239/weft/internal/platform/metrics"
 	"github.com/abhinavjha0239/weft/internal/platform/presence"
 )
@@ -74,6 +75,23 @@ type client struct {
 	// creator). Loaded and refreshed with `channels` by loadChannels, so the
 	// same membership events that widen the view also carry the floor.
 	historyFloor map[int64]time.Time
+	// spaces is the connection's space-visibility set — the third container
+	// view, loaded and refreshed exactly like channels/dms. Space-scoped
+	// events (space, work item, sprint, field def) have no channel or DM to
+	// gate on and used to fan ORG-WIDE; they now resolve their space against
+	// this set. Empty for a guest (P-5: a guest sees nothing beyond their own
+	// channels), which is what lets guests ride the SAME predicate with no
+	// role branch in filter.
+	spaces map[int64]bool
+	// itemSecurityActive reports whether this org defines ANY visibility_scope
+	// (P-4 item security). work_item.security_scope_id can only reference such
+	// a row, so while the org defines none, NO item is security-scoped and the
+	// space set alone is exact. The moment one exists the gateway cannot tell
+	// which items it covers without a per-event query — and it has no
+	// evaluator for visibility_scope.rule at all — so every work-item event is
+	// withheld: an unresolvable scope must never fall through to org-wide
+	// delivery. Defaults to true (withhold) so a partial load fails closed.
+	itemSecurityActive bool
 	// Inbound signal-frame budget (typing storms, abuse).
 	frameLimit *rate.Limiter
 	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
@@ -375,7 +393,12 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	defer cancel()
 	c := &client{conn: ws, id: id, cancel: cancel, lastID: lastID,
 		feed: make(chan []eventRow, feedBuffer),
-		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter()}
+		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter(),
+		// Seeded WITHHOLDING: nil container views deny by lookup, and item
+		// security starts active, so a connection whose ACL load never ran
+		// (or failed) can only ever under-deliver. loadChannels below is the
+		// only thing that relaxes any of it.
+		itemSecurityActive: true}
 
 	// Setup order matters (fixes a startup race): load the membership view and
 	// register the connection BEFORE reading any client frame, so the sender's
@@ -564,6 +587,12 @@ type eventRow struct {
 	// a TIMESTAMPTZ (channel_member.history_from) while the stream is ordered
 	// by id, so there is no id-space equivalent to compare with.
 	occurredAt time.Time
+	// entityType is event_log.entity_type — the event's own NOT NULL statement
+	// of what it is ABOUT. The read ACL classifies with it rather than by
+	// sniffing payload keys: a work-item event whose payload happens to carry
+	// no space_id is still a work-item event and must fail closed, where key
+	// sniffing would silently fall through to org-wide delivery.
+	entityType enum.EntityType
 	// enc is the row's Envelope pre-marshaled ONCE by the multicast reader
 	// (the Envelope is identical for every connection in the org — same seq,
 	// verb, payload, org id), so the fan reuses these bytes instead of
@@ -578,7 +607,7 @@ type eventRow struct {
 // consumers use (F-1) so an in-flight transaction's rows never surface early.
 func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) ([]eventRow, error) {
 	rows, err := h.pool.Query(ctx, `
-		SELECT e.id, e.verb, e.payload, e.occurred_at
+		SELECT e.id, e.verb, e.payload, e.occurred_at, e.entity_type
 		FROM event_log e
 		WHERE e.org_id = $1 AND e.id > $2
 		  AND e.txid < pg_snapshot_xmin(pg_current_snapshot())
@@ -592,7 +621,8 @@ func (h *Hub) readEvents(ctx context.Context, orgID, afterID int64, limit int) (
 	var batch []eventRow
 	for rows.Next() {
 		var r eventRow
-		if err := rows.Scan(&r.id, &r.verb, &r.payload, &r.occurredAt); err != nil {
+		if err := rows.Scan(&r.id, &r.verb, &r.payload, &r.occurredAt,
+			&r.entityType); err != nil {
 			return nil, err
 		}
 		batch = append(batch, r)
@@ -698,13 +728,14 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 
 // filter applies the read ACL: channel-scoped events require membership AND
 // clear the channel's protected-history floor, DM-scoped events require
-// participation, container-less events (spaces) deliver org-wide. Events about
-// this user's own membership trigger a view refresh. dm.opened and
-// dm.participants_changed decide from their user_ids list rather than current
-// participation: dm.opened reaches the invited side whose view predates the new
-// conversation, and dm.participants_changed reaches the leaver whose view must
-// now drop it (their dm_participant row is already gone, so a participation
-// check would wrongly withhold it).
+// participation, SPACE-scoped events require space visibility, and only what
+// is genuinely org-wide fans org-wide. Events about this user's own membership
+// trigger a view refresh. dm.opened and dm.participants_changed decide from
+// their user_ids list rather than current participation: dm.opened reaches the
+// invited side whose view predates the new conversation, and
+// dm.participants_changed reaches the leaver whose view must now drop it
+// (their dm_participant row is already gone, so a participation check would
+// wrongly withhold it).
 //
 // The floor (ADR-008 C-2, F-16b) is the half REST already enforced and the
 // stream did not: a member of a PROTECTED channel resuming with a last_id from
@@ -720,11 +751,21 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	var p struct {
 		ChannelID int64   `json:"channel_id"`
 		DMSpaceID int64   `json:"dm_space_id"`
+		SpaceID   int64   `json:"space_id"`
 		UserID    int64   `json:"user_id"`
 		UserIDs   []int64 `json:"user_ids"`
 	}
 	_ = json.Unmarshal(r.payload, &p)
 	if (r.verb == "member.joined" || r.verb == "member.left") && p.UserID == c.id.UserID {
+		refresh = true
+	}
+	// A new Space widens (or, for a guest, does not widen) every connection's
+	// space set, so it drives the same event-driven refresh membership does.
+	// The event itself is decided against the PRE-refresh set and so is
+	// withheld — the member.joined precedent: the view catches up, the
+	// envelope that caused it does not arrive, and the client's next REST read
+	// closes the gap (F-2 tolerates a detectable gap, not a leak).
+	if r.verb == "space.created" {
 		refresh = true
 	}
 	if r.verb == "dm.opened" || r.verb == "dm.participants_changed" {
@@ -750,7 +791,41 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	if p.DMSpaceID != 0 {
 		return c.dms[p.DMSpaceID], refresh
 	}
+	if spaceScoped(r.entityType) {
+		// Container-less but NOT org-wide: these events belong to a Space, so
+		// they resolve one instead of fanning. Everything here fails CLOSED —
+		// an unresolvable scope is withheld, never dropped through to the
+		// org-wide return below, which is exactly the hole this closes.
+		//   · space_id missing from the payload  → withhold (unresolvable)
+		//   · space not in this connection's set → withhold (includes every
+		//     guest, whose set is empty — the same predicate, no role branch)
+		//   · a work item while the org defines any visibility_scope →
+		//     withhold (no evaluator exists for the scope's rule)
+		if p.SpaceID == 0 || !c.spaces[p.SpaceID] {
+			return false, refresh
+		}
+		if r.entityType == enum.EntityWorkItem && c.itemSecurityActive {
+			return false, refresh
+		}
+		return true, refresh
+	}
+	// Genuinely org-wide: org settings, emoji, user directory, and the
+	// space-governed THREAD traffic (message.*/thread.*) that the v1
+	// visibility slice makes org-visible over REST too — withholding it here
+	// would over-withhold against messaging.Get, not close a hole.
 	return true, refresh
+}
+
+// spaceScoped reports whether an event's entity belongs to a Space, i.e. has
+// no channel or DM container but is NOT org-wide. These four are the only
+// entity types worktrack appends under, and only work_item carries a
+// security_scope_id.
+func spaceScoped(t enum.EntityType) bool {
+	switch t {
+	case enum.EntitySpace, enum.EntityWorkItem, enum.EntitySprint, enum.EntityFieldDef:
+		return true
+	}
+	return false
 }
 
 func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
@@ -806,7 +881,53 @@ func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
 		dset[id] = true
 	}
 	c.dms = dset
-	return drows.Err()
+	if err := drows.Err(); err != nil {
+		return err
+	}
+	return c.loadSpaces(ctx, pool)
+}
+
+// loadSpaces builds the space-visibility set — the container view for events
+// that have neither a channel nor a DM. Spaces are org-visible in the v1
+// worktrack slice (see its package doc), and a GUEST sees none (P-5, the same
+// `NOT $2` shape messaging.ListChannels uses), so the guest restriction lives
+// in the SQL and filter keeps ONE predicate for everyone. Archival is
+// deliberately not filtered: it is a lifecycle state, not an ACL state, and
+// REST still reads an archived space's items — withholding here would
+// over-withhold against the read path rather than close a hole.
+//
+// The uncorrelated EXISTS is Postgres's InitPlan (evaluated once, not per row)
+// and rides the same round trip as the set.
+func (c *client) loadSpaces(ctx context.Context, pool *pgxpool.Pool) error {
+	rows, err := pool.Query(ctx, `
+		SELECT sp.id,
+		       EXISTS (SELECT 1 FROM visibility_scope vs
+		               JOIN space s2 ON s2.id = vs.space_id
+		               WHERE s2.org_id = $1)
+		FROM space sp
+		WHERE sp.org_id = $1 AND NOT $2`, c.id.OrgID, c.id.IsGuest())
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	// Fail closed on the way in: until a row proves otherwise the connection
+	// behaves as if item security were active. Zero rows leaves it true, which
+	// is moot — an empty space set already withholds every space-scoped event.
+	set, scoped := map[int64]bool{}, true
+	for rows.Next() {
+		var id int64
+		var active bool
+		if err := rows.Scan(&id, &active); err != nil {
+			return err
+		}
+		set[id] = true
+		scoped = active
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	c.spaces, c.itemSecurityActive = set, scoped
+	return nil
 }
 
 // send serializes writes per connection: coder/websocket forbids concurrent
