@@ -197,6 +197,14 @@ func serve(ctx context.Context, cfg config.Config) error {
 	go feed.Run(ctx)
 	hub := gateway.NewHub(pool, log)
 	hub.SetMetrics(reg)
+	// The gateway rides the SAME driver as the durable consumers (P-45): live
+	// fan-out reads through the feed's cursor-free tail, so an operator who
+	// picks `logical` gets commit-ordered delivery all the way to the socket
+	// rather than only as far as the materialisers. Under a commit-ordered
+	// driver a client may see a rare DUPLICATE seq at the live/resume hand-off
+	// — the documented protocol cost (ADR-002), taken because the alternative
+	// is silent loss.
+	hub.SetSource(feed)
 	// Presence plane seam (S5): the pg driver (default) shares presence across
 	// this cell's gateway nodes via the UNLOGGED presence table + LISTEN/NOTIFY;
 	// "local" keeps it in-process for a single-node deployment.

@@ -154,6 +154,22 @@ The event feed is a seam with two drivers, picked by
    the reader loudly with the SQL above; it never degrades silently back to
    the poller.
 
+**The gateway rides the driver too, and it changes a CLIENT contract**
+(P-45). Live fan-out reads through the feed's cursor-free half
+(`eventlog.Tail`), so `logical` gives commit-ordered delivery all the way
+to the socket — which is the point, because the txid/id crossing that
+drops an event under the gate drops it at the connection as well. The
+price is one protocol requirement: **clients must tolerate a duplicate
+`seq`.** They already tolerate GAPS (ACL filtering, F-2); duplicates are
+now possible too, bounded to the live/resume hand-off, because under
+commit order "id ≤ the last id I sent" stops being a sound
+already-delivered test and the honest alternative to a duplicate is a
+silent LOSS. `seq` is still the event-log id and resume still replays
+with `WHERE id > seq`. Nothing changes under `xmin`, which stays the
+default, and a duplicate-tolerant client works against BOTH — so the safe
+order is "make the client tolerate duplicates, then switch the driver".
+ADR-002 carries the amendment.
+
 **Single reader per cell.** A replication slot allows ONE active
 connection, so exactly one process streams the feed. Other nodes retry and
 their consumers report `ErrFeedNotReady` until they win the slot, which
