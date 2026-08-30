@@ -311,11 +311,59 @@ func TestGatewayReadACL(t *testing.T) {
 			}
 		}
 
+		// workitem.promoted_from_thread is the ONE work-item event that names
+		// TWO containers: the promoted thread keeps its CHANNEL's ACL (the D2
+		// fusion's F-5 rule) while the item it now backs lives in a SPACE, so
+		// the payload carries channel_id AND space_id. It must clear BOTH
+		// gates, which splits three live connections three ways —
+		//   alice: in #support AND sees the Space       -> receives it
+		//   gina:  in #support, empty space set (guest) -> SPACE gate withholds
+		//   carol: sees the Space, NOT in #support      -> CHANNEL gate withholds
+		// and carol's line is the one that goes red if entity class is made to
+		// WIN over the payload's channel_id rather than be conjunctive with it:
+		// that ordering leaks a private channel's thread_id and channel_id to
+		// everyone who can see the Space.
+		alice := dialClientLast(t, ctx, ts.URL, boot.Token, "-1")
+		defer alice.conn.CloseNow()
+		alice.waitFor(t, "ready")
+
+		var escalation struct {
+			ThreadID int64 `json:"thread_id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, support.ChannelID),
+			boot.Token, map[string]any{"title": "escalation", "content": "needs an item"},
+			&escalation)
+		var promoted struct {
+			ID int64 `json:"id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/promote", ts.URL, escalation.ThreadID),
+			boot.Token, map[string]any{"space_id": space.ID}, &promoted)
+		promotedPingSupport := sendChannel(t, ts.URL, boot.Token, support.ChannelID, "after promote")
+		promotedPingGeneral := sendChannel(t, ts.URL, boot.Token, boot.ChannelID, "after promote")
+
+		aliceSaw := drainUntil(t, alice, promotedPingGeneral)
+		if !hasItemEvent(aliceSaw, "workitem.promoted_from_thread", promoted.ID) {
+			t.Fatalf("the promoter, who is in the channel AND sees the Space, did not receive workitem.promoted_from_thread for item %d; saw %v",
+				promoted.ID, envTypes(aliceSaw))
+		}
+		ginaPromote := drainUntil(t, ginaC, promotedPingSupport)
+		if hasItemEvent(ginaPromote, "workitem.promoted_from_thread", promoted.ID) {
+			t.Fatalf("a guest in the channel received a work-item event the SPACE gate must withhold; the gates must be conjunctive. saw %v",
+				envTypes(ginaPromote))
+		}
+		carolPromote := drainUntil(t, carol, promotedPingGeneral)
+		if hasItemEvent(carolPromote, "workitem.promoted_from_thread", promoted.ID) {
+			t.Fatalf("a non-member of the promoted thread's channel received its channel_id and thread_id; the CHANNEL gate must still apply to space-scoped events. saw %v",
+				envTypes(carolPromote))
+		}
+
 		// P-4 item security: the org defines a visibility_scope, so no
 		// work-item event can be resolved any more (there is no evaluator for
-		// the rule) and every one of them is withheld — while space-scoped
-		// events that CANNOT carry a security scope keep flowing, so the
-		// withholding is as narrow as the hook it fails closed on.
+		// the rule) and every one of them is withheld — including the
+		// two-container promotion, for a connection that clears both of ITS
+		// gates — while space-scoped events that CANNOT carry a security scope
+		// keep flowing, so the withholding is as narrow as the hook it fails
+		// closed on.
 		if _, err := pool.Exec(ctx, `
 			INSERT INTO visibility_scope (space_id, name, rule)
 			VALUES ($1, 'restricted', '{"roles":["reporter"]}'::jsonb)`,
@@ -330,6 +378,12 @@ func TestGatewayReadACL(t *testing.T) {
 		scoped := dialClientLast(t, ctx, ts.URL, carolTok, "-1")
 		defer scoped.conn.CloseNow()
 		scoped.waitFor(t, "ready")
+		// alice re-dials so her connection picks the scope up; she is the only
+		// principal who passes BOTH gates on a #support promotion, so anything
+		// she is denied below is denied by item security and nothing else.
+		scopedAlice := dialClientLast(t, ctx, ts.URL, boot.Token, "-1")
+		defer scopedAlice.conn.CloseNow()
+		scopedAlice.waitFor(t, "ready")
 
 		if code := patchJSON(t, fmt.Sprintf("%s/api/v1/items/%d", ts.URL, first.ID),
 			boot.Token, map[string]any{"title": "retitled"}); code != http.StatusOK {
@@ -340,7 +394,19 @@ func TestGatewayReadACL(t *testing.T) {
 		}
 		postJSON(t, fmt.Sprintf("%s/api/v1/spaces/%d/sprints", ts.URL, space.ID),
 			boot.Token, map[string]any{"name": "Sprint 1"}, &sprint)
+		var second2 struct {
+			ThreadID int64 `json:"thread_id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, support.ChannelID),
+			boot.Token, map[string]any{"title": "second escalation", "content": "another"},
+			&second2)
+		var promoted2 struct {
+			ID int64 `json:"id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/threads/%d/promote", ts.URL, second2.ThreadID),
+			boot.Token, map[string]any{"space_id": space.ID}, &promoted2)
 		scopedPing := sendChannel(t, ts.URL, boot.Token, boot.ChannelID, "after scoping")
+
 		afterScope := drainUntil(t, scoped, scopedPing)
 		for _, e := range afterScope {
 			if strings.HasPrefix(e.Type, "workitem.") {
@@ -351,6 +417,15 @@ func TestGatewayReadACL(t *testing.T) {
 		if !hasEvent(afterScope, "sprint.created") {
 			t.Fatalf("item security blacked out a NON-work-item space event; sprint.created must still flow. saw %v",
 				envTypes(afterScope))
+		}
+		aliceScope := drainUntil(t, scopedAlice, scopedPing)
+		if hasItemEvent(aliceScope, "workitem.promoted_from_thread", promoted2.ID) {
+			t.Fatalf("the promotion event escaped the item-security blackout for a connection that clears both container gates; every work-item event must be withheld while a visibility_scope exists. saw %v",
+				envTypes(aliceScope))
+		}
+		if !hasEvent(aliceScope, "sprint.created") {
+			t.Fatalf("the same connection must still receive sprint.created; a blanket space blackout is too wide. saw %v",
+				envTypes(aliceScope))
 		}
 	})
 }

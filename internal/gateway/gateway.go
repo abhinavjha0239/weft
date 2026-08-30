@@ -729,7 +729,8 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 // filter applies the read ACL: channel-scoped events require membership AND
 // clear the channel's protected-history floor, DM-scoped events require
 // participation, SPACE-scoped events require space visibility, and only what
-// is genuinely org-wide fans org-wide. Events about this user's own membership
+// is genuinely org-wide fans org-wide. An event that names several containers
+// must clear ALL of their gates. Events about this user's own membership
 // trigger a view refresh. dm.opened and dm.participants_changed decide from
 // their user_ids list rather than current participation: dm.opened reaches the
 // invited side whose view predates the new conversation, and
@@ -776,6 +777,15 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 		}
 		return false, refresh
 	}
+	// The container gates below are CONJUNCTIVE, not a first-match dispatch: an
+	// event may name MORE than one container and must clear every gate it
+	// names. workitem.promoted_from_thread is the case — the D2 fusion's
+	// reverse direction leaves the discussion governed by its CHANNEL (F-5)
+	// while the item it now backs lives in a SPACE, so its payload carries
+	// channel_id AND space_id. A first-match dispatch let the channel gate
+	// PASS and return, skipping the space and item-security gates entirely;
+	// conjunction is the fail-closed direction (it can only ever withhold
+	// more) and it is why neither gate may return true early.
 	if p.ChannelID != 0 {
 		if !c.channels[p.ChannelID] {
 			return false, refresh
@@ -786,16 +796,15 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 			r.occurredAt.Before(floor) {
 			return false, refresh
 		}
-		return true, refresh
 	}
-	if p.DMSpaceID != 0 {
-		return c.dms[p.DMSpaceID], refresh
+	if p.DMSpaceID != 0 && !c.dms[p.DMSpaceID] {
+		return false, refresh
 	}
 	if spaceScoped(r.entityType) {
-		// Container-less but NOT org-wide: these events belong to a Space, so
-		// they resolve one instead of fanning. Everything here fails CLOSED —
-		// an unresolvable scope is withheld, never dropped through to the
-		// org-wide return below, which is exactly the hole this closes.
+		// These events belong to a Space, so they resolve one instead of
+		// fanning. Everything here fails CLOSED — an unresolvable scope is
+		// withheld, never dropped through to the org-wide return below, which
+		// is exactly the hole this closes.
 		//   · space_id missing from the payload  → withhold (unresolvable)
 		//   · space not in this connection's set → withhold (includes every
 		//     guest, whose set is empty — the same predicate, no role branch)
@@ -807,18 +816,19 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 		if r.entityType == enum.EntityWorkItem && c.itemSecurityActive {
 			return false, refresh
 		}
-		return true, refresh
 	}
-	// Genuinely org-wide: org settings, emoji, user directory, and the
-	// space-governed THREAD traffic (message.*/thread.*) that the v1
+	// Cleared every gate it named. An event that named NO container and is not
+	// space-scoped is genuinely org-wide: org settings, emoji, user directory,
+	// and the space-governed THREAD traffic (message.*/thread.*) that the v1
 	// visibility slice makes org-visible over REST too — withholding it here
 	// would over-withhold against messaging.Get, not close a hole.
 	return true, refresh
 }
 
-// spaceScoped reports whether an event's entity belongs to a Space, i.e. has
-// no channel or DM container but is NOT org-wide. These four are the only
-// entity types worktrack appends under, and only work_item carries a
+// spaceScoped reports whether an event's entity belongs to a Space — a gate
+// most of these events have INSTEAD of a channel or DM, and one
+// (workitem.promoted_from_thread) has IN ADDITION to a channel. These four are
+// the only entity types worktrack appends under, and only work_item carries a
 // security_scope_id.
 func spaceScoped(t enum.EntityType) bool {
 	switch t {
