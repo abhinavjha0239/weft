@@ -131,13 +131,19 @@ func TestMulticastFeedErrors(t *testing.T) {
 //
 // It is here because both ways of getting this wrong are SILENT. entity_type
 // classifies a container-less event as space-scoped; left at zero it is not,
-// so scoped events fall back to the org-wide fan — a leak. occurred_at is
+// so scoped events fall back to the org-wide fan — a leak. boundaryAt is
 // compared against channel_member.history_from; left at zero it is before every
 // floor, so a protected-history member silently stops receiving. Neither is a
 // compile error and neither shows up in a delivery-count assert, so the
 // structure is one construction site (fanRows) and this is the pin on it.
 //
-// RED: drop either field from fanRows — the matching assert names it.
+// boundaryAt is the EARLIER of occurred_at and recorded_at, and this pins both
+// directions of that rule — the import shape (recorded later, so the backdated
+// domain time must win) and the clock-skew shape (recorded earlier, so an app
+// clock running ahead must not open the floor).
+//
+// RED: drop either field from fanRows, or take OccurredAt alone instead of the
+// earlier of the two — the matching assert names it.
 func TestFannedRowCarriesACLColumns(t *testing.T) {
 	when := time.Date(2026, 3, 4, 5, 6, 7, 0, time.UTC)
 	// recorded_at LATER than occurred_at is the IMPORT shape (E3 backdates the

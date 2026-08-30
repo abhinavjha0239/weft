@@ -744,8 +744,10 @@ type eventRow struct {
 	verb    string
 	payload json.RawMessage
 	// boundaryAt is the timestamp the read ACL judges this event at for the
-	// protected-history floor — LEAST(occurred_at, recorded_at), computed in
-	// SQL. The floor is a TIMESTAMPTZ (channel_member.history_from) while the
+	// protected-history floor — the earlier of occurred_at and recorded_at,
+	// applied in fanRows (P-46 computed it in SQL; the feed seam removed that
+	// query, so the rule moved into Go over eventlog.Row, which carries both
+	// columns). The floor is a TIMESTAMPTZ (channel_member.history_from) while the
 	// stream is ordered by id, so there is no id-space equivalent; the
 	// question is only WHICH timestamp, and neither column is right alone:
 	//
