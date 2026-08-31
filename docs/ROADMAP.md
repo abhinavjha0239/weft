@@ -3099,7 +3099,98 @@ importer mapping of Zulip announcement-only streams → kind=4; the
 
 ---
 
-### P-27 `importer: Slack.` — L (was XL — see the sizing correction) — ZERO migrations — **SPEC-READY (the IR prep refactor is commit 1 and is what makes this tractable; `slack_incoming` split out as P-27b)**
+### P-27 `importer: Slack.` — **XL, and must SPLIT** — ZERO migrations — **[!] NOT SPEC-READY — DO NOT DISPATCH. Failed its pre-flight audit (2026-09-01). The intent is sound; the mechanism, the sizing and the test-guard premise are all wrong. See the audit block.**
+
+> **PRE-FLIGHT AUDIT — 81 findings, 28 blocking (13 after dedupe/verification).**
+> Third such audit, third failure, same author. Seven findings were
+> DISCARDED on verification — including a suspected #134 drift that turned
+> out to be handled deliberately (`eventlog/eventlog.go:49-51`:
+> `message.created` omits `message_created_at` on purpose, because event and
+> message are written in one transaction).
+>
+> **This audit is different from P-44's and P-47's: it found LIVE DEFECTS
+> IN SHIPPED CODE, not only spec errors.** Those are being fixed
+> separately (`fix/importer-backfill-invariants`) and are NOT part of this
+> entry:
+> - **"backfills NEVER notify" (CLAUDE.md invariant) is FALSE.** Only
+>   `notification/runner.go:306` honours it. `automation/runner.go`
+>   special-cases `ActorAutomation` only and `triggerMatches` compares the
+>   VERB alone, so every imported `message.created` fires every enabled
+>   org-scope rule — an `automation_run` per imported message, plus
+>   `post_message` steps that mint `ActorAutomation` messages which DO
+>   notify (the invariant fails transitively), plus `http_request`
+>   deliveries. `unfurl/runner.go:166-171` checks no actor kind at all →
+>   one outbound egress fetch per imported message carrying a link.
+> - **Emailless users are silently merged.** `emailToID[lower(BestEmail())]`
+>   (`importer.go:418`, cache written at `:452`): the first emailless user
+>   inserts `email = ''` and every later one matches `emailToID[""]`,
+>   getting messages re-attributed and DM keys merged with **no loss
+>   bucket** — while the dry run counts them individually.
+>
+> **Blocking spec errors** (each verified with file:line):
+> 1. **`<#C123|name>` → "the channel ref" names a mechanism that does not
+>    exist.** The AST is `doc…mention, emoji, text` — no channel node
+>    (`content/content.go:36-53`), two custom inline parsers only
+>    (`parse.go:29-34`). Probed: `#**general**` renders as literal text.
+> 2. **Red/green pin (2) uses the wrong token and cannot go red.**
+>    `@channel` is Slack's RENDERED form; the wire token is `<!channel>`
+>    (`slack_message_conversion.py:200-207`). Probed: `"@channel"` already
+>    passes through untouched with zero conversion code, so the pin is
+>    vacuous — and `"<!channel>"` renders as visible corruption, not inert
+>    text. The natural asserts an executor would write both stay GREEN under
+>    the break, because `doc.Mentions()` returns resolved ids only. The
+>    assert must be on NODE TYPE.
+> 3. **"ZERO notification rows" is vacuous in the importer package** — its
+>    test builds no consumer at all, so the count is 0 regardless of actor
+>    kind, and `drainConsumer` is `package rest`.
+> 4. **The S6 bullet points at the wrong mechanism, and Slack breaks the
+>    right one.** The importer-actor early return is already correct and
+>    untouchable. The real hazard: `write` calls `SeedUnreadCounters`
+>    unconditionally, and a Slack export carries **no per-user read state**
+>    → zero watermarks → every member's badge becomes the entire imported
+>    history. The Zulip test asserts the OPPOSITE, so it would confirm the
+>    inflation rather than catch it.
+> 5. **Unthreaded messages (~90% of Slack) have no stated landing, and the
+>    shared write path violates F-15 there** — `importer.go:761-767` bumps
+>    `message_count`/`last_activity_at`/`root_message_id` unconditionally,
+>    which 0004 forbids for kind=2 and the native send path guards.
+> 6. **`thread_ts` is on PARENTS too** (`thread_ts == ts` for a root,
+>    `slack.py:1055-1057`), so "has `thread_ts` ⇒ reply" makes every parent
+>    its own reply. `thread_broadcast` is unmentioned.
+> 7. **"Later commits add `slack.go` — the loader only" is false in four
+>    places**: a second Zulip-shaped consumer exists that `write` never sees
+>    (the ~160-line dry-run branch, whose parity with `write` is pinned),
+>    `Run` hardcodes `LoadZulipExport`, `originZulip` is used 17× including
+>    a user-visible rename suffix an existing assert pins by exact string,
+>    and every cross-entity map is **int64-keyed** while Slack ids are
+>    strings.
+> 8. **"The existing Zulip tests ARE the no-op proof" certifies far less
+>    than claimed** — one test function asserting **one of six** event
+>    verbs, never exercising the group-DM kind=2 lane (the exact lane
+>    `mpims.json` needs), never exercising the multi-chunk merge. The stop
+>    rule ("if a test needs editing, the refactor is not pure") is
+>    satisfied by almost any restructuring.
+> 9. Files: **"exactly as the Zulip lane does" is not implementable** —
+>    that lane's byte resolution IS the Zulip format (`uploads/<PathID>`);
+>    Slack file records have no path field at all. A pre-fetch convention
+>    must be DEFINED or neither loader nor fixture can be written.
+> 10. Bots: the shared path **skips** them, no imported user is kind=1
+>     anyway, and landing them is a shared-write-path change that
+>     invalidates the whole-skip DM rule an existing test pins.
+>
+> **SIZING: XL, and it must SPLIT.** Commit 1 is not an extraction — it
+> must rewrite the dry-run accounting, change every cross-entity map from
+> int64 to string, thread the origin token through a user-visible rename
+> suffix, and gate the thread-counter bump on kind. Recommended split:
+> **P-27a** = the test-guard pre-commit + the IR/write-path refactor
+> (F-15 gating, string ids, origin parameterization, dry-run unification);
+> **P-27b** = the Slack loader + `import-slack` CLI + fixture. The
+> automation/unfurl backfill skip is its own slice, already dispatched.
+>
+> **Five blocking items are undecided DESIGN questions** and cannot be
+> fixed inline by a dispatcher: the channel-ref target, the email/NULL
+> rule, the read-state policy, the bot policy, and the pre-fetch layout.
+> The entry needs a re-spec, not a patch.
 
 **Grounding done.** Zulip ships a mature Slack importer —
 `~/Documents/zulip/zerver/data_import/slack.py` (1951 lines) +
@@ -3614,12 +3705,16 @@ record the scope and the known design questions so nothing is lost.)
 - **P-25** — **promoted to Tier 1** (full spec above).
 - **P-26 `automation: LLM steps + budgets + approval gates.`** XL —
   NEEDS-DESIGN: model gateway seam, budget metering, run status 8 flow.
-- **P-27** — **promoted to Tier 1** (full spec above; grounded in
-  Zulip's own `data_import/slack.py` rather than format docs. Sized
-  DOWN to L: the write path is already reusable, so commit 1 is a pure
-  IR prep refactor and the rest is a loader. Weft's first-class threads
-  take Slack's `thread_ts` directly — Zulip's topic-synthesis
-  workaround must NOT be ported. `slack_incoming` split out as P-27b).
+- **P-27** — promoted to Tier 1, then **[!] BLOCKED by its pre-flight
+  audit** (81 findings, 28 blocking; see the entry). The "sized DOWN to
+  L, commit 1 is a pure IR prep refactor" claim is **withdrawn** — that
+  commit must rewrite the dry-run accounting, move every cross-entity
+  map from int64 to string ids, thread the origin token through a
+  user-visible rename suffix, and gate the thread-counter bump on kind.
+  It is XL and must split (P-27a refactor / P-27b loader). The one part
+  that SURVIVED audit: Weft's first-class threads take Slack's
+  `thread_ts` directly, so Zulip's topic-synthesis workaround must NOT
+  be ported. `slack_incoming` stays split out.
 - **P-28 `importer: Jira.`** XL — deliberately last (M3 exit).
 - **P-29** — **promoted to Tier 1** (full spec above; password RESET
   split out as P-35 — it depends on P-20's mail plumbing).
