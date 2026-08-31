@@ -42,3 +42,22 @@ CROSS JOIN (VALUES
 ) AS v (verb)
 WHERE pa.verb = 'manage_org'
 ON CONFLICT (org_id, verb, scope_type, scope_id) DO NOTHING;
+
+-- P-47, part two: unseed manage_billing.
+--
+-- It is registered and was seeded to role:owners, and it is checked in ZERO
+-- places — a knob whose lane does not exist, which the honest-rungs rule
+-- forbids. Giving it a lane would mean inventing a billing feature, which the
+-- verbs-land-with-their-features policy forbids, so it goes the other way:
+-- perms.defaultAssignments no longer seeds it (new orgs), and this deletes
+-- the dead grant every existing org still carries. Without this line the
+-- unseed would only ever apply to orgs created after the upgrade.
+--
+-- The VERB STRING survives: perms.VerbManageBilling and its knownVerbs entry
+-- stay, so PUT /admin/verbs still accepts "manage_billing" exactly as it has
+-- since P-2. Rejecting a verb it took yesterday would be a wire-contract
+-- change, not a cleanup. An operator who assigns it gets a row back — one
+-- that still enforces nothing, honestly, until a billing feature lands.
+--
+-- Byte-for-byte perms.UnseedManageBillingSQL; the test asserts containment.
+DELETE FROM permission_assignment WHERE verb = 'manage_billing';

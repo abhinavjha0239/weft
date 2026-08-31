@@ -105,7 +105,14 @@ var defaultAssignments = map[string]string{
 	VerbAdministerChannel: GroupAdmins,
 	VerbModerateMessages:  GroupModerators,
 	VerbManageOrg:         GroupAdmins,
-	VerbManageBilling:     GroupOwners,
+	// manage_billing is NOT seeded (P-47): it is checked in ZERO places, so
+	// seeding it minted a grant with no lane — the honest-rungs violation.
+	// Giving it a lane means inventing a billing feature, which the
+	// verbs-land-with-their-features policy above forbids, so it goes the
+	// other way: no seed for new orgs, migration 0026 deletes existing rows,
+	// and the constant + knownVerbs entry stay because PUT /admin/verbs has
+	// accepted the string since P-2 and must not start rejecting it.
+
 	// P-47: the seven verbs manage_org split into, all at its own default so
 	// a NEW org's answers are the pre-split answers. This loop is the ONLY
 	// reader of this map, so seeding here helps future orgs only — every
@@ -156,3 +163,16 @@ CROSS JOIN (VALUES
 ) AS v (verb)
 WHERE pa.verb = 'manage_org'
 ON CONFLICT (org_id, verb, scope_type, scope_id) DO NOTHING`
+
+// UnseedManageBillingSQL is the second statement migration 0026 runs (P-47).
+// manage_billing is registered and was seeded to role:owners, but it is
+// checked in ZERO places — config nothing enforces, which the honest-rungs
+// rule forbids. Giving it a lane would mean inventing a billing feature, so
+// it is unseeded instead: dropped from defaultAssignments for new orgs, and
+// deleted here for the orgs that already carry the dead grant.
+//
+// The verb string itself SURVIVES (the constant and the knownVerbs entry
+// stay): PUT /admin/verbs has accepted it since P-2, and making it 400 would
+// be a wire-contract change, not a cleanup. Exported for the same
+// no-drift reason as the backfill.
+const UnseedManageBillingSQL = `DELETE FROM permission_assignment WHERE verb = 'manage_billing'`
