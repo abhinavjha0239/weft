@@ -79,15 +79,29 @@ type Runner struct {
 	// reg is remembered so SetSource and SetMetrics compose in either order:
 	// a feed swapped in after the registry was wired still publishes.
 	reg metrics.Registry
+	// wake is the DRIVER's push wake, coalesced per org. Under a streaming
+	// driver it is the only wake that arrives after the events are readable
+	// (eventlog.Feed.OnWake); under the default xmin driver nothing ever
+	// signals it. Either way it is a hint — the sweep below is the backstop.
+	wake *eventlog.WakeQueue
+	// SweepInterval paces the FALLBACK sweep: the pass that re-polls every org
+	// regardless of wakes, and therefore the bound on how late materialisation
+	// can be when every wake is lost. Exported so a test can widen it (to
+	// prove a wake delivered something the sweep could not have) or shrink it
+	// (to prove the backstop still converges with the wake gone); production
+	// leaves the default.
+	SweepInterval time.Duration
 }
 
 func NewRunner(pool *pgxpool.Pool, fan Fanout, log *slog.Logger) *Runner {
 	r := &Runner{
-		pool:     pool,
-		consumer: eventlog.NewConsumer(pool, consumerName, batchSize),
-		fan:      fan,
-		log:      log,
-		deliv:    NewDeliverability(pool, log),
+		pool:          pool,
+		consumer:      eventlog.NewConsumer(pool, consumerName, batchSize),
+		fan:           fan,
+		log:           log,
+		deliv:         NewDeliverability(pool, log),
+		wake:          eventlog.NewWakeQueue(),
+		SweepInterval: sweepInterval,
 	}
 	r.SetMetrics(metrics.Nop())
 	return r
@@ -112,6 +126,15 @@ func (r *Runner) SetSource(src eventlog.Source) {
 	if r.reg != nil {
 		c.SetMetrics(r.reg)
 	}
+	// Take the driver's PUSH wake as well as the LISTEN one. Under a streaming
+	// driver the two fire at different instants and only this one is DEPENDABLE:
+	// Append's NOTIFY arrives at COMMIT, before the WAL reader has decoded the
+	// commit, so the woken Poll races the decoder and every time it loses,
+	// materialisation silently falls back to the sweep interval. Signal is a map
+	// write plus a non-blocking send, which is what the OnWake contract
+	// requires; the LISTEN path stays, because it is the whole wake mechanism
+	// for the default driver (whose Consumer.OnWake registers nothing at all).
+	c.OnWake(r.wake.Signal)
 	r.consumer = c
 }
 
@@ -122,15 +145,31 @@ func (r *Runner) SetSource(src eventlog.Source) {
 func (r *Runner) SetUnread(m UnreadMaintainer) { r.unread = m }
 
 // Run blocks until ctx ends: LISTEN on the event channel and process the
-// signalled org; a sweep catches anything a missed NOTIFY left behind.
+// signalled org, drain the driver's push wake, and sweep every org on a slow
+// ticker as the backstop for anything either wake left behind.
+//
+// The wake pump is started unconditionally, which costs nothing on the default
+// driver: Consumer.OnWake registers no subscriber there, so the queue is never
+// signalled and the goroutine parks on its channel for the process lifetime —
+// the same shape as listenLoop parking on WaitForNotification, and not one
+// extra statement against Postgres.
 func (r *Runner) Run(ctx context.Context) {
 	go r.sweep(ctx)
 	go r.reconcileLoop(ctx)
+	go r.wake.Run(ctx, r.processOrgLogged)
 	for ctx.Err() == nil {
 		if err := r.listenLoop(ctx); err != nil && ctx.Err() == nil {
 			r.log.Warn("notification: listen loop restarting", "err", err)
 			time.Sleep(time.Second)
 		}
+	}
+}
+
+// processOrgLogged is one pass with this runner's error logging — shared by the
+// LISTEN wake and the driver's push wake so the two lanes cannot drift.
+func (r *Runner) processOrgLogged(ctx context.Context, orgID int64) {
+	if err := r.ProcessOrg(ctx, orgID); err != nil && ctx.Err() == nil {
+		r.log.Warn("notification: process", "org", orgID, "err", err)
 	}
 }
 
@@ -149,15 +188,17 @@ func (r *Runner) listenLoop(ctx context.Context) error {
 			return err
 		}
 		if orgID, err := strconv.ParseInt(n.Payload, 10, 64); err == nil {
-			if err := r.ProcessOrg(ctx, orgID); err != nil && ctx.Err() == nil {
-				r.log.Warn("notification: process", "org", orgID, "err", err)
-			}
+			r.processOrgLogged(ctx, orgID)
 		}
 	}
 }
 
 func (r *Runner) sweep(ctx context.Context) {
-	t := time.NewTicker(sweepInterval)
+	every := r.SweepInterval
+	if every <= 0 {
+		every = sweepInterval
+	}
+	t := time.NewTicker(every)
 	defer t.Stop()
 	for {
 		select {
