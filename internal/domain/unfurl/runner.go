@@ -150,10 +150,17 @@ func (r *Runner) handle(ctx context.Context, ev eventlog.Row) error {
 	var ast []byte
 	var threadID int64
 	var channelID, dmSpaceID *int64
+	// createdAt rides along for the same reason the container ids do: the
+	// preview lands LATER than the message (a fetch round trip, or an import's
+	// whole backfill), so the event's own stamp says nothing about its subject
+	// and the gateway's protected-history floor needs the message's own time
+	// (eventlog.MessageCreatedAtKey).
+	var createdAt time.Time
 	err = r.pool.QueryRow(ctx, `
-		SELECT ast, thread_id, channel_id, dm_space_id FROM message
+		SELECT ast, thread_id, channel_id, dm_space_id, created_at FROM message
 		WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL`,
-		ev.EntityID, ev.OrgID).Scan(&ast, &threadID, &channelID, &dmSpaceID)
+		ev.EntityID, ev.OrgID).
+		Scan(&ast, &threadID, &channelID, &dmSpaceID, &createdAt)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil // deleted since; nothing to preview
 	}
@@ -205,8 +212,10 @@ func (r *Runner) handle(ctx context.Context, ev eventlog.Row) error {
 			return nil // replay — associations already landed, no second event
 		}
 		// Mirrors message.created's container fields so the gateway routes
-		// the refresh to exactly the message's audience.
-		payload := map[string]any{"message_id": ev.EntityID, "thread_id": threadID}
+		// the refresh to exactly the message's audience, plus the message's
+		// created_at so the protected-history floor judges the message.
+		payload := map[string]any{"message_id": ev.EntityID, "thread_id": threadID,
+			eventlog.MessageCreatedAtKey: createdAt}
 		if channelID != nil {
 			payload["channel_id"] = *channelID
 		}

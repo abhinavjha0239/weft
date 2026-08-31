@@ -19,6 +19,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/unfurl"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
 )
@@ -148,6 +149,22 @@ func TestLinkPreviews(t *testing.T) {
 		WHERE org_id = $1 AND verb = 'message.preview_added' AND entity_id = $2`,
 		boot.OrgID, msg1).Scan(&eventCount); err != nil || eventCount != 1 {
 		t.Fatalf("preview_added events = %d (%v), want 1", eventCount, err)
+	}
+	// message.preview_added is an event ABOUT an already-existing message, and
+	// it lands a fetch round trip (or a whole import) LATER than its subject —
+	// so its own timestamps cannot answer the gateway's protected-history
+	// floor. It must carry the message's own created_at
+	// (eventlog.MessageCreatedAtKey), compared here against the message ROW
+	// rather than against anything the producer reported.
+	var stampMatches bool
+	if err := pool.QueryRow(ctx, `
+		SELECT (e.payload->>$3)::timestamptz = m.created_at
+		FROM event_log e JOIN message m ON m.id = e.entity_id
+		WHERE e.org_id = $1 AND e.verb = 'message.preview_added' AND e.entity_id = $2`,
+		boot.OrgID, msg1, eventlog.MessageCreatedAtKey).Scan(&stampMatches); err != nil ||
+		!stampMatches {
+		t.Fatalf("preview_added %s = message.created_at is %v (%v), want true",
+			eventlog.MessageCreatedAtKey, stampMatches, err)
 	}
 
 	// Cache: a second message with the SAME URL never refetches.
