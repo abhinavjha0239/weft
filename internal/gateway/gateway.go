@@ -984,8 +984,9 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 // before their join used to replay events that predate their access. The
 // comparison is deliberately TIME-based — history_from is a TIMESTAMPTZ and
 // the stream is ordered by id, so there is no id-space floor to compare with —
-// it judges eventRow.boundaryAt (see there for WHY that is
-// LEAST(occurred_at, recorded_at) and not either column alone), and its
+// it judges floorAt (the earlier of eventRow.boundaryAt, see there for WHY
+// that is LEAST(occurred_at, recorded_at) and not either column alone, and the
+// referenced message's created_at when the payload names one), and its
 // boundary is INCLUSIVE of history_from: an event AT the stamp is delivered.
 // That is exactly messaging.ListMessages' `created_at >= history_from` and the
 // negation of messaging.Get's `created_at < history_from` hide-rule, so the
@@ -997,6 +998,19 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 		SpaceID   int64   `json:"space_id"`
 		UserID    int64   `json:"user_id"`
 		UserIDs   []int64 `json:"user_ids"`
+		// MessageCreatedAt is eventlog.MessageCreatedAtKey — the created_at of
+		// the message this event is ABOUT (absent when it is about no existing
+		// message). Deliberately RAW rather than a time.Time, for two reasons.
+		// (1) Isolation: a time.Time field whose value fails to parse ABORTS
+		// encoding/json's object decode, leaving every field spelled after it
+		// in the payload at its ZERO value — verified. Today's key order
+		// (Go marshals map keys alphabetically) happens to put channel_id and
+		// dm_space_id BEFORE it, so the reachable damage is withhold-direction,
+		// but a read ACL must not rest on a key-sort accident; raw bytes never
+		// fail to decode, so no gate can be disturbed by the value of this one
+		// field. (2) Cost: floorAt parses it only on the rare row that actually
+		// faces a floor, so the common event pays nothing.
+		MessageCreatedAt json.RawMessage `json:"message_created_at"`
 	}
 	_ = json.Unmarshal(r.payload, &p)
 	if (r.verb == "member.joined" || r.verb == "member.left") && p.UserID == c.id.UserID {
@@ -1035,7 +1049,7 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 		// Protected-history floor. Absent key = no boundary (shared channel or
 		// the protected channel's creator) — the common case, one map miss.
 		if floor, bounded := c.historyFloor[p.ChannelID]; bounded &&
-			r.boundaryAt.Before(floor) {
+			floorAt(r.boundaryAt, p.MessageCreatedAt).Before(floor) {
 			return false, refresh
 		}
 	}
@@ -1065,6 +1079,51 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	// visibility slice makes org-visible over REST too — withholding it here
 	// would over-withhold against messaging.Get, not close a hole.
 	return true, refresh
+}
+
+// floorAt is the timestamp the protected-history floor judges ONE event at:
+// the EARLIER of the event's own boundaryAt and the created_at of the message
+// the event is ABOUT, when its payload names one
+// (eventlog.MessageCreatedAtKey).
+//
+// It extends the LEAST discipline boundaryAt already is rather than inventing a
+// second rule, and that is what makes it fail-closed BY CONSTRUCTION: the
+// earlier of two times always wins, so every outcome can only withhold MORE
+// than judging boundaryAt alone, never less.
+//
+//   - key ABSENT (len 0) → boundaryAt, i.e. exactly the pre-existing rule. The
+//     field's presence is never made load-bearing in the opening direction: an
+//     event about no existing message (message.created, a channel rename) must
+//     keep flowing, and a producer that has not been taught the key yet must
+//     not be handed a wider gate than it had.
+//   - key present and PARSEABLE → the earlier of the two. The message's own
+//     time is what REST compares (messaging.Get's `m.created_at <
+//     cm2.history_from`), so this is the value that makes the two planes agree;
+//     boundaryAt still caps it, so a producer cannot widen its own audience by
+//     naming a LATER created_at than the event.
+//   - key present and UNPARSEABLE → the zero time, which precedes every floor,
+//     so the event is withheld. A value we cannot read is a value we cannot
+//     authorize; over-withholding costs a client a REST refetch, under-
+//     withholding is the oracle this closes. JSON `null` lands here too, by a
+//     different route: time.Time accepts it without error and yields the zero
+//     time, which withholds for the same reason.
+//
+// The parse is paid only on rows that actually face a floor (a protected
+// channel this connection joined late), so the common event stays the same
+// single Unmarshal it always was — the O(1)-per-event fan-out invariant the
+// scale slices established is untouched, and no lookup leaves the process.
+func floorAt(boundaryAt time.Time, messageCreatedAt json.RawMessage) time.Time {
+	if len(messageCreatedAt) == 0 {
+		return boundaryAt
+	}
+	var refAt time.Time
+	if err := json.Unmarshal(messageCreatedAt, &refAt); err != nil {
+		return time.Time{}
+	}
+	if refAt.Before(boundaryAt) {
+		return refAt
+	}
+	return boundaryAt
 }
 
 // spaceScoped reports whether an event's entity belongs to a Space — a gate

@@ -21,6 +21,36 @@ import (
 // NotifyChannel is the LISTEN/NOTIFY channel that wakes consumers.
 const NotifyChannel = "event_log"
 
+// MessageCreatedAtKey is THE payload key for the one piece of ACL input an
+// event cannot derive from itself: the created_at of the message the event is
+// ABOUT. Every producer of an event about an ALREADY-EXISTING message carries
+// it under this key; it is defined here, once, because four packages
+// (messaging, unfurl, compliance, and the gateway that reads it) must spell it
+// identically for the read ACL to hold.
+//
+// Why it exists. The ADR-008 C-2 protected-history floor asks "may this
+// connection see this?", and REST answers on the MESSAGE's time
+// (messaging.Get's `m.created_at < cm2.history_from`). An event about a
+// message carries its OWN time, which says nothing about its subject: a
+// post-join edit / reaction / pin / move / delete of a PRE-join message clears
+// a floor REST does not, handing a protected-history member the id of a message
+// REST 404s for — an existence oracle over pre-join history. Resolving it in
+// the gateway would cost a query per event PER CONNECTION and break the
+// O(1)-per-event fan-out invariant, so the PRODUCER carries the timestamp and
+// the filter stays in memory.
+//
+// Contract. The value is the message row's created_at, unmodified (a move does
+// not change it, and REST compares that exact column). The field is ADDITIVE —
+// payloads are wire contracts, so no key changes and no verb renames — and the
+// gateway takes the EARLIER of it and the event's own boundary. Hence a
+// producer that omits it is judged exactly as before, and one that carries it
+// can only ever withhold MORE: absence never opens the gate.
+//
+// message.created deliberately does NOT carry it: its event and its message are
+// written by the same transaction, so its boundary already equals (importers) or
+// precedes (live sends) the created_at it would name.
+const MessageCreatedAtKey = "message_created_at"
+
 // MustPayload marshals a payload map; keys and shapes are wire contract.
 // Panics only on unmarshalable input, which is a programming error.
 func MustPayload(v any) json.RawMessage {

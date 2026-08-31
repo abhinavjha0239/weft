@@ -369,7 +369,8 @@ func (j *Janitor) vacuumMessages(ctx context.Context, now time.Time, vacuumed *i
 // DeleteMessage side-effects that keep the per-channel pin cap and thread
 // counters honest. Content is left in place for recovery; the purge lane
 // removes it after the window. Emits retention.message_vacuumed (system
-// actor).
+// actor) carrying the message's containers and created_at, so the gateway's
+// existing gates route it exactly like the message.deleted it mirrors.
 func (j *Janitor) vacuumMessage(ctx context.Context, msgID int64, now time.Time, vacuumed *int) error {
 	return db.WithTx(ctx, j.pool, func(tx pgx.Tx) error {
 		var locked int64
@@ -392,11 +393,16 @@ func (j *Janitor) vacuumMessage(ctx context.Context, msgID int64, now time.Time,
 			return nil
 		}
 		var orgID, threadID int64
-		var channelID *int64
+		// dm_space_id and created_at ride along for the gateway (see the event
+		// append below): without the DM container this event fanned ORG-WIDE.
+		var channelID, dmSpaceID *int64
+		var createdAt time.Time
 		if err := tx.QueryRow(ctx, `
 			UPDATE message SET deleted_at = $2, retention_vacuumed_at = $2
-			WHERE id = $1 RETURNING org_id, thread_id, channel_id`,
-			msgID, now).Scan(&orgID, &threadID, &channelID); err != nil {
+			WHERE id = $1
+			RETURNING org_id, thread_id, channel_id, dm_space_id, created_at`,
+			msgID, now).Scan(&orgID, &threadID, &channelID, &dmSpaceID,
+			&createdAt); err != nil {
 			return fmt.Errorf("janitor: vacuum: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `DELETE FROM pin WHERE message_id = $1`, msgID); err != nil {
@@ -407,9 +413,21 @@ func (j *Janitor) vacuumMessage(ctx context.Context, msgID int64, now time.Time,
 			WHERE id = $1 AND kind = 1`, threadID); err != nil {
 			return fmt.Errorf("janitor: vacuum thread count: %w", err)
 		}
-		payload := map[string]any{"message_id": msgID, "thread_id": threadID}
+		// The messaging.InsertThreadMessage / edit.go shape, verbatim: BOTH
+		// container ids plus the referenced message's created_at. This event
+		// used to carry channel_id only when the message had one, so a DM
+		// message's vacuum named no container at all and the gateway fanned a
+		// DM thread id to every connection in the org; and its own timestamp is
+		// the SWEEP clock, which by definition sits far above the age of the
+		// message it names, so without created_at it also cleared every
+		// protected-history floor (eventlog.MessageCreatedAtKey).
+		payload := map[string]any{"message_id": msgID, "thread_id": threadID,
+			eventlog.MessageCreatedAtKey: createdAt}
 		if channelID != nil {
 			payload["channel_id"] = *channelID
+		}
+		if dmSpaceID != nil {
+			payload["dm_space_id"] = *dmSpaceID
 		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: orgID, ActorKind: enum.ActorSystem,
@@ -467,13 +485,21 @@ func (j *Janitor) purgeVacuumedMessages(ctx context.Context, cutoff time.Time, p
 // due index) and the no-FK back-references are nulled (thread.root_message_id,
 // forwarded_from_message_id on any forward copy). The event_log has no FK to
 // message, so the audit trail — including this message's own created/vacuumed
-// entries — survives; a retention.message_purged entry is appended.
+// entries — survives; a retention.message_purged entry is appended, carrying
+// the same containers + created_at as the vacuum twin (read under the lock,
+// before the DELETE takes the row that holds them).
 func (j *Janitor) purgeVacuumedMessage(ctx context.Context, msgID int64, cutoff time.Time, purged *int) error {
 	return db.WithTx(ctx, j.pool, func(tx pgx.Tx) error {
 		var orgID int64
-		err := tx.QueryRow(ctx,
-			`SELECT org_id FROM message WHERE id = $1 AND retention_vacuumed_at IS NOT NULL FOR UPDATE`,
-			msgID).Scan(&orgID)
+		// The containers and created_at must be read HERE, under the lock and
+		// before the DELETE below removes the only row that holds them — they
+		// are what the gateway's ACL gates and history floor need on the event.
+		var channelID, dmSpaceID *int64
+		var createdAt time.Time
+		err := tx.QueryRow(ctx, `
+			SELECT org_id, channel_id, dm_space_id, created_at FROM message
+			WHERE id = $1 AND retention_vacuumed_at IS NOT NULL FOR UPDATE`,
+			msgID).Scan(&orgID, &channelID, &dmSpaceID, &createdAt)
 		if err == pgx.ErrNoRows {
 			return nil // purged or restored by a concurrent actor
 		}
@@ -509,10 +535,21 @@ func (j *Janitor) purgeVacuumedMessage(ctx context.Context, msgID int64, cutoff 
 		if _, err := tx.Exec(ctx, `DELETE FROM message WHERE id = $1`, msgID); err != nil {
 			return fmt.Errorf("janitor: purge: %w", err)
 		}
+		// Same shape as the vacuum twin. This payload was `{message_id}` alone —
+		// no container for a public, private or DM message alike — so every
+		// permanent removal was announced to the whole org.
+		payload := map[string]any{"message_id": msgID,
+			eventlog.MessageCreatedAtKey: createdAt}
+		if channelID != nil {
+			payload["channel_id"] = *channelID
+		}
+		if dmSpaceID != nil {
+			payload["dm_space_id"] = *dmSpaceID
+		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: orgID, ActorKind: enum.ActorSystem,
 			EntityType: enum.EntityMessage, EntityID: msgID, Verb: "retention.message_purged",
-			Payload: eventlog.MustPayload(map[string]any{"message_id": msgID}),
+			Payload: eventlog.MustPayload(payload),
 		}); err != nil {
 			return fmt.Errorf("janitor: purge event: %w", err)
 		}

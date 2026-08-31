@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"slices"
 	"strings"
@@ -19,6 +20,7 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
 	"github.com/abhinavjha0239/weft/internal/domain/worktrack"
+	"github.com/abhinavjha0239/weft/internal/eventlog"
 	"github.com/abhinavjha0239/weft/internal/gateway"
 )
 
@@ -489,6 +491,174 @@ func TestGatewayReadACL(t *testing.T) {
 				backdated, seen)
 		}
 	})
+
+	// WHICH MESSAGE the protected-history floor is about. Every subtest above
+	// judges events whose subject IS the event (message.created), where the
+	// event's own time and the message's created_at agree. The seven verbs here
+	// are events ABOUT an already-existing message, so their own time says
+	// nothing about the message they name: a post-join edit / reaction / pin /
+	// unpin / move / delete of a PRE-join message carries a post-join stamp.
+	// REST answers on the MESSAGE (messaging.Get: m.created_at <
+	// cm2.history_from), so judging the event's stamp alone hands a protected-
+	// history member the id of a message REST 404s for — an existence oracle
+	// over pre-join history. The producers therefore carry the referenced
+	// message's created_at and the floor takes the EARLIER of the two.
+	//
+	// Each verb is asserted TWICE: withheld for the pre-join message AND
+	// delivered for the post-join one. The positive half is what stops the
+	// negative from passing vacuously — a filter that withheld everything, or a
+	// connection that was never a fan target, fails it.
+	//
+	// Appended last so the pinned assertion line numbers of the subtests above
+	// stay valid.
+	t.Run("referenced message floor", func(t *testing.T) {
+		var archive struct {
+			ChannelID int64 `json:"channel_id"`
+		}
+		postJSON(t, ts.URL+"/api/v1/channels", boot.Token, map[string]any{
+			"name": "archive", "visibility": "private", "protected": true}, &archive)
+
+		// pre exists BEFORE oscar's join; post exists after it. Both live in the
+		// same protected channel, so the ONLY thing separating them is their
+		// created_at against oscar's stamp.
+		pre := sendChannel(t, ts.URL, boot.Token, archive.ChannelID, "before oscar")
+
+		var inv identity.Invite
+		postJSON(t, ts.URL+"/api/v1/invites", boot.Token, map[string]any{
+			"role": 40, "channel_ids": []int64{archive.ChannelID}}, &inv)
+		var oscar identity.AcceptInviteResult
+		postJSON(t, ts.URL+"/api/v1/invites/accept", "", map[string]any{
+			"token": inv.Token, "email": "oscar@acl.test", "password": "password123",
+			"full_name": "Oscar Late"}, &oscar)
+		var stamp *time.Time
+		if err := pool.QueryRow(ctx, `
+			SELECT history_from FROM channel_member
+			WHERE channel_id = $1 AND user_id = $2`,
+			archive.ChannelID, oscar.UserID).Scan(&stamp); err != nil || stamp == nil {
+			t.Fatalf("oscar history_from = %v (%v), want stamped", stamp, err)
+		}
+		post := sendChannel(t, ts.URL, boot.Token, archive.ChannelID, "after oscar")
+		// The two messages must actually straddle the stamp, or both halves of
+		// every assertion below would be about the same side of the floor.
+		var preAt, postAt time.Time
+		if err := pool.QueryRow(ctx,
+			`SELECT max(created_at) FILTER (WHERE id = $1), max(created_at) FILTER (WHERE id = $2)
+			 FROM message WHERE id IN ($1, $2)`, pre, post).Scan(&preAt, &postAt); err != nil {
+			t.Fatalf("message times: %v", err)
+		}
+		if !preAt.Before(*stamp) || postAt.Before(*stamp) {
+			t.Fatalf("fixture does not straddle the stamp: pre=%v post=%v stamp=%v",
+				preAt, postAt, *stamp)
+		}
+
+		// A move needs a same-channel target thread that is not the root.
+		var target struct {
+			ThreadID int64 `json:"thread_id"`
+		}
+		postJSON(t, fmt.Sprintf("%s/api/v1/channels/%d/threads", ts.URL, archive.ChannelID),
+			boot.Token, map[string]any{"title": "relocations", "content": "landing zone"},
+			&target)
+
+		// oscar goes live AFTER his join, so his filter holds the stamp, and
+		// every operation below is logged while he is connected.
+		oc := dialClientLast(t, ctx, ts.URL, oscar.Token, "-1")
+		defer oc.conn.CloseNow()
+		oc.waitFor(t, "ready")
+
+		// The full set of message-referencing verbs, run identically on both
+		// messages. Delete is last: it is the only one that makes its subject
+		// unusable for the ops after it.
+		for _, msgID := range []int64{pre, post} {
+			if code := patchJSON(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, msgID),
+				boot.Token, map[string]any{"content": fmt.Sprintf("edited %d", msgID)}); code != http.StatusOK {
+				t.Fatalf("edit %d = %d, want 200", msgID, code)
+			}
+			react := fmt.Sprintf("%s/api/v1/messages/%d/reactions/%s",
+				ts.URL, msgID, url.PathEscape("👍"))
+			if code := putJSON(t, react, boot.Token, nil); code != http.StatusOK {
+				t.Fatalf("react %d = %d, want 200", msgID, code)
+			}
+			if code := deleteReq(t, react, boot.Token); code != http.StatusOK {
+				t.Fatalf("unreact %d = %d, want 200", msgID, code)
+			}
+			pin := fmt.Sprintf("%s/api/v1/messages/%d/pin", ts.URL, msgID)
+			if code := putJSON(t, pin, boot.Token, nil); code != http.StatusOK {
+				t.Fatalf("pin %d = %d, want 200", msgID, code)
+			}
+			if code := deleteReq(t, pin, boot.Token); code != http.StatusOK {
+				t.Fatalf("unpin %d = %d, want 200", msgID, code)
+			}
+			if code := postJSONStatus(t, fmt.Sprintf("%s/api/v1/messages/%d/move", ts.URL, msgID),
+				boot.Token, map[string]any{"thread_id": target.ThreadID}); code != http.StatusOK {
+				t.Fatalf("move %d = %d, want 200", msgID, code)
+			}
+			if code := deleteReq(t, fmt.Sprintf("%s/api/v1/messages/%d", ts.URL, msgID),
+				boot.Token); code != http.StatusOK {
+				t.Fatalf("delete %d = %d, want 200", msgID, code)
+			}
+		}
+		// Unambiguously above the stamp on every clock: the drain terminator,
+		// and the proof oscar is a LIVE fan target for this channel.
+		tail := sendChannel(t, ts.URL, boot.Token, archive.ChannelID, "terminator")
+
+		saw := drainUntil(t, oc, tail)
+		for _, verb := range []string{
+			"message.edited", "reaction.added", "reaction.removed",
+			"message.pinned", "message.unpinned", "message.moved", "message.deleted"} {
+			if hasMessageEvent(saw, verb, pre) {
+				t.Fatalf("%q about pre-join message %d was delivered to a protected-history member; REST 404s that message, so its id must never reach the stream. saw %v",
+					verb, pre, envTypes(saw))
+			}
+			if !hasMessageEvent(saw, verb, post) {
+				t.Fatalf("%q about post-join message %d was withheld; the floor must judge the REFERENCED message, not blanket-withhold. saw %v",
+					verb, post, envTypes(saw))
+			}
+		}
+
+		// A field that is PRESENT but unreadable must withhold, not fall back
+		// to the event's own stamp: a timestamp the filter cannot parse is a
+		// timestamp it cannot authorize. Corrupt it on ONE post-join event and
+		// replay — that event must vanish while its post-join sibling, whose
+		// field is untouched, still arrives (the anchor that keeps this from
+		// being satisfied by a filter that simply stopped delivering).
+		if ct, err := pool.Exec(ctx, `
+			UPDATE event_log
+			SET payload = jsonb_set(payload, '{message_created_at}', '"not-a-timestamp"')
+			WHERE verb = 'message.pinned' AND (payload->>'message_id')::bigint = $1`,
+			post); err != nil || ct.RowsAffected() != 1 {
+			t.Fatalf("corrupt the stamp: %d rows (%v)", ct.RowsAffected(), err)
+		}
+		corruptTail := sendChannel(t, ts.URL, boot.Token, archive.ChannelID, "after corruption")
+		rc := dialClientLast(t, ctx, ts.URL, oscar.Token, "0")
+		defer rc.conn.CloseNow()
+		replayed := drainUntil(t, rc, corruptTail)
+		if hasMessageEvent(replayed, "message.pinned", post) {
+			t.Fatalf("an event whose %s could not be parsed was delivered; an unreadable stamp must withhold, never fall back to the event's own time. saw %v",
+				eventlog.MessageCreatedAtKey, envTypes(replayed))
+		}
+		if !hasMessageEvent(replayed, "message.unpinned", post) {
+			t.Fatalf("the uncorrupted sibling event for message %d was also withheld; only the unreadable event may be dropped. saw %v",
+				post, envTypes(replayed))
+		}
+	})
+}
+
+// hasMessageEvent matches an envelope by verb AND the message_id its payload
+// names, so an event about a DIFFERENT message can never satisfy (or falsely
+// trip) an assertion about this one.
+func hasMessageEvent(evs []gateway.Envelope, want string, msgID int64) bool {
+	for _, e := range evs {
+		if e.Type != want {
+			continue
+		}
+		var p struct {
+			MessageID int64 `json:"message_id"`
+		}
+		if json.Unmarshal(e.Payload, &p) == nil && p.MessageID == msgID {
+			return true
+		}
+	}
+	return false
 }
 
 // forceTimes pins an event row's two timestamps so a clock disagreement can be

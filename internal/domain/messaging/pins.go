@@ -61,7 +61,7 @@ func (s *Service) togglePin(ctx context.Context, actor auth.Identity, msgID int6
 		// Read gate first (oracle-free): the same three-way container rule as a
 		// fetch/reaction. A deleted or unreadable message is 404, so pinning
 		// never confirms a private message exists.
-		_, channelID, _, err := s.loadReactable(ctx, tx, actor, msgID)
+		_, channelID, _, createdAt, err := s.loadReactable(ctx, tx, actor, msgID)
 		if err != nil {
 			return err
 		}
@@ -127,7 +127,10 @@ func (s *Service) togglePin(ctx context.Context, actor auth.Identity, msgID int6
 				OrgID: actor.OrgID, ActorKind: enum.ActorHuman, ActorID: &actor.UserID,
 				EntityType: enum.EntityMessage, EntityID: msgID, Verb: verb,
 				Payload: eventlog.MustPayload(map[string]any{
-					"message_id": msgID, "channel_id": *channelID}),
+					"message_id": msgID, "channel_id": *channelID,
+					// Pinning is a NEW act on a possibly OLD message; the floor
+					// judges the message (eventlog.MessageCreatedAtKey).
+					eventlog.MessageCreatedAtKey: createdAt}),
 			}); err != nil {
 				return apperr.Internal("append event", err)
 			}

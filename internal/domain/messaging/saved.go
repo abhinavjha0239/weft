@@ -47,7 +47,7 @@ func (s *Service) SaveMessage(ctx context.Context, actor auth.Identity, msgID in
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		// The three-way read ACL (shared with reactions): channel membership,
 		// DM participation, or an org-visible space thread; deleted → 404.
-		if _, _, _, err := s.loadReactable(ctx, tx, actor, msgID); err != nil {
+		if _, _, _, _, err := s.loadReactable(ctx, tx, actor, msgID); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `
