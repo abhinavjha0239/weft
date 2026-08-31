@@ -147,7 +147,7 @@ func (a *api) handleSignLink(w http.ResponseWriter, r *http.Request, id auth.Ide
 }
 
 // handleGetStorageQuota: GET /admin/storage-quota → {max_bytes, used_bytes}
-// (manage_org-gated in the domain). max_bytes 0 = unlimited.
+// (manage_storage_quota-gated in the domain). max_bytes 0 = unlimited.
 func (a *api) handleGetStorageQuota(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	info, err := a.Files.StorageQuota(r.Context(), id)
 	if err != nil {
@@ -157,7 +157,8 @@ func (a *api) handleGetStorageQuota(w http.ResponseWriter, r *http.Request, id a
 	writeJSON(w, http.StatusOK, info)
 }
 
-// handleSetStorageQuota: PUT /admin/storage-quota {max_bytes} (manage_org).
+// handleSetStorageQuota: PUT /admin/storage-quota {max_bytes}
+// (manage_storage_quota).
 func (a *api) handleSetStorageQuota(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	type req struct {
 		MaxBytes int64 `json:"max_bytes"`

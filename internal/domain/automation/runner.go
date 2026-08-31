@@ -506,8 +506,8 @@ func (r *Runner) execute(ctx context.Context, orgID int64, rl rule, ev eventlog.
 // notifyFailure records a kind-6 notification for whoever may administer the
 // failed rule — but only on ENTRY into the failing state, throttled to at most
 // once an hour while it keeps failing (any success re-arms). Recipients mirror
-// the WRITE gate (requireScopeAdmin): org rules → manage_org holders, channel
-// rules → administer_channel holders. Returns the users a live ping should
+// the WRITE gate (requireScopeAdmin): org rules → manage_automations holders,
+// channel rules → administer_channel holders. Returns the users a live ping should
 // reach (the ones actually inserted). Runs inside the finish transaction.
 func (r *Runner) notifyFailure(ctx context.Context, tx pgx.Tx, orgID int64, rl rule, runID int64) ([]int64, error) {
 	// Alert on entry only: inspect the most recent OTHER terminal run for this
@@ -536,14 +536,17 @@ func (r *Runner) notifyFailure(ctx context.Context, tx pgx.Tx, orgID int64, rl r
 	return r.notif.RecordAutomationFailure(ctx, tx, orgID, runID, recips)
 }
 
-// ruleAdmins resolves a rule's write-gate holders — org rules → manage_org
-// holders, channel rules → administer_channel holders (the requireScopeAdmin
-// mirror, so whoever may edit the rule is who hears about it). Shared by the
+// ruleAdmins resolves a rule's write-gate holders — org rules →
+// manage_automations holders, channel rules → administer_channel holders (the
+// requireScopeAdmin mirror, so whoever may edit the rule is who hears about
+// it). P-47 moved the org arm off manage_org WITH its gate: leaving it behind
+// would have falsified the mirror the moment the write gate changed — a
+// holder could edit org rules and never hear that they broke one. Shared by the
 // run-failure alert (notifyFailure) and the delivery-failure health alerts.
 func (r *Runner) ruleAdmins(ctx context.Context, tx pgx.Tx, orgID int64, scopeType int16, scopeID int64) ([]int64, error) {
 	switch scopeType {
 	case ScopeOrg:
-		return r.perms.HoldersAt(ctx, tx, orgID, perms.VerbManageOrg, perms.OrgScope(orgID))
+		return r.perms.HoldersAt(ctx, tx, orgID, perms.VerbManageAutomations, perms.OrgScope(orgID))
 	case ScopeChannel:
 		chain, err := r.perms.ChannelScope(ctx, tx, orgID, scopeID)
 		if err != nil {

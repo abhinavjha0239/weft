@@ -212,7 +212,8 @@ func TestAutomationFailureNotifies(t *testing.T) {
 		t.Fatalf("run1: admins should each get one kind-6 row (alice=%d bob=%d)",
 			kind6ForRun(aliceID, run1), kind6ForRun(bobID, run1))
 	}
-	// Load-bearing: a member and a guest are NOT holders of manage_org.
+	// Load-bearing: a member and a guest are NOT holders of manage_automations
+	// (P-47 moved the audience with its write gate; the backfill kept the set).
 	// Resolving recipients WITHOUT the closure/verb path (e.g. "all org users")
 	// would give them rows and fail here.
 	if kind6ForRun(carolID, run1) != 0 || kind6ForRun(danID, run1) != 0 {

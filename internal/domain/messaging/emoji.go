@@ -17,7 +17,7 @@ import (
 
 // Custom emoji (P-06). Org-scoped registry backing reaction tokens: reactions
 // already store arbitrary emoji tokens, so this list is how a client resolves
-// a custom name to its image file. Create/delete are manage_org-gated org
+// a custom name to its image file. Create/delete are add_emoji-gated org
 // config (event-logged); the image bytes ride files.Upload, and the
 // custom_emoji.file_id FK guards them from GC (avatar-style). Delete is SOFT
 // (deactivated_at), and the UNIQUE(org_id, name) index means a deactivated
@@ -36,7 +36,7 @@ type Emoji struct {
 	FileID int64  `json:"file_id"`
 }
 
-// CreateEmoji registers a custom emoji (manage_org). fileID is a file already
+// CreateEmoji registers a custom emoji (add_emoji). fileID is a file already
 // uploaded through the org-scoped image path. The name must match
 // [a-z0-9_]{2,32} and be free across the org's WHOLE registry — a deactivated
 // name is still taken, so a collision is a 409.
@@ -45,7 +45,7 @@ func (s *Service) CreateEmoji(ctx context.Context, actor auth.Identity, name str
 		return Emoji{}, apperr.Invalid("emoji name must be 2-32 chars of a-z, 0-9, or _")
 	}
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg, perms.OrgScope(actor.OrgID)); err != nil {
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbAddEmoji, perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
 		// The name is reserved across live AND deactivated rows (the unique
@@ -104,13 +104,13 @@ func (s *Service) ListEmoji(ctx context.Context, actor auth.Identity) ([]Emoji, 
 	return out, rows.Err()
 }
 
-// DeleteEmoji soft-deletes a live custom emoji (manage_org): deactivated_at is
+// DeleteEmoji soft-deletes a live custom emoji (add_emoji): deactivated_at is
 // set while the row and its file_id FK stay, so the name remains reserved and
 // the image survives for historical reaction rendering. An unknown or
 // already-deactivated name is a 404.
 func (s *Service) DeleteEmoji(ctx context.Context, actor auth.Identity, name string) error {
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg, perms.OrgScope(actor.OrgID)); err != nil {
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbAddEmoji, perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
 		var emojiID int64

@@ -64,14 +64,14 @@ func (s *Service) checkQuota(ctx context.Context, orgID, incoming int64) error {
 	return nil
 }
 
-// StorageQuota returns the org's cap and current usage. manage_org-gated (the
-// F-9 admin surface); the gate runs in a tx, the usage read follows.
+// StorageQuota returns the org's cap and current usage.
+// manage_storage_quota-gated (the F-9 admin surface); the gate runs in a tx, the usage read follows.
 func (s *Service) StorageQuota(ctx context.Context, actor auth.Identity) (StorageQuotaInfo, error) {
 	if s.perms == nil {
 		return StorageQuotaInfo{}, apperr.Internal("storage quota", errors.New("perms not wired"))
 	}
 	if err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		return s.perms.Require(ctx, tx, actor, perms.VerbManageOrg, perms.OrgScope(actor.OrgID))
+		return s.perms.Require(ctx, tx, actor, perms.VerbManageStorageQuota, perms.OrgScope(actor.OrgID))
 	}); err != nil {
 		return StorageQuotaInfo{}, err
 	}
@@ -83,7 +83,7 @@ func (s *Service) StorageQuota(ctx context.Context, actor auth.Identity) (Storag
 }
 
 // SetStorageQuota sets the org's storage cap in bytes (0 = unlimited).
-// manage_org-gated in the same tx as the write; jsonb_set touches only the
+// manage_storage_quota-gated in the same tx as the write; jsonb_set touches only the
 // quota key, and the change is event-logged (org.quota_changed — the admin.go
 // precedent). Setting a cap below current usage is allowed: it blocks NEW
 // uploads without touching stored bytes.
@@ -95,7 +95,7 @@ func (s *Service) SetStorageQuota(ctx context.Context, actor auth.Identity, maxB
 		return apperr.Invalid("max_bytes must be >= 0")
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg, perms.OrgScope(actor.OrgID)); err != nil {
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageStorageQuota, perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `

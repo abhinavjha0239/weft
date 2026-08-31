@@ -25,7 +25,7 @@ import (
 // TestStorageQuota: P-19 per-org storage quota. A cap rejects an upload that
 // would push live usage past it (413, inclusive boundary), used_bytes tracks
 // row-accounted live size, a GC purge frees room, max_bytes 0 is unlimited,
-// only manage_org holders may read or set the cap, and every set is
+// only manage_storage_quota holders may read or set the cap, and every set is
 // event-logged.
 func TestStorageQuota(t *testing.T) {
 	dbURL := os.Getenv("TEST_DATABASE_URL")
@@ -135,7 +135,8 @@ func TestStorageQuota(t *testing.T) {
 	}
 	assertQuota(150, 140)
 
-	// Non-admin: a plain member may neither read nor set the quota (manage_org).
+	// Non-admin: a plain member may neither read nor set the quota
+	// (manage_storage_quota).
 	if code, _ := getQuota(bobTok); code != http.StatusForbidden {
 		t.Fatalf("non-admin GET quota = %d, want 403", code)
 	}

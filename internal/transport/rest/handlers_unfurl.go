@@ -7,7 +7,7 @@ import (
 )
 
 // handleGetLinkPreviews: GET /admin/link-previews → {enabled}
-// (manage_org-gated in the domain). Absent setting = enabled.
+// (manage_link_previews-gated in the domain). Absent setting = enabled.
 func (a *api) handleGetLinkPreviews(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	setting, err := a.Unfurl.LinkPreviewsSetting(r.Context(), id)
 	if err != nil {
@@ -17,7 +17,8 @@ func (a *api) handleGetLinkPreviews(w http.ResponseWriter, r *http.Request, id a
 	writeJSON(w, http.StatusOK, setting)
 }
 
-// handleSetLinkPreviews: PUT /admin/link-previews {enabled} (manage_org).
+// handleSetLinkPreviews: PUT /admin/link-previews {enabled}
+// (manage_link_previews).
 func (a *api) handleSetLinkPreviews(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	type req struct {
 		Enabled bool `json:"enabled"`

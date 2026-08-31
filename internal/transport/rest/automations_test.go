@@ -20,7 +20,7 @@ import (
 )
 
 // TestAutomationCRUD: ADR-014 governance — rules are owned by the scope
-// (org rules need manage_org, channel rules administer_channel), created
+// (org rules need manage_automations, channel rules administer_channel), created
 // DISABLED, validated against the v1 definition vocabulary, and the F-13
 // consent arc holds: acting as another human requires their consent, a
 // definition edit clears consent AND disables, and only re-consent

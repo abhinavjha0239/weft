@@ -7,7 +7,7 @@ import (
 )
 
 // handleAssignVerb: PUT /api/v1/admin/verbs — point an org-scope verb at a
-// group (manage_org gated in the domain layer).
+// group (manage_permissions gated in the domain layer).
 func (a *api) handleAssignVerb(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	type req struct {
 		Verb  string `json:"verb"`

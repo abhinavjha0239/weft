@@ -21,7 +21,7 @@ import (
 
 // TestChannelFolders proves P-09's channel-folder + default-channel admin
 // surfaces: CRUD, the folder assignment on channels (surfaced on the list and
-// cleared by folder delete), the manage_org gate on every endpoint, and the
+// cleared by folder delete), the manage_channel_folders gate on every endpoint, and the
 // replace-set validation for default channels (public + live + same-org only,
 // atomic on failure).
 func TestChannelFolders(t *testing.T) {
@@ -57,7 +57,7 @@ func TestChannelFolders(t *testing.T) {
 		"org_slug": "fold", "email": "alice@f.test", "password": "password123",
 		"full_name": "Alice Admin",
 	}, &boot)
-	// A plain member (role:members, no manage_org) for the gate tests.
+	// A plain member (role:members, no manage_channel_folders) for the gate tests.
 	bobTok := addChannelMember(t, ctx, pool, boot.OrgID, boot.ChannelID,
 		"bob@f.test", "Bob Member", "bobfoldtok")
 
@@ -202,7 +202,7 @@ func TestChannelFolders(t *testing.T) {
 		t.Fatalf("defaults after rejected sets = %+v, want unchanged [%d]", dc.ChannelIDs, pub.ChannelID)
 	}
 
-	// --- manage_org gate: a plain member is refused everywhere ---
+	// --- manage_channel_folders gate: a plain member is refused everywhere ---
 	if code := postJSONStatus(t, folderURL, bobTok, map[string]any{"name": "sneaky"}); code != http.StatusForbidden {
 		t.Fatalf("member create folder = %d, want 403", code)
 	}

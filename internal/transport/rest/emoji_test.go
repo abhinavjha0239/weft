@@ -42,7 +42,7 @@ func postEmoji(t *testing.T, base, token, name string, data []byte) int {
 	return resp.StatusCode
 }
 
-// TestCustomEmoji: P-06 emoji — manage_org gating, the name grammar, the
+// TestCustomEmoji: P-06 emoji — add_emoji gating (P-47), the name grammar, the
 // reserved-even-when-deactivated uniqueness, soft delete with a live-only
 // list, and a reaction with a custom name surfacing in the aggregates.
 func TestCustomEmoji(t *testing.T) {
@@ -89,7 +89,7 @@ func TestCustomEmoji(t *testing.T) {
 
 	png := pngBytes("emoji-image", 40)
 
-	// manage_org gate: a plain member cannot create.
+	// add_emoji gate: a plain member cannot create.
 	if code := postEmoji(t, ts.URL, bobTok, "partyparrot", png); code != http.StatusForbidden {
 		t.Fatalf("member create emoji = %d, want 403", code)
 	}

@@ -12,7 +12,8 @@ import (
 // per-IP authLimit (the login/unsubscribe precedent): no Authorization is read
 // because the IdP-issued code+state are the capability. The callback answers
 // 200 JSON {token, user_id, org_id} — the API-era austerity, no web page. The
-// auth-provider CRUD routes are withAuth + manage_org-gated in the domain.
+// auth-provider CRUD routes are withAuth + manage_auth_providers-gated in the
+// domain.
 
 // handleOIDCStart: GET /api/v1/auth/oidc/{org_slug}/{provider}/start → 302 to
 // the IdP authorize URL. An absent/disabled provider or bad org slug is one

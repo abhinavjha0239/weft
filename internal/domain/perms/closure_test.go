@@ -504,7 +504,10 @@ func TestClosureVersionFence(t *testing.T) {
 	var holders []int64
 	if err := inTx(t, pool, func(tx pgx.Tx) error {
 		var err error
-		holders, err = svc.HoldersAt(ctx, tx, f.orgID, VerbManageOrg, OrgScope(f.orgID))
+		// A verb still SEEDED to role:admins, so the planted admins-group rows
+		// are actually in play. manage_org would return empty post-P-47 (it is
+		// no longer seeded) and this leak check would pass vacuously.
+		holders, err = svc.HoldersAt(ctx, tx, f.orgID, VerbManageAuthProviders, OrgScope(f.orgID))
 		return err
 	}); err != nil {
 		t.Fatalf("holders: %v", err)
