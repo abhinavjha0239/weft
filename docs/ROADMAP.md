@@ -3386,111 +3386,192 @@ per-scope refresh granularity if the reload proves hot.
 
 ---
 
-### P-47 `perms: Split manage_org into its ADR-006 verbs.` — M — migration 0027 — **SPEC-READY (the compat backfill is the load-bearing line, not the split itself)**
+### P-47 `perms: Split manage_org into its ADR-006 verbs.` — M — migration 0026 — **SPEC-READY (amended 2026-09-01 after a pre-flight audit found 17 blocking errors in the FIRST draft; read the amendment note before implementing)**
 
-**What & why — and it is NOT "we owe ADR-006 26 more verbs".** The
-registry holds 14 verbs, 13 enforced (`docs/REALITY.md`'s corrected
-Permission-model row). The unregistered remainder is mostly CORRECT:
-`verbs.go` states the policy that verbs land with their features, so
-registering ahead would be config nothing enforces. The real debt is
-**coarseness**, and it is concentrated in one verb:
+> **AMENDMENT NOTE.** The first draft of this entry was audited against
+> the tree before dispatch and failed: 54 findings, 17 blocking. Two of
+> its load-bearing statements were false and one of its three red/green
+> pins **could not go red**. The corrections are folded in below; the
+> three that changed the DESIGN are called out inline so nobody
+> reinstates them. The original framing — "the compat backfill is the
+> load-bearing line" — was right about the backfill mattering and wrong
+> about why, and only becomes true once the `OR manage_org` fallback is
+> dropped (see "The fallback is GONE").
 
-> **`manage_org` alone guards 19 call sites, and they are not remotely
-> equal in privilege.** Adding a custom emoji and configuring an SSO
-> provider are the same verb today. So an org that wants someone to
-> curate emoji must also let them reconfigure authentication and
-> reassign every permission in the org.
+**What & why.** The registry holds 14 verbs, 13 enforced. The
+unregistered remainder is mostly CORRECT — `verbs.go` states that verbs
+land with their features, so registering ahead would be config nothing
+enforces. The debt is **coarseness**, concentrated in one verb:
 
-That is the argument for this slice: not granularity for its own sake,
-but that the coarse verb **forces over-granting of the highest-privilege
-capabilities in the product** to anyone who needs a trivial one.
+> **`manage_org` guards 18 gates that are nowhere near equal in
+> privilege.** Adding a custom emoji and configuring an SSO provider are
+> the same verb today, so an org that wants someone to curate emoji must
+> also let them reconfigure authentication and reassign every permission
+> in the org.
 
-**The 19 sites, verified, grouped by capability** (`git grep -n
-"perms.VerbManageOrg" -- internal/` and exclude tests):
+**The surface, counted correctly** (the first draft said "19 sites" and
+conflated grep hits with endpoints): 19 non-test `perms.VerbManageOrg`
+references = **18 gates + 1 alert-audience read**. The 18 gates fan out
+to **24 gated REST endpoints**, because `automation/automation.go:163`
+sits inside `requireScopeAdmin`, which is called from **seven** methods
+(`Create`, `Update`, `Delete`, `List`, `ListRuns`, `ListDeliveries`,
+`RotateWebhookToken`). The other 17 gates are 1:1 with a method.
+Endpoints: emoji 2 · channel-folders 4 · default-channels 2 ·
+storage-quota 2 · link-previews 2 · auth-providers 4 · admin/verbs 1 ·
+automations 7. **`POST /automations/{id}/consent` and
+`/automations/slash` are NOT gated** — do not add them to the matrix.
 
-| Capability | Sites | Notes |
+**The seven verbs, named here because they are permanent** (`verbs.go:3`
+— "wire/DB strings, append, never rename"; they are also the literals
+the migration INSERTs and the values `PUT /admin/verbs` accepts):
+
+| Verb | Replaces `manage_org` at | Seeded |
 |---|---|---|
-| custom emoji | `messaging/emoji.go:48,113` | ADR-006 names this `add_emoji` verbatim — lowest privilege here |
-| channel folders + default channels | `messaging/folders.go:70,100,138,166,216,258` | 6 sites; presentation/onboarding |
-| storage quota | `files/quota.go:74,98` | |
-| link-preview / unfurl policy | `unfurl/unfurl.go:102,119` | |
-| automation administration | `automation/automation.go:163` | |
-| **auth-provider (SSO) config** | `identity/oidc_admin.go:113,147,195,266` | **HIGH privilege** — controls who can log in at all |
-| **permission reassignment** | `identity/admin.go:26` | **THE meta-verb.** Its holder can grant themselves every other verb, so it must never be narrowable BELOW the tier that holds it |
-| (not a gate) | `automation/runner.go:508` | see the decision below |
+| `add_emoji` | `messaging/emoji.go` (2) — the one name ADR-006:54 gives us | `role:admins` |
+| `manage_channel_folders` | `messaging/folders.go` (6, folders + default channels) | `role:admins` |
+| `manage_storage_quota` | `files/quota.go` (2) | `role:admins` |
+| `manage_link_previews` | `unfurl/unfurl.go` (2) | `role:admins` |
+| `manage_automations` | `automation/automation.go:163` (`requireScopeAdmin`) | `role:admins` |
+| `manage_auth_providers` | `identity/oidc_admin.go` (4) — controls who can log in at all | `role:admins` |
+| `manage_permissions` | `identity/admin.go:26` — the meta-verb | `role:admins` |
 
-**Design (decided):**
-- **One new verb per capability row above**, named per ADR-006 where it
-  names one (`add_emoji`) and in its idiom otherwise. Registered in
-  `knownVerbs` so `PUT /admin/verbs` accepts them, and each seeded in
-  `defaultAssignments`.
-- **`manage_org` SURVIVES as the umbrella, and every gate checks
-  `specific_verb OR manage_org`.** Deleting it would break any org that
-  retargeted it and would destroy the "org admin can do everything"
-  intuition; keeping it additive means this slice cannot reduce anyone's
-  access. The narrowing this buys is the *other* direction — an admin
-  may now grant `add_emoji` to `role:members` WITHOUT granting SSO
-  config. Implement the OR once in a shared helper, not 19 times.
-- **THE LOAD-BEARING PART — migration 0027, the compat backfill.**
-  Seeding the new verbs to `role:admins` reproduces today's behaviour
-  ONLY for orgs still on the default, because `manage_org` defaults to
-  `role:admins`. An org that RETARGETED `manage_org` (via
-  `PUT /admin/verbs`, the one surface that writes
-  `permission_assignment`) would silently have its intent dropped. So
-  0027 must, per org, copy the existing `manage_org` assignment's
-  `group_id` onto a row for every new verb:
-  `INSERT INTO permission_assignment (org_id, verb, scope_type,
-  scope_id, group_id) SELECT org_id, <new verb>, scope_type, scope_id,
-  group_id FROM permission_assignment WHERE verb = 'manage_org'` — the
-  table is `(org_id, verb, scope_type, scope_id)` UNIQUE with `group_id`
-  (`0002_identity_permissions.sql:111-119`), so `ON CONFLICT DO NOTHING`
-  makes it idempotent. **An org with no explicit row keeps the seeded
-  default and needs no backfill** — verify that claim against
-  `SeedOrg` before writing the migration.
-- **`automation/runner.go:508` is NOT a gate — it is an ALERT
-  AUDIENCE.** It calls `HoldersAt(manage_org)` to decide who receives
-  automation delivery-health alerts. Splitting silently changes who gets
-  paged. **Decision: it keeps `manage_org`**, because "everyone who
-  administers the org" is exactly the intended audience and a narrower
-  verb would shrink it. Leave the call site alone and say so in a
-  comment, so the next reader does not "finish the job" by mistake.
-- **Close the `manage_billing` defect while here** (recorded in
-  REALITY): it is registered AND seeded to `role:owners` but checked
-  **nowhere** — config nothing enforces, which the honest-rungs rule
-  forbids. Either give it its enforcement site or unseed it. Pick one
-  and argue it; do not leave it as it is.
+ADR-006:54's competing umbrella `set_policies` was **considered and
+rejected**: it would absorb two rows and re-create exactly the
+coarseness this slice exists to remove.
 
-**Edge cases:** an org whose `manage_org` was retargeted to a group
-that is later deleted (the FK protects it — confirm); scope rows at
-non-org scope for `manage_org` (the backfill must copy `scope_type`/
-`scope_id` verbatim rather than assuming org scope); a verb name that
-collides with an existing registry entry; guests (unchanged — these are
-all org-admin surfaces they never reach).
+**`manage_permissions` is honestly dangerous and gets no fake guard.**
+Its holder can grant themselves every other verb. The first draft said
+it "must never be narrowable BELOW the tier that holds it" — that named
+no mechanism, and `AssignVerb` has no floor check. So: state plainly in
+REALITY that retargeting `manage_permissions` is equivalent to granting
+org administration, and do NOT invent a floor.
 
-**Tests (`TestVerbSplit`, real PG).** The load-bearing assertion is
-**upgrade-invisibility**: for an org on defaults AND an org with a
-retargeted `manage_org`, every one of the 19 surfaces must answer
-IDENTICALLY before and after — build the matrix and assert it, do not
-spot-check. Then the point of the slice: retarget `add_emoji` to
-`role:members` and prove a plain member may add an emoji while STILL
-being refused SSO config and verb reassignment. **RED/GREEN (pin
-both):** (1) drop the `OR manage_org` fallback → an org that retargeted
-`manage_org` loses access and the upgrade-invisibility matrix goes red;
-(2) drop 0027's backfill → the retargeted-org half of that matrix goes
-red while the default-org half stays green, which is exactly the
-silent-intent-drop this migration exists to prevent.
+**THE FALLBACK IS GONE — the design change the audit forced.** The first
+draft kept `manage_org` as an umbrella with every gate checking
+`specific_verb OR manage_org`. That was wrong twice over:
+- **It made the backfill behaviourally invisible.** With the OR, an
+  org's answer is `holders(new) ∪ holders(manage_org)`; delete the
+  backfill and the new verb simply denies, collapsing the set to
+  `holders(manage_org)` — the pre-split answer. So the draft's red/green
+  pin (2) **could not go red**, for any org, ever.
+- **It broke the slice's own purpose.** `Require` resolves per-verb, so
+  with `add_emoji` pinned at `role:admins`, an operator setting
+  `add_emoji → role:owners` to NARROW it changes nothing while
+  `manage_org` still passes — and `PUT /admin/verbs` cheerfully accepts
+  that write. A knob whose lane does not exist, which is the same
+  honest-rungs violation this entry invokes against `manage_billing`.
 
-**Scale review.** The OR adds at most one more indexed
-`permission_assignment` probe on admin surfaces only — never on a
-message path. `HoldersAt` is unchanged. No new per-message cost.
+**So each gate checks its OWN verb only.** Upgrade-invisibility comes
+from the backfill, which is now genuinely load-bearing and genuinely
+falsifiable; narrowing and widening both work; and every accepted write
+has an effect.
 
-**Gaps to record:** the remaining ADR-006 verbs still land with their
-features (unchanged policy); the `create_channel`
-public/private/web-public split, Jira's own/all comment and attachment
-pairs, `rank_items` for P-12 board ordering, and the DM verbs
-(`start_dm`/`be_dm_recipient`, hardcoded participation today) stay
-queued as their own slices; custom groups still have no API, so
-retargeting remains role-group-only (P-3 governance).
+**The backfill (migration 0026) — corrected.** The first draft said
+"an org with no explicit row keeps the seeded default and needs no
+backfill". **That is false.** `SeedOrg` (`perms/perms.go:237-243`)
+INSERTs an **explicit** org-scope `permission_assignment` row for every
+verb in `defaultAssignments`, including `manage_org`, and
+`identity.Bootstrap` is the only production `INSERT INTO org` and always
+calls it. **There is no row-less org.** `defaultAssignments` has exactly
+one reader — that seed loop — so seeding the new verbs helps FUTURE orgs
+only; for every existing org the migration is the ONLY source of their
+rows, and a missing row is DENY, not "the default".
+
+```sql
+INSERT INTO permission_assignment (org_id, verb, scope_type, scope_id, group_id)
+SELECT org_id, <new verb>, scope_type, scope_id, group_id
+  FROM permission_assignment WHERE verb = 'manage_org'
+ON CONFLICT DO NOTHING
+```
+Copy `scope_type`/`scope_id` **verbatim** rather than assuming org
+scope. Export the statement as a shared SQL const so the migration and
+its test cannot drift.
+
+**`manage_billing`: UNSEED, and it is three edits, not one.** It is
+registered, seeded to `role:owners`, and enforced in **zero** places —
+config nothing enforces. "Give it an enforcement site" means inventing a
+billing feature and violates the verbs-land-with-features policy. So:
+(a) drop it from `defaultAssignments` (future orgs); (b)
+`DELETE FROM permission_assignment WHERE verb = 'manage_billing'` in
+0026, or every existing org keeps the dead grant; (c) **keep it in
+`knownVerbs` and keep the `VerbManageBilling` constant** — removing it
+would make `PUT /admin/verbs` start 400ing a verb it accepted yesterday,
+a wire-contract change. Separate commit from the split.
+
+**The alert audience moves WITH its gate.** `HoldersAt(VerbManageOrg)`
+is at `automation/runner.go:546` inside `ruleAdmins`, which serves BOTH
+the P-25 run-failure alert and the delivery-health alert. Its contract
+is stated twice in code (`runner.go:509`, `:540-541`) and in REALITY as
+a **mirror of the write gate** — "whoever may edit the rule is who hears
+about it". The first draft said to leave it alone; that would falsify
+those comments the moment the write gate becomes `manage_automations`,
+because a holder could edit org rules and never hear that they broke.
+**So `ruleAdmins` switches to `manage_automations` too.** Because the
+backfill copies `manage_org`'s group onto it, today's audience is
+preserved exactly, the mirror stays true, and `HoldersAt` stays
+single-verb (no any-of variant needed).
+`TestAutomationFailureNotifies` (`automation_failure_test.go:215-219`)
+already pins the audience — it must stay green.
+
+**Tests — the structure is mandatory, because "identical before and
+after" has no referent inside one binary.** A matrix authored in the
+same commit as the change can only encode what the new code does, which
+is vacuous. So:
+- **Commit 1 is TEST-ONLY.** It lands the 24-endpoint matrix with
+  **hardcoded expected statuses** and must be green on dev **before**
+  the split. That run IS the "before".
+- **Commit 2** is the split + 0026. **The same unchanged table** must
+  stay green. Both commits build and pass alone, per the playbook.
+- **Every cell needs a VALID payload** — five gates validate input
+  BEFORE the gate (`CreateEmoji`, `CreateFolder`, `SetStorageQuota`,
+  `CreateAuthProvider`/`UpdateAuthProvider`, `AssignVerb`), so a
+  placeholder gives 400/400 and proves nothing. Emoji needs a prior
+  `uploadFile`; auth-providers need an `https://` issuer (only
+  `PATCH enabled:true` triggers the discovery probe). The matrix server
+  must wire Identity + Messaging + Files (real `blob` store) + Unfurl +
+  Automations — routes register unconditionally and handlers have no nil
+  guards.
+- **"Identical" = HTTP status + row/event-log state**, not full-response
+  equality (`Require`'s "missing permission: <verb>" string reaches the
+  body and no test pins it).
+- **The backfill cannot be observed through the normal harness.**
+  `resetAndMigrate` drops the schema and runs migrations against an
+  EMPTY database, so the backfill matches zero rows in every test, and
+  `db.Migrate` records applied files so it cannot re-run in-process. To
+  test it: bootstrap the org, `PUT /admin/verbs {manage_org: <group>}`,
+  `DELETE` the new verbs' rows to synthesise a pre-upgrade org, then
+  execute the shared backfill const and assert the resulting `group_id`
+  per verb. Direct-SQL assignment planting has precedent at
+  `threads_test.go:215-218`.
+- **RED/GREEN:** (1) retarget `manage_org` after bootstrap, drop the
+  backfill from the synthesised pre-upgrade org → that org's matrix goes
+  red while a default org's stays green. (2) Narrowing: point
+  `add_emoji` at `role:owners` and assert a plain admin is now REFUSED
+  emoji while still allowed SSO config — this is the pin the dropped
+  fallback makes possible, and it goes red if anyone reinstates the OR.
+
+**Scale review.** Each gate keeps exactly one indexed
+`permission_assignment` probe — the verb string changes, the shape does
+not — so F-16's single-probe guarantee and #116's version fence are
+untouched. `HoldersAt` stays single-verb. Admin surfaces only; no
+per-message cost.
+
+**Edge cases, both unreachable today — keep the defensive SQL, budget no
+fixtures.** No group-deletion path exists anywhere, so the
+`permission_assignment` FK is true but vacuous. No production writer can
+create a non-org-scope row (`SeedOrg` hardcodes `ScopeOrg`, `AssignVerb`
+hardcodes `OrgRef`, `ChannelRef` has no non-test caller).
+
+**Gaps to record:** guests are in `role:everyone` and **no** gate in
+this set checks `actor.IsGuest()`, so retargeting a new verb to
+`role:everyone` — the very move this slice enables — grants it to
+guests; say so rather than implying a structural block. There is no
+`GET /admin/verbs` and `knownVerbs` is private, so the seven names are
+undiscoverable over the API and the payoff depends on out-of-band
+knowledge. The remaining ADR-006 verbs still land with their features;
+the `create_channel` public/private/web-public split, Jira's own/all
+comment and attachment pairs, `rank_items`, and the DM verbs stay queued
+as their own slices; custom groups still have no API (P-3 governance).
 
 ---
 
