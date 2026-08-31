@@ -118,7 +118,8 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("PATCH /api/v1/channels/{id}", a.withAuth(a.handleUpdateChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/join", a.withAuth(a.handleJoinChannel))
 	mux.HandleFunc("POST /api/v1/channels/{id}/leave", a.withAuth(a.handleLeaveChannel))
-	// P-09 channel folders + default channels (manage_org, workspace-implicit).
+	// P-09 channel folders + default channels (manage_channel_folders,
+	// workspace-implicit).
 	mux.HandleFunc("POST /api/v1/channel-folders", a.withAuth(a.handleCreateFolder))
 	mux.HandleFunc("GET /api/v1/channel-folders", a.withAuth(a.handleListFolders))
 	mux.HandleFunc("PATCH /api/v1/channel-folders/{id}", a.withAuth(a.handleUpdateFolder))
@@ -246,13 +247,13 @@ func Handler(ctx context.Context, d Deps) http.Handler {
 	mux.HandleFunc("GET /api/v1/admin/exports", a.withAuth(a.handleListExports))
 	// P-31: compliance_officer-gated read over the raw event log.
 	mux.HandleFunc("GET /api/v1/audit/events", a.withAuth(a.handleAuditEvents))
-	// P-19: manage_org-gated org storage quota (get usage + set cap).
+	// P-19: manage_storage_quota-gated org storage quota (get usage + set cap).
 	mux.HandleFunc("GET /api/v1/admin/storage-quota", a.withAuth(a.handleGetStorageQuota))
 	mux.HandleFunc("PUT /api/v1/admin/storage-quota", a.withAuth(a.handleSetStorageQuota))
-	// P-15: org link-preview toggle (manage_org in the domain).
+	// P-15: org link-preview toggle (manage_link_previews in the domain).
 	mux.HandleFunc("GET /api/v1/admin/link-previews", a.withAuth(a.handleGetLinkPreviews))
 	mux.HandleFunc("PUT /api/v1/admin/link-previews", a.withAuth(a.handleSetLinkPreviews))
-	// P-30: OIDC auth-provider CRUD (manage_org in the domain). client_secret
+	// P-30: OIDC auth-provider CRUD (manage_auth_providers in the domain). client_secret
 	// is write-only; enabling requires a live discovery probe.
 	mux.HandleFunc("POST /api/v1/admin/auth-providers", a.withAuth(a.handleCreateAuthProvider))
 	mux.HandleFunc("GET /api/v1/admin/auth-providers", a.withAuth(a.handleListAuthProviders))

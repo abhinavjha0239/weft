@@ -59,7 +59,7 @@ func validateFolderName(name string) (string, error) {
 }
 
 // CreateFolder appends a folder to the resolved workspace (position = append
-// order). manage_org-gated.
+// order). manage_channel_folders-gated.
 func (s *Service) CreateFolder(ctx context.Context, actor auth.Identity, name string) (Folder, error) {
 	name, err := validateFolderName(name)
 	if err != nil {
@@ -67,7 +67,7 @@ func (s *Service) CreateFolder(ctx context.Context, actor auth.Identity, name st
 	}
 	out := Folder{Name: name}
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageChannelFolders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -97,7 +97,7 @@ func (s *Service) CreateFolder(ctx context.Context, actor auth.Identity, name st
 func (s *Service) ListFolders(ctx context.Context, actor auth.Identity) ([]Folder, error) {
 	var out []Folder
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageChannelFolders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -128,14 +128,15 @@ func (s *Service) ListFolders(ctx context.Context, actor auth.Identity) ([]Folde
 	return out, nil
 }
 
-// UpdateFolder renames a folder in the resolved workspace. manage_org-gated.
+// UpdateFolder renames a folder in the resolved workspace.
+// manage_channel_folders-gated.
 func (s *Service) UpdateFolder(ctx context.Context, actor auth.Identity, folderID int64, name string) error {
 	name, err := validateFolderName(name)
 	if err != nil {
 		return err
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageChannelFolders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -160,10 +161,10 @@ func (s *Service) UpdateFolder(ctx context.Context, actor auth.Identity, folderI
 
 // DeleteFolder hard-deletes a folder and clears folder_id on its member
 // channels in the same transaction (the schema FK forbids orphan references,
-// and folders carry no lifecycle beyond existence). manage_org-gated.
+// and folders carry no lifecycle beyond existence). manage_channel_folders-gated.
 func (s *Service) DeleteFolder(ctx context.Context, actor auth.Identity, folderID int64) error {
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageChannelFolders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -206,14 +207,15 @@ func appendFolderEvent(ctx context.Context, tx pgx.Tx, actor auth.Identity, wsID
 // always-bundle, bundle IS NULL). Each channel must be a PUBLIC, live channel
 // in that workspace — a private, archived, or foreign channel is rejected. A
 // new MEMBER auto-joins this set on invite accept (identity.AcceptInvite).
-// manage_org-gated.
+// manage_channel_folders-gated (the folder verb covers the whole sidebar
+// surface: both are workspace channel-organisation config).
 func (s *Service) SetDefaultChannels(ctx context.Context, actor auth.Identity, channelIDs []int64) error {
 	distinct := dedupInt64(channelIDs)
 	if len(distinct) > maxDefaultChannels {
 		return apperr.Invalid("too many default channels (max 20)")
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageChannelFolders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -251,11 +253,11 @@ func (s *Service) SetDefaultChannels(ctx context.Context, actor auth.Identity, c
 }
 
 // DefaultChannelIDs lists the resolved workspace's always-bundle default
-// channels. manage_org-gated (an admin-config surface).
+// channels. manage_channel_folders-gated (an admin-config surface).
 func (s *Service) DefaultChannelIDs(ctx context.Context, actor auth.Identity) ([]int64, error) {
 	var out []int64
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageChannelFolders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}

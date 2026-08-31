@@ -8,7 +8,8 @@ import (
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 )
 
-// P-09 channel folders + default channels: workspace-admin (manage_org)
+// P-09 channel folders + default channels: workspace-admin
+// (manage_channel_folders)
 // surfaces. The workspace is resolved server-side (the org's bootstrap
 // workspace), so these endpoints are workspace-implicit.
 

@@ -11,7 +11,7 @@ import (
 // emojiMaxBytes caps a custom-emoji image (P-06); tiny by design.
 const emojiMaxBytes = 256 << 10 // 256 KiB
 
-// handleCreateEmoji: POST /emoji?name=<name> + multipart "file" — manage_org
+// handleCreateEmoji: POST /emoji?name=<name> + multipart "file" — add_emoji
 // gated. The name is validated up front so a bad one never spools an upload;
 // the image is magic-byte + size gated, stored, then registered.
 func (a *api) handleCreateEmoji(w http.ResponseWriter, r *http.Request, id auth.Identity) {
@@ -48,7 +48,7 @@ func (a *api) handleListEmoji(w http.ResponseWriter, r *http.Request, id auth.Id
 	writeJSON(w, http.StatusOK, map[string]any{"emoji": list})
 }
 
-// handleDeleteEmoji: DELETE /emoji/{name} — soft delete (manage_org).
+// handleDeleteEmoji: DELETE /emoji/{name} — soft delete (add_emoji).
 func (a *api) handleDeleteEmoji(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	if err := a.Messaging.DeleteEmoji(r.Context(), id, r.PathValue("name")); err != nil {
 		writeDomainError(w, a.Log, r, err)

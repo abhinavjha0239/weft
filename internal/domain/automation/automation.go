@@ -47,7 +47,7 @@ func New(pool *pgxpool.Pool, p *perms.Service) *Service {
 func (s *Service) SetMessaging(m *messaging.Service) { s.msg = m }
 
 // Automation scope types (automation.scope_type). Like retention scopes,
-// only the rungs with real gates exist: org (manage_org) and channel
+// only the rungs with real gates exist: org (manage_automations) and channel
 // (administer_channel). Workspace/space rungs arrive with their admin verbs.
 const (
 	ScopeOrg     int16 = 1
@@ -153,14 +153,16 @@ type CreateParams struct {
 }
 
 // requireScopeAdmin gates by the automation's OWNING scope: org rules need
-// manage_org, channel rules administer_channel (resolved up the chain).
+// manage_automations, channel rules administer_channel (resolved up the
+// chain). One gate, seven endpoints (Create, Update, Delete, List, ListRuns,
+// ListDeliveries, RotateWebhookToken).
 func (s *Service) requireScopeAdmin(ctx context.Context, tx pgx.Tx, actor auth.Identity, scopeType int16, scopeID int64) error {
 	switch scopeType {
 	case ScopeOrg:
 		if scopeID != actor.OrgID {
 			return apperr.Invalid("org-scope automation must target your org")
 		}
-		return s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		return s.perms.Require(ctx, tx, actor, perms.VerbManageAutomations,
 			perms.OrgScope(actor.OrgID))
 	case ScopeChannel:
 		chain, err := s.perms.ChannelScope(ctx, tx, actor.OrgID, scopeID)

@@ -21,7 +21,8 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
 )
 
-// Auth-provider CRUD (P-30) — the manage_org admin surface. client_secret is
+// Auth-provider CRUD (P-30) — the manage_auth_providers admin surface
+// (P-47: its own verb because it controls who may log in at all). client_secret is
 // WRITE-ONLY: it is accepted on create/rotate and never read back (List/GET
 // return only has_secret, the invite-token show-once spirit), and it never
 // appears in an event payload or a log line. Providers are created DISABLED;
@@ -89,7 +90,7 @@ func (s *Service) probeDiscovery(ctx context.Context, issuer string) error {
 	return err
 }
 
-// CreateAuthProvider registers a DISABLED provider (manage_org). The name is a
+// CreateAuthProvider registers a DISABLED provider (manage_auth_providers). The name is a
 // per-org slug, the issuer must be https + shape-valid, and a client_secret is
 // required (confidential client; public/PKCE-only clients are a recorded gap).
 func (s *Service) CreateAuthProvider(ctx context.Context, actor auth.Identity, p CreateProviderParams) (AuthProvider, error) {
@@ -110,7 +111,7 @@ func (s *Service) CreateAuthProvider(ctx context.Context, actor auth.Identity, p
 	}
 	out := AuthProvider{Name: p.Name, Issuer: p.Issuer, ClientID: p.ClientID, HasSecret: true}
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageAuthProviders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -139,12 +140,13 @@ func (s *Service) CreateAuthProvider(ctx context.Context, actor auth.Identity, p
 	return out, nil
 }
 
-// ListAuthProviders returns the org's providers (manage_org) — never a secret,
+// ListAuthProviders returns the org's providers (manage_auth_providers) —
+// never a secret,
 // only has_secret.
 func (s *Service) ListAuthProviders(ctx context.Context, actor auth.Identity) ([]AuthProvider, error) {
 	out := []AuthProvider{}
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageAuthProviders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -168,7 +170,7 @@ func (s *Service) ListAuthProviders(ctx context.Context, actor auth.Identity) ([
 	return out, err
 }
 
-// UpdateAuthProvider mutates a provider (manage_org): rotate the secret, change
+// UpdateAuthProvider mutates a provider (manage_auth_providers): rotate the secret, change
 // issuer/client_id, and enable/disable. Enabling — or changing the issuer of an
 // enabled provider — runs the discovery probe and 422s on failure. The probe
 // dials inside the tx; enabling a provider is a rare admin action, not a hot
@@ -192,7 +194,7 @@ func (s *Service) UpdateAuthProvider(ctx context.Context, actor auth.Identity, p
 	}
 	var out AuthProvider
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageAuthProviders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
@@ -258,12 +260,12 @@ func (s *Service) UpdateAuthProvider(ctx context.Context, actor auth.Identity, p
 	return out, nil
 }
 
-// DeleteAuthProvider removes a provider (manage_org). Its throwaway in-flight
+// DeleteAuthProvider removes a provider (manage_auth_providers). Its throwaway in-flight
 // oidc_flow rows are cleared first; a provider that still has durable
 // external_identity links refuses (Conflict) rather than orphan those logins.
 func (s *Service) DeleteAuthProvider(ctx context.Context, actor auth.Identity, providerID int64) error {
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageAuthProviders,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}

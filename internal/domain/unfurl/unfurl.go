@@ -92,14 +92,14 @@ type LinkPreviewSetting struct {
 	Enabled bool `json:"enabled"`
 }
 
-// LinkPreviewsSetting returns the org toggle. manage_org-gated (the
-// storage-quota admin precedent).
+// LinkPreviewsSetting returns the org toggle. manage_link_previews-gated
+// (the storage-quota admin precedent).
 func (s *Service) LinkPreviewsSetting(ctx context.Context, actor auth.Identity) (LinkPreviewSetting, error) {
 	if s.perms == nil {
 		return LinkPreviewSetting{}, apperr.Internal("link previews", errors.New("perms not wired"))
 	}
 	if err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		return s.perms.Require(ctx, tx, actor, perms.VerbManageOrg, perms.OrgScope(actor.OrgID))
+		return s.perms.Require(ctx, tx, actor, perms.VerbManageLinkPreviews, perms.OrgScope(actor.OrgID))
 	}); err != nil {
 		return LinkPreviewSetting{}, err
 	}
@@ -116,7 +116,7 @@ func (s *Service) SetLinkPreviews(ctx context.Context, actor auth.Identity, enab
 		return apperr.Internal("link previews", errors.New("perms not wired"))
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg, perms.OrgScope(actor.OrgID)); err != nil {
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageLinkPreviews, perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}
 		if _, err := tx.Exec(ctx, `

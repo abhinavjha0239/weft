@@ -178,7 +178,8 @@ func TestMostSpecificWins(t *testing.T) {
 }
 
 // TestHoldersAt: the read-side mirror of Require. The org default for
-// manage_org (role:admins) expands through the closure to admins ∪ owners,
+// manage_org (role:admins — still seeded, though P-47 left it enforcing
+// nothing) expands through the closure to admins ∪ owners,
 // excluding agent principals (kind 2) and deactivated accounts; a channel
 // override of the verb wins over the org default (fewer holders here proves
 // it); and a verb with no assignment resolves to no holders (deny-default).

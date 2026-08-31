@@ -23,7 +23,7 @@ func (s *Service) AssignVerb(ctx context.Context, actor auth.Identity, verb, gro
 		return apperr.Invalid("unknown verb")
 	}
 	return db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		if err := s.perms.Require(ctx, tx, actor, perms.VerbManageOrg,
+		if err := s.perms.Require(ctx, tx, actor, perms.VerbManagePermissions,
 			perms.OrgScope(actor.OrgID)); err != nil {
 			return err
 		}

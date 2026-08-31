@@ -393,7 +393,7 @@ func TestOIDCLogin(t *testing.T) {
 	}
 
 	// 11. Cross-org admin reach: mallory owns org "rival", so she HAS
-	//     manage_org — in HER org. Acme's provider is a 404 to her PATCH and
+	//     manage_auth_providers — in HER org. Acme's provider is a 404 to her PATCH and
 	//     DELETE (the org-pinned load), and stays enabled.
 	var rival struct {
 		OrgID  int64  `json:"org_id"`
@@ -465,7 +465,7 @@ func TestOIDCLogin(t *testing.T) {
 	oidcProviderCRUD(t, ctx, pool, ts, boot.OrgID, boot.ChannelID, boot.Token)
 }
 
-// oidcProviderCRUD exercises the manage_org admin surface: write-only secret,
+// oidcProviderCRUD exercises the manage_auth_providers admin surface: write-only secret,
 // the https/shape validation, the enable discovery-probe 422, and non-admin
 // rejection. These ride withAuth (per-user apiLimit), not the pre-auth bucket.
 func oidcProviderCRUD(t *testing.T, ctx context.Context, pool *pgxpool.Pool, ts *httptest.Server, orgID, channelID int64, ownerTok string) {
