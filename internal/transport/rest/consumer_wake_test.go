@@ -6,11 +6,13 @@ import (
 	"log/slog"
 	"net/http/httptest"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/abhinavjha0239/weft/internal/db"
 	"github.com/abhinavjha0239/weft/internal/domain/automation"
 	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
@@ -67,11 +69,7 @@ func TestConsumerPushWakeOnLogicalFeed(t *testing.T) {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Second)
-	pool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		cancel()
-		t.Fatalf("connect: %v", err)
-	}
+	pool := runnerPool(t, ctx, dbURL)
 	defer func() { cancel(); pool.Close() }()
 	requireLogicalWAL(t, ctx, pool)
 	resetAndMigrate(t, ctx, pool)
@@ -85,8 +83,11 @@ func TestConsumerPushWakeOnLogicalFeed(t *testing.T) {
 	msgSvc := messaging.New(pool, permsSvc)
 	msgSvc.SetDeliverability(notification.NewDeliverability(pool, log))
 	notifSvc := notification.New(pool)
+	// The hub is wired as the materialiser's Fanout but deliberately NOT Run:
+	// this test opens no socket, the gateway's own behaviour on this driver is
+	// pinned by TestGatewayOnLogicalFeed, and hub.Run would hold a fourth
+	// pooled connection in a LISTEN loop for the whole test (see runnerPool).
 	hub := gateway.NewHub(pool, log)
-	go hub.Run(ctx)
 
 	// All THREE durable runners on the SAME driver. Each mints its own named
 	// consumer and registers its own wake callback, so this also pins that the
@@ -185,14 +186,46 @@ func TestConsumerPushWakeOnLogicalFeed(t *testing.T) {
 	// A dedicated LISTENer, so the "the NOTIFY lane was not what delivered
 	// this" claim is an OBSERVATION rather than an assumption about the wake
 	// function's memo.
+	//
+	// It DRAINS continuously on its own goroutine rather than sitting idle and
+	// being read once at the end. Two reasons, both real: a LISTENing backend
+	// that never consumes is what pins the server's async notify queue (the
+	// queue can only be trimmed past its slowest listener), which is a hazard to
+	// every other test sharing the cluster; and recording the whole window is a
+	// STRONGER assertion than a single poll, because it cannot miss a
+	// notification that arrived and was then overtaken.
 	probe, err := pool.Acquire(ctx)
 	if err != nil {
 		t.Fatalf("acquire notify probe: %v", err)
 	}
-	defer probe.Release()
 	if _, err := probe.Exec(ctx, "LISTEN "+eventlog.NotifyChannel); err != nil {
+		probe.Release()
 		t.Fatalf("listen: %v", err)
 	}
+	probeCtx, probeCancel := context.WithCancel(ctx)
+	var probeMu sync.Mutex
+	var heard []string
+	probeDone := make(chan struct{})
+	go func() {
+		defer close(probeDone)
+		for {
+			n, err := probe.Conn().WaitForNotification(probeCtx)
+			if err != nil {
+				return // the window closed (or the conn died); nothing more to record
+			}
+			probeMu.Lock()
+			heard = append(heard, n.Channel+"/"+n.Payload)
+			probeMu.Unlock()
+		}
+	}()
+	// Ordered before the pool's own deferred Close: pgxpool.Close blocks until
+	// every acquired connection is released, so a t.Fatal below must not be able
+	// to strand this one and turn a failure into a hang.
+	defer func() {
+		probeCancel()
+		<-probeDone
+		probe.Release()
+	}()
 
 	const bound = 1500 * time.Millisecond
 	for round := 1; round <= 2; round++ {
@@ -211,14 +244,16 @@ func TestConsumerPushWakeOnLogicalFeed(t *testing.T) {
 	// Two rounds, because a wake that fires once and then goes silent (a stale
 	// token left in the coalescing queue) would pass a single round.
 
-	// The suppression really held: nothing was notified for either probe
-	// commit. NOTIFY is transactional and delivered at COMMIT, so anything that
-	// was going to arrive has arrived by now.
-	quietCtx, quietCancel := context.WithTimeout(ctx, 200*time.Millisecond)
-	defer quietCancel()
-	if n, err := probe.Conn().WaitForNotification(quietCtx); err == nil {
-		t.Fatalf("the probe appends notified %q/%q after all: the isolated measurement above "+
-			"could have been the LISTEN lane, not the push wake", n.Channel, n.Payload)
+	// The suppression really held: NOTHING was notified across the whole probe
+	// window. NOTIFY is transactional and delivered at COMMIT, so a settle pass
+	// is enough to catch a straggler that the drain has not yet recorded.
+	time.Sleep(250 * time.Millisecond)
+	probeMu.Lock()
+	got := append([]string(nil), heard...)
+	probeMu.Unlock()
+	if len(got) > 0 {
+		t.Fatalf("the probe appends notified %v after all: the isolated measurement above "+
+			"could have been the LISTEN lane, not the push wake", got)
 	}
 }
 
@@ -302,11 +337,7 @@ func TestConsumerWakeLossConvergesOnSweep(t *testing.T) {
 		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
-	pool, err := pgxpool.New(ctx, dbURL)
-	if err != nil {
-		cancel()
-		t.Fatalf("connect: %v", err)
-	}
+	pool := runnerPool(t, ctx, dbURL)
 	defer func() { cancel(); pool.Close() }()
 	requireLogicalWAL(t, ctx, pool)
 	resetAndMigrate(t, ctx, pool)
@@ -428,6 +459,44 @@ func cursorAt(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 		t.Fatalf("cursor for %s: %v", consumer, err)
 	}
 	return at
+}
+
+// runnerPool builds the harness pool through db.Connect — the PRODUCTION
+// constructor — instead of pgxpool.New, and then asserts the budget it needs.
+//
+// This is not incidental tidiness; it is the fix for a real failure. A test
+// that starts N event-log runners holds ONE pooled connection per runner for
+// the entire life of its LISTEN loop (notification/automation/unfurl
+// listenLoop, and gateway.Hub.listenLoop, all `pool.Acquire` then park in
+// WaitForNotification). pgxpool defaults MaxConns to max(4, NumCPU), which is
+// 4 on a CI runner and 8+ on a developer laptop — so a composition holding
+// four of them passes locally and STARVES on CI, where it presents not as an
+// error but as an API call that blocks for minutes and then succeeds once the
+// test's own context expires and the listen loops release. (Observed: a
+// message POST with ms=148733, and `pg_stat_activity` showing exactly four
+// backends, all idle on `LISTEN event_log`, with pg_notification_queue_usage()
+// at 0 — the request never reached Postgres at all.)
+//
+// db.Connect floors MaxConns at 25 for precisely this reason, so a test that
+// composes what `weftd serve` composes must build its pool the same way rather
+// than on a budget production refuses to run under. The explicit check below
+// keeps the requirement stated and self-diagnosing instead of latent.
+func runnerPool(t *testing.T, ctx context.Context, dbURL string) *pgxpool.Pool {
+	t.Helper()
+	pool, err := db.Connect(ctx, dbURL)
+	if err != nil {
+		t.Fatalf("connect: %v", err)
+	}
+	// Three runner LISTEN loops + the NOTIFY probe + whatever request is in
+	// flight, with headroom for each runner's sweep and poll queries.
+	const need = 8
+	if got := pool.Config().MaxConns; got < need {
+		pool.Close()
+		t.Fatalf("harness pool has MaxConns=%d, need at least %d: this composition parks "+
+			"one connection per runner in a LISTEN loop, so a smaller pool starves the "+
+			"request path instead of failing (that is what broke CI)", got, need)
+	}
+	return pool
 }
 
 // startLogicalFeed provisions this cell's slot + publication, starts the WAL
