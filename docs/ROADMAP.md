@@ -2170,7 +2170,10 @@ unusable as a conversation (1% daily participation = ~1000 msg/day
 scrolling past) and no incumbent supports it — the real 100k channels
 are announcement channels, which is exactly why Zulip ships
 `stream_post_policy` (`zerver/models/streams.py:92-95`). The membership
-axis is therefore carried by **P-44 announcement mode**, whose REDUCED
+axis is therefore carried by **P-44 announcement mode** — which as of
+2026-09-01 FAILED its pre-flight audit and is NOT dispatchable, so this
+re-scope currently names an intent rather than a shipped answer; the
+reduced-contract idea stands, its subtraction MECHANISM did not — whose REDUCED
 feature contract makes unread derivable by arithmetic at O(1) per
 message, and conversational channels stay bounded with that bound made
 honest there. S1/S2/S3/S5 are unaffected — they are org-axis and
@@ -2183,7 +2186,7 @@ connection-axis work, required regardless of any channel's size.
 | Connections | O(connections) `event_log` queries per message (`gateway.go:256-263`) | **S3** |
 | Membership | O(members) live join per message (`runner.go:195-207`) | **S1** |
 | Membership | O(members) unread aggregate per read (`readstate.go:131-143`) | **S6** |
-| Membership | O(members) unread counter WRITE per message (`unreadcounter.go`, S6's disclosed residue — irreducible while the full conversational contract holds) | **P-44** |
+| Membership | O(members) unread counter WRITE per message (`unreadcounter.go`, S6's disclosed residue — irreducible while the full conversational contract holds) | **P-44 — [!] STILL OPEN**, its pre-flight audit failed (see the entry); the axis has no shipped answer yet |
 | Membership | O(members) synchronous closure rebuild per group edit (`perms.go:235-257`), 2× per invite | **S2** |
 | Throughput | DB-global xmin stall (`consumer.go:60`); NOTIFY per append | **S4** |
 | Connections | O(connections) presence fans under one mutex; multi-node fragmentation (`presence.go`) | **S5** |
@@ -2902,7 +2905,88 @@ directive 8).
 
 ---
 
-### P-44 `channels: Announcement mode — O(1) unread at unbounded membership.` — L — migration 0026 — **SPEC-READY (carries the cluster's membership axis; the constant-write pin is the load-bearing line)**
+### P-44 `channels: Announcement mode — O(1) unread at unbounded membership.` — was L — migration 0026 — **[!] NOT SPEC-READY — DO NOT DISPATCH. Failed its pre-flight audit (2026-09-01); the spec below is retained for its intent but its MECHANISM is wrong. See the audit block immediately following.**
+
+> **PRE-FLIGHT AUDIT — 70 findings, 25 blocking. Verdict: not implementable as written.**
+>
+> This entry was written before eight merges (#118, #128, #131–#135) that
+> moved exactly the machinery it assumes. A five-lens audit against dev
+> @ `dbdf5b4`, with every finding re-verified by a synthesis pass that
+> also DISCARDED four whose evidence did not hold up, found that **six of
+> the design bullets describe mechanisms that do not exist** and three are
+> internally contradictory. Dispatching it would have burned a multi-hour
+> executor run and shipped a broken feature. Highlights, each with
+> file:line evidence in the audit record:
+>
+> 1. **The new verb would be dead in every existing org.**
+>    `defaultAssignments` has exactly ONE reader — the seed loop in
+>    `SeedOrg` (`perms/perms.go:237-244`) — and no migration has ever
+>    written `permission_assignment`. `Require` denies with no
+>    owner/admin bypass, so `post_announcement` resolves to nothing
+>    anywhere it was not seeded at bootstrap.
+> 2. **ADR-006 already decided this differently** (`ADR-006:45`:
+>    "announcement channels = this verb restricted", i.e. `send_message`
+>    at CHANNEL scope). And `AssignVerb` hardcodes org scope
+>    (`identity/admin.go:38`), so a new verb would be ONE org-wide poster
+>    group for every announcement channel. The Zulip citation is also
+>    wrong: the live mechanism is `can_send_message_group`, a per-stream
+>    FK; `stream_post_policy` is its legacy projection.
+> 3. **Nothing would ever create a kind=4 counter row** — the bulk UPSERT
+>    the spec removes is the only thing that creates them
+>    (`unreadcounter.go:122-137`), so every announcement channel would
+>    read 0 unread forever.
+> 4. **The O(1) read does not exist**: `Unreads` never joins `channel`,
+>    so it cannot see `kind`, and its `unread_count > 0` filter drops
+>    every kind=4 row (`readstate.go:159-164`).
+> 5. **There is no "send path" and no "same tx"** — the maintainer runs
+>    on the at-least-once consumer pass with bare `pool.Exec`, and the
+>    proposed shared total has no `last_event_id` guard, so one replayed
+>    batch double-counts for every member at once.
+> 6. **The subtraction model does not fit the existing semantics.** This
+>    is the deep one, and it is why the fix is not mechanical: a shared
+>    total minus a per-reader position breaks four behaviours that a
+>    per-reader absolute gets for free — a multi-poster channel wipes a
+>    poster's badge (#6), deleting an already-read message leaves
+>    `read_total > total`, a hidden credit that **permanently swallows a
+>    future unread** and cannot self-heal (#8), `MarkRead` is a PARTIAL
+>    mark on a client-supplied position that does not map onto a total
+>    (#10), and every mention clamp is expressed against `unread_count`,
+>    which would be permanently 0 (#12).
+> 7. **The reconcile arm as specced is self-referential** —
+>    `GREATEST(0, total − read_total)` recomputes from the two numbers it
+>    is meant to verify, so it can never disagree. Worse, getting it
+>    wrong breaks #128 **for the whole org**: kind=4 rows falling through
+>    to the aggregate path make `recomputed != stored` forever, so the
+>    org never settles and idle-org skipping is permanently defeated.
+> 8. **Unhandled delete lanes**: the retention vacuum and GC purge never
+>    call `messaging.DeleteMessage`, and the vacuum's thread fix-up is
+>    `AND kind = 1` — i.e. it skips the channel-root thread, the only
+>    thread a kind=4 channel has.
+> 9. **The conversion surface does not exist at all** — nothing sets
+>    `channel.kind`; `CreateChannel`'s INSERT omits it and
+>    `UpdateChannelParams` rejects anything outside its four fields.
+> 10. **The load-bearing pin has no instrument**: #117's tracer measures
+>     rows SCANNED BY READS and deliberately skips non-SELECTs, so it
+>     cannot count rows WRITTEN, and a statement count is vacuously green
+>     (today's O(members) UPSERT is one statement for N rows).
+>
+> **Consequences for the queue.** P-44 is XL, not L: it needs a
+> conversion surface, a verb-assignment backfill migration, a rewritten
+> read query, replay guards, delete-lane handling across compliance, a
+> mention-clamp redesign, and a new test instrument. Two decisions are
+> NOT the executor's and not the reviewer's alone: (a) new verb vs
+> restricting `send_message` at channel scope, which is an ADR-006
+> amendment either way; (b) whether `PostToChannelAsAutomation` — which
+> posts with no permission gate by AU-2 — inherits the restriction. The
+> write-rate premise the whole design rests on ("send-restricted ⇒ a hot
+> counter row is safe") is also **enforced nowhere**: one `AssignVerb`
+> call can point the verb at `role:everyone` org-wide.
+>
+> **Recommended next step: re-spec, not patch.** The intent stands and
+> the membership axis still needs an answer; the subtraction mechanism
+> is what failed. A per-reader design that keeps `unread_count`'s
+> semantics while removing the per-message fan-out is worth exploring
+> before re-writing this entry bullet by bullet.
 
 **What & why.** After S6 (#117) and its follow-up (#118), the ONE
 remaining per-message cost that scales with membership is
