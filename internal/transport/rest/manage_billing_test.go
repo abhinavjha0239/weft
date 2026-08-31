@@ -71,7 +71,7 @@ func TestManageBillingUnseeded(t *testing.T) {
 	if n := countVerb(perms.VerbManageBilling); n != 0 {
 		t.Errorf("bootstrapped org has %d manage_billing rows, want 0 (unseeded)", n)
 	}
-	for _, verb := range []string{perms.VerbSendMessage, perms.VerbManageOrg, perms.VerbAddEmoji} {
+	for _, verb := range []string{perms.VerbSendMessage, perms.VerbAdministerChannel, perms.VerbAddEmoji} {
 		if n := countVerb(verb); n != 1 {
 			t.Errorf("bootstrapped org has %d %s rows, want 1 (the seed loop still runs)", n, verb)
 		}
@@ -95,7 +95,7 @@ func TestManageBillingUnseeded(t *testing.T) {
 		t.Errorf("after the migration's DELETE, manage_billing rows = %d, want 0", n)
 	}
 	// Blast radius: the DELETE is verb-scoped and touched nothing else.
-	for _, verb := range []string{perms.VerbSendMessage, perms.VerbManageOrg, perms.VerbAddEmoji} {
+	for _, verb := range []string{perms.VerbSendMessage, perms.VerbAdministerChannel, perms.VerbAddEmoji} {
 		if n := countVerb(verb); n != 1 {
 			t.Errorf("after the unseed, %s rows = %d, want 1 (the DELETE is verb-scoped)", verb, n)
 		}

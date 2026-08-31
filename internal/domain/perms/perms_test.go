@@ -239,11 +239,14 @@ func TestHoldersAt(t *testing.T) {
 	orgChain := func(tx pgx.Tx) ([]scopeRef, error) { return OrgScope(f.orgID), nil }
 	chanChain := func(tx pgx.Tx) ([]scopeRef, error) { return f.svc.ChannelScope(ctx, tx, f.orgID, f.channelID) }
 
-	// Org default: manage_org → admins ∪ owners, live humans only, sorted.
-	got := holders(t, VerbManageOrg, orgChain)
+	// Org default: an admins-seeded verb → admins ∪ owners, live humans only,
+	// sorted. Uses manage_auth_providers rather than manage_org, which P-47
+	// left unseeded (zero enforcement sites) — that would make this assert
+	// pass on an empty set.
+	got := holders(t, VerbManageAuthProviders, orgChain)
 	want := []int64{f.owner.UserID, humanAdmin}
 	if !equalInt64s(got, want) {
-		t.Fatalf("manage_org holders = %v, want %v (owner+admin, agent/deactivated excluded)", got, want)
+		t.Fatalf("manage_auth_providers holders = %v, want %v (owner+admin, agent/deactivated excluded)", got, want)
 	}
 
 	// Channel override beats the org default: point administer_channel at

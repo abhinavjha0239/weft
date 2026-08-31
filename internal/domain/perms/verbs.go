@@ -104,7 +104,15 @@ var defaultAssignments = map[string]string{
 	VerbInviteMembers:     GroupMembers,
 	VerbAdministerChannel: GroupAdmins,
 	VerbModerateMessages:  GroupModerators,
-	VerbManageOrg:         GroupAdmins,
+	// manage_org is NOT seeded either, for the SAME reason and by the same
+	// rule — this slice moved all 18 of its gates onto the seven verbs below,
+	// so it now has ZERO enforcement sites and seeding it would mint exactly
+	// the grant-with-no-lane this slice exists to remove. Its EXISTING rows
+	// are deliberately kept: migration 0026 reads them to backfill the seven,
+	// and they are the record of what each org had configured. Same residual
+	// as manage_billing, accepted the same way: the constant and the
+	// knownVerbs entry stay, so PUT /admin/verbs keeps accepting a string it
+	// has taken since P-2 rather than starting to 400 it.
 	// manage_billing is NOT seeded (P-47): it is checked in ZERO places, so
 	// seeding it minted a grant with no lane — the honest-rungs violation.
 	// Giving it a lane means inventing a billing feature, which the
