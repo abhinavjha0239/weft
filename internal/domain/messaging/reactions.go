@@ -3,6 +3,7 @@ package messaging
 import (
 	"context"
 	"strings"
+	"time"
 	"unicode"
 
 	"github.com/jackc/pgx/v5"
@@ -49,10 +50,13 @@ func validEmoji(emoji string) bool {
 // exactly message visibility (the same three-way container rule as Get):
 // channel membership, DM participation, or an org-visible space thread.
 // Container ids come back for the event payload (the gateway routes by
-// them). Invisible and nonexistent are indistinguishable (no id oracle).
-func (s *Service) loadReactable(ctx context.Context, tx pgx.Tx, actor auth.Identity, msgID int64) (threadID int64, channelID, dmSpaceID *int64, err error) {
+// them), and so does the message's createdAt: the gateway's protected-history
+// floor judges the MESSAGE an event is about, not the event's own stamp
+// (eventlog.MessageCreatedAtKey). Invisible and nonexistent are
+// indistinguishable (no id oracle).
+func (s *Service) loadReactable(ctx context.Context, tx pgx.Tx, actor auth.Identity, msgID int64) (threadID int64, channelID, dmSpaceID *int64, createdAt time.Time, err error) {
 	err = tx.QueryRow(ctx, `
-		SELECT m.thread_id, m.channel_id, m.dm_space_id
+		SELECT m.thread_id, m.channel_id, m.dm_space_id, m.created_at
 		FROM message m
 		WHERE m.id = $1 AND m.org_id = $3 AND m.deleted_at IS NULL
 		  AND ((m.channel_id IS NOT NULL AND EXISTS (
@@ -63,11 +67,12 @@ func (s *Service) loadReactable(ctx context.Context, tx pgx.Tx, actor auth.Ident
 		         SELECT 1 FROM dm_participant dp
 		         WHERE dp.dm_space_id = m.dm_space_id AND dp.user_id = $2))
 		    OR (m.channel_id IS NULL AND m.dm_space_id IS NULL))`,
-		msgID, actor.UserID, actor.OrgID).Scan(&threadID, &channelID, &dmSpaceID)
+		msgID, actor.UserID, actor.OrgID).
+		Scan(&threadID, &channelID, &dmSpaceID, &createdAt)
 	if err != nil {
-		return 0, nil, nil, apperr.NotFound("message not found")
+		return 0, nil, nil, time.Time{}, apperr.NotFound("message not found")
 	}
-	return threadID, channelID, dmSpaceID, nil
+	return threadID, channelID, dmSpaceID, createdAt, nil
 }
 
 // AddReaction is an idempotent ensure-present: the first add records the
@@ -90,7 +95,7 @@ func (s *Service) toggleReaction(ctx context.Context, actor auth.Identity, msgID
 	}
 	out := ReactionState{MessageID: msgID, Emoji: emoji, Me: want}
 	err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		threadID, channelID, dmSpaceID, err := s.loadReactable(ctx, tx, actor, msgID)
+		threadID, channelID, dmSpaceID, createdAt, err := s.loadReactable(ctx, tx, actor, msgID)
 		if err != nil {
 			return err
 		}
@@ -116,7 +121,11 @@ func (s *Service) toggleReaction(ctx context.Context, actor auth.Identity, msgID
 			}
 			payload := map[string]any{
 				"message_id": msgID, "thread_id": threadID,
-				"emoji": emoji, "user_id": actor.UserID}
+				"emoji": emoji, "user_id": actor.UserID,
+				// The reaction is new; the MESSAGE it is on may predate a
+				// member's protected-history floor
+				// (eventlog.MessageCreatedAtKey).
+				eventlog.MessageCreatedAtKey: createdAt}
 			if channelID != nil {
 				payload["channel_id"] = *channelID
 			}

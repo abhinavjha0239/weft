@@ -2,6 +2,7 @@ package messaging
 
 import (
 	"context"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -32,6 +33,11 @@ type editedMessage struct {
 	threadID  int64
 	channelID *int64
 	dmSpaceID *int64
+	// createdAt is the message's own created_at, carried on every event this
+	// file and move.go append so the gateway's protected-history floor judges
+	// the MESSAGE rather than the event about it
+	// (eventlog.MessageCreatedAtKey).
+	createdAt time.Time
 }
 
 // loadForWrite locks the message row (serializing revisions) and applies the
@@ -42,11 +48,12 @@ func (s *Service) loadForWrite(ctx context.Context, tx pgx.Tx, actor auth.Identi
 	var ast []byte
 	var authorID int64
 	err := tx.QueryRow(ctx, `
-		SELECT thread_id, channel_id, dm_space_id, author_id, source, ast
+		SELECT thread_id, channel_id, dm_space_id, created_at, author_id, source, ast
 		FROM message
 		WHERE id = $1 AND org_id = $2 AND deleted_at IS NULL
 		FOR UPDATE`, msgID, actor.OrgID).
-		Scan(&m.threadID, &m.channelID, &m.dmSpaceID, &authorID, &source, &ast)
+		Scan(&m.threadID, &m.channelID, &m.dmSpaceID, &m.createdAt,
+			&authorID, &source, &ast)
 	if err != nil {
 		return m, "", nil, 0, apperr.NotFound("message not found")
 	}
@@ -127,7 +134,10 @@ func (s *Service) EditMessage(ctx context.Context, actor auth.Identity, msgID in
 			}
 		}
 		payload := map[string]any{
-			"message_id": msgID, "thread_id": m.threadID, "new_mentions": newMentions}
+			"message_id": msgID, "thread_id": m.threadID, "new_mentions": newMentions,
+			// The gateway's protected-history floor judges the MESSAGE, not
+			// this event's own stamp (see eventlog.MessageCreatedAtKey).
+			eventlog.MessageCreatedAtKey: m.createdAt}
 		if m.channelID != nil {
 			payload["channel_id"] = *m.channelID
 		}
@@ -210,7 +220,8 @@ func (s *Service) DeleteMessage(ctx context.Context, actor auth.Identity, msgID 
 		if err := s.decrementUnreadOnDelete(ctx, tx, cid, did, m.threadID, msgID, authorID); err != nil {
 			return err
 		}
-		payload := map[string]any{"message_id": msgID, "thread_id": m.threadID}
+		payload := map[string]any{"message_id": msgID, "thread_id": m.threadID,
+			eventlog.MessageCreatedAtKey: m.createdAt}
 		if m.channelID != nil {
 			payload["channel_id"] = *m.channelID
 		}

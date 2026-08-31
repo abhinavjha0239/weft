@@ -124,6 +124,9 @@ func (s *Service) MoveMessage(ctx context.Context, actor auth.Identity, msgID, t
 				"from_thread_id": m.threadID,
 				"to_thread_id":   targetThreadID,
 				"channel_id":     *m.channelID,
+				// A move never rewrites created_at, so this stays the value
+				// REST's floor compares (eventlog.MessageCreatedAtKey).
+				eventlog.MessageCreatedAtKey: m.createdAt,
 			}),
 		}); err != nil {
 			return apperr.Internal("append event", err)
