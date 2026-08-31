@@ -69,6 +69,14 @@ func (c *Consumer) SetMetrics(reg metrics.Registry) {
 	c.lag = reg.Gauge("consumer_lag", "consumer", "org")
 }
 
+// OnWake is a no-op, and that is the whole reason the DEFAULT driver's
+// behaviour is unchanged by the push wake: a polled row is readable the moment
+// its transaction commits, which is exactly when Append's NOTIFY fires, so
+// this driver's callers are already woken at the right instant and there is
+// nothing for a second wake to add. (The logical driver is where the two
+// instants differ — see Feed.OnWake.)
+func (c *Consumer) OnWake(func(int64)) {}
+
 // Poll returns the next batch after the cursor, respecting the txid gate.
 // An empty result means either nothing new or older transactions still in
 // flight — callers just poll again (or wait for NOTIFY).

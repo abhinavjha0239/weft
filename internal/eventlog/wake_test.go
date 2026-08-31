@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"strconv"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -217,4 +218,136 @@ func TestAppendWakeDelivers(t *testing.T) {
 	if want := strconv.FormatInt(orgID, 10); n.Payload != want {
 		t.Fatalf("wake payload %q, want the org id %q", n.Payload, want)
 	}
+}
+
+// TestWakeQueueCoalesces pins the property that keeps a driver push wake from
+// becoming a busy loop (the #98 scheduler lesson): a storm of signals for one
+// org, delivered while that org's pass is ALREADY RUNNING, must collapse into
+// exactly ONE further pass — not one per signal.
+//
+// The construction is deterministic, not timing-based: the first pass BLOCKS on
+// a channel, every signal is delivered while it is blocked, and only then is it
+// released. So the pass count is fixed by the queue's semantics, not by the
+// scheduler.
+//
+// RED (observed): make `pending` a slice appended to per Signal instead of a
+// SET keyed by org, and the count becomes one pass per signal.
+func TestWakeQueueCoalesces(t *testing.T) {
+	const org, other, storm = int64(7), int64(9), 200
+	q := NewWakeQueue()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	started := make(chan struct{})
+	release := make(chan struct{})
+	var mu sync.Mutex
+	passes := map[int64]int{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		q.Run(ctx, func(_ context.Context, id int64) {
+			mu.Lock()
+			passes[id]++
+			first := passes[org] == 1 && id == org
+			mu.Unlock()
+			if first {
+				close(started)
+				<-release // hold the pump inside the org's first pass
+			}
+		})
+	}()
+
+	q.Signal(org)
+	select {
+	case <-started:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wake queue never ran a pass for the signalled org")
+	}
+	// Every one of these lands while the org's pass is in flight.
+	for i := 0; i < storm; i++ {
+		q.Signal(org)
+	}
+	q.Signal(other) // a second org must not be swallowed by the first's storm
+	close(release)
+
+	// Wait for the queue to go quiet: both orgs seen, then a settle window in
+	// which a busy loop would keep piling passes on.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		mu.Lock()
+		seenOther := passes[other]
+		mu.Unlock()
+		if seenOther > 0 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("org %d was never drained: a storm of signals for org %d starved it", other, org)
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	time.Sleep(200 * time.Millisecond)
+
+	mu.Lock()
+	gotOrg, gotOther := passes[org], passes[other]
+	mu.Unlock()
+	// 2, exactly: the pass that was in flight, plus the ONE coalesced follow-up
+	// the storm collapsed into. A third would mean a stale token survived the
+	// drain; more would mean no coalescing at all.
+	if gotOrg != 2 {
+		t.Fatalf("%d signals for org %d during one in-flight pass produced %d passes, want 2 "+
+			"(the in-flight one plus one coalesced follow-up)", storm+1, org, gotOrg)
+	}
+	if gotOther != 1 {
+		t.Fatalf("org %d got %d passes, want exactly 1", other, gotOther)
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the wake queue's pump did not stop when its context ended")
+	}
+}
+
+// TestWakeQueueLosesSignalsWithoutAPump pins the OTHER half of the wake
+// contract: a signal is a HINT with no durability at all. Signals delivered
+// while nothing is draining must not block the driver, must not accumulate per
+// EVENT (only per org — an unbounded queue on the reader's goroutine would be a
+// memory leak fed by write traffic), and must be forgotten rather than replayed.
+// That is precisely why losing every wake can only cost latency: the durable
+// cursor and the fallback sweep are what carry correctness.
+func TestWakeQueueLosesSignalsWithoutAPump(t *testing.T) {
+	q := NewWakeQueue()
+	for i := 0; i < 5000; i++ {
+		q.Signal(int64(i%3) + 1) // never blocks, with no pump anywhere
+	}
+	q.mu.Lock()
+	held := len(q.pending)
+	q.mu.Unlock()
+	if held != 3 {
+		t.Fatalf("5000 signals across 3 orgs left %d pending entries, want 3: the queue must "+
+			"hold ORG IDS, not signals", held)
+	}
+
+	// A pump whose context is already dead RETURNS instead of draining the
+	// backlog or spinning on it. (It may take at most one pass first: Run's
+	// select is free to pick the ready signal over the ready ctx.Done, and the
+	// post-pass ctx check is what stops it there.)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ran := 0
+	stopped := make(chan struct{})
+	go func() {
+		defer close(stopped)
+		q.Run(ctx, func(context.Context, int64) { ran++ })
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("a pump with a dead context did not return: it is draining or spinning")
+	}
+	if ran > 1 {
+		t.Fatalf("a pump with a dead context ran %d passes, want at most 1", ran)
+	}
+	// And a signal after that is still just a map write — no panic, no block.
+	q.Signal(42)
 }

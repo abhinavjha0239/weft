@@ -20,7 +20,8 @@ import (
 //     the consumer must process them, and never returns an event whose
 //     transaction has not committed.
 //   - An empty batch means "nothing to do right now", never "you are done
-//     forever" — callers poll again (or wait for the NOTIFY wake).
+//     forever" — callers poll again (or wait for a wake: the LISTEN one on
+//     every driver, plus OnWake on a driver that pushes).
 //   - Ack durably advances the cursor. Delivery is AT-LEAST-ONCE: a crash
 //     between processing and Ack replays, so consumers must be idempotent
 //     (dedupe keys / ON CONFLICT claims — the outbox rule already requires it).
@@ -35,6 +36,33 @@ type Feed interface {
 	Poll(ctx context.Context, orgID int64) ([]Row, error)
 	Ack(ctx context.Context, orgID, lastID int64) error
 	Lag(ctx context.Context, orgID int64) (int64, error)
+
+	// OnWake registers a callback the DRIVER invokes, with an org id, when that
+	// org's newly committed events have become READABLE through Poll. It is the
+	// mirror of Tail.OnWake for the durable half of the seam, and it exists for
+	// the same reason: under a streaming driver LISTEN/NOTIFY is not a
+	// DEPENDABLE wake, and its failure is quiet rather than loud. Append's
+	// notification fires at COMMIT; the events only become readable once the WAL
+	// reader DECODES that commit a moment later. A NOTIFY-woken Poll is
+	// therefore RACING the decoder, and every time it loses it reads nothing and
+	// the consumer waits out its fallback sweep — a feed whose whole point is
+	// lower latency delivers on a sweep interval instead, with no error anywhere
+	// to say so. (How often it loses is not a property callers may reason about:
+	// it depends on notification-delivery latency versus WAL round trip. The
+	// gateway's cursor-free read, which polls with no query in front of it,
+	// loses essentially always — Tail.OnWake. This one, which reads its cursor
+	// first, often wins on a fast local box and cannot be relied on to.)
+	//
+	// A wake is a HINT, never a delivery: the consumer still Polls and still
+	// Acks, so a wake that is never registered, never fires, or is dropped
+	// costs LATENCY and nothing else — the sweep is the backstop, and no
+	// consumer may come to depend on the wake for correctness. Callbacks run on
+	// the driver's own goroutine and MUST NOT BLOCK; drive a WakeQueue with it.
+	//
+	// The xmin driver registers nothing: its rows are readable exactly when the
+	// notification fires, which is what its callers already use.
+	OnWake(fn func(orgID int64))
+
 	SetMetrics(reg metrics.Registry)
 }
 

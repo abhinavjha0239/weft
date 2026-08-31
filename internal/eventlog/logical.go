@@ -719,6 +719,13 @@ type logicalConsumer struct {
 	lag    metrics.Gauge
 }
 
+// OnWake rides the WAL reader, exactly as logicalTail.OnWake does: the
+// callback fires when a commit has been DECODED, which is the first instant
+// Poll can read its events back. Every registered consumer gets its own
+// subscription (AddWake accumulates), so wiring a second, third or fourth
+// consumer cannot silently displace the first.
+func (c *logicalConsumer) OnWake(fn func(orgID int64)) { c.src.AddWake(fn) }
+
 func (c *logicalConsumer) SetMetrics(reg metrics.Registry) {
 	c.events = reg.Counter("fanout_events_total", "consumer")
 	c.lag = reg.Gauge("consumer_lag", "consumer", "org")
