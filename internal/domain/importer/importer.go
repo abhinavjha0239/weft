@@ -783,11 +783,19 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		}
 		messageMap[m.ID] = msgID
 		msgThread[m.ID] = thID
+		// F-15: only kind=1 threads carry denormalized counters. The gate is
+		// a no-op for the Zulip lane, which only ever reaches topic threads —
+		// it is here so that merging the channel and DM lanes (or adding a
+		// source whose "channel" messages land on a root) cannot quietly
+		// corrupt a container. root_message_id is the dangerous one:
+		// messaging/move.go rejects a move for ANY message some thread names
+		// as its root and does not filter by kind, so a root_message_id set
+		// on a kind=2 root makes that message permanently unmovable.
 		if _, err := tx.Exec(ctx, `
 			UPDATE thread SET message_count = message_count + 1,
 			       last_activity_at = GREATEST(last_activity_at, $2),
 			       root_message_id = COALESCE(root_message_id, $3)
-			WHERE id = $1`, thID, ts(m.DateSent), msgID); err != nil {
+			WHERE id = $1 AND kind = 1`, thID, ts(m.DateSent), msgID); err != nil {
 			return err
 		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
