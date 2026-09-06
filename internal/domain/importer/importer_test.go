@@ -11,6 +11,7 @@ import (
 	"reflect"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -190,10 +191,14 @@ func TestZulipImportShowcase(t *testing.T) {
 	pool, orgID := testPool(t)
 	ctx := context.Background()
 	dir := writeFixture(t)
-	store, err := blob.Open("fs", t.TempDir())
+	fsStore, err := blob.Open("fs", t.TempDir())
 	if err != nil {
 		t.Fatalf("blob: %v", err)
 	}
+	// The dry run must leave the BLOB seam alone too. A Put is a real side
+	// effect on the operator's storage that no SQL count can see, and the
+	// attachment lane opens and hashes every file before it writes a row.
+	store := &countingStore{Store: fsStore}
 	svc := New(pool, store)
 
 	// Dry run first: full accounting, zero writes.
@@ -235,6 +240,35 @@ func TestZulipImportShowcase(t *testing.T) {
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM message WHERE origin_system = 'zulip'`).Scan(&n)
 	if n != 0 {
 		t.Fatalf("dry run wrote %d messages", n)
+	}
+	// "Writes nothing" means every table the write path touches, not just
+	// the one. A single-table check leaves users, channels, threads, groups,
+	// files, DM spaces, watermarks and the event log free to be written by a
+	// dry run — and the message table is the LAST thing the write path
+	// reaches, so a half-executed write would slip past it entirely.
+	for _, tbl := range []struct{ name, q string }{
+		{"user_account", `SELECT count(*) FROM user_account WHERE org_id = $1 AND origin_system IS NOT NULL`},
+		{"channel", `SELECT count(*) FROM channel WHERE org_id = $1 AND origin_system IS NOT NULL`},
+		{"thread", `SELECT count(*) FROM thread WHERE org_id = $1 AND origin_system IS NOT NULL`},
+		{"user_group", `SELECT count(*) FROM user_group WHERE org_id = $1 AND origin_system IS NOT NULL`},
+		{"file", `SELECT count(*) FROM file WHERE org_id = $1 AND origin_system IS NOT NULL`},
+		// dm_space carries no provenance columns, so the fixture's own
+		// emptiness is the pin: a bootstrapped org has no conversations.
+		{"dm_space", `SELECT count(*) FROM dm_space WHERE org_id = $1`},
+		{"thread_read_watermark", `SELECT count(*) FROM thread_read_watermark w
+			JOIN thread t ON t.id = w.thread_id WHERE t.org_id = $1`},
+		{"event_log(importer)", `SELECT count(*) FROM event_log WHERE org_id = $1 AND actor_kind = 4`},
+	} {
+		var got int
+		if err := pool.QueryRow(ctx, tbl.q, orgID).Scan(&got); err != nil {
+			t.Fatalf("dry-run %s census: %v", tbl.name, err)
+		}
+		if got != 0 {
+			t.Fatalf("dry run wrote %d %s row(s)", got, tbl.name)
+		}
+	}
+	if puts := store.puts.Load(); puts != 0 {
+		t.Fatalf("dry run put %d blob(s) into the store", puts)
 	}
 
 	// Real import.
@@ -410,6 +444,59 @@ func TestZulipImportShowcase(t *testing.T) {
 		orgID).Scan(&kind, &role, &deact)
 	if kind != 3 || role != 20 {
 		t.Fatalf("imported Iago kind=%d role=%d, want kind 3, role 20 (admin)", kind, role)
+	}
+	// An ACTIVE source user must not arrive pre-deactivated. The column comes
+	// from one `CASE WHEN is_active` and the whole fixture is active, so the
+	// polarity is invertible with nothing red here; the other half of the pin
+	// (a deactivated source user arriving deactivated) lives in
+	// TestImportCountsUnmappableChannelMessagesAndReactions, which owns the
+	// only inactive fixture user in the suite.
+	if deact != nil {
+		t.Fatalf("active source user imported deactivated (deactivated_at = %v)", *deact)
+	}
+
+	// Channel visibility carries over: Zulip's invite_only is Weft's
+	// visibility 2, everything else is 1. Never asserted before, and the
+	// import is the one path that can leak a PRIVATE stream into a public
+	// channel — the whole read ACL hangs off this column.
+	var visGeneral, visCore int16
+	if err := pool.QueryRow(ctx, `
+		SELECT
+		  (SELECT visibility FROM channel WHERE org_id = $1
+		    AND origin_system = 'zulip' AND origin_id = '21'),
+		  (SELECT visibility FROM channel WHERE org_id = $1
+		    AND origin_system = 'zulip' AND origin_id = '22')`,
+		orgID).Scan(&visGeneral, &visCore); err != nil {
+		t.Fatalf("channel visibility: %v", err)
+	}
+	if visGeneral != 1 || visCore != 2 {
+		t.Fatalf("visibility: general=%d core-team=%d, want 1 (public) and 2 (private)",
+			visGeneral, visCore)
+	}
+
+	// F-15: a kind=2 ROOT thread is a container, not a conversation — it
+	// carries no denormalized counters, and above all no root_message_id,
+	// because messaging/move.go rejects a move for ANY message some thread
+	// names as its root (it does not filter by kind), so a root_message_id on
+	// a root thread makes that message permanently unmovable. Six roots here:
+	// the bootstrap channel, the two imported channels, and the three DM
+	// spaces. The importer's counter bump is the only writer in the tree that
+	// touches all three columns at once.
+	var roots, bumpedRoots int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*),
+		       count(*) FILTER (WHERE message_count <> 0
+		                     OR last_activity_at IS NOT NULL
+		                     OR root_message_id IS NOT NULL)
+		FROM thread WHERE org_id = $1 AND kind = 2`, orgID).Scan(&roots, &bumpedRoots); err != nil {
+		t.Fatalf("root thread fence: %v", err)
+	}
+	if roots != 6 {
+		t.Fatalf("kind=2 root threads = %d, want 6 (bootstrap + 2 imported channels + 3 DM spaces)", roots)
+	}
+	if bumpedRoots != 0 {
+		t.Fatalf("%d root thread(s) carry F-15 counters (message_count / last_activity_at / root_message_id)",
+			bumpedRoots)
 	}
 
 	// Groups: same accounting as the dry run, plus real rows.
@@ -705,6 +792,60 @@ func TestZulipImportShowcase(t *testing.T) {
 		t.Fatalf("revision wrong: prev=%q by=%d at=%v msg=%v", prevSrc, editedBy, editedAt, msgEditedAt)
 	}
 
+	// The REPORT IS THE OPERATOR'S ARTIFACT: `weftd import-zulip` prints
+	// exactly this, MarshalIndent'd, and nothing else. Every bucket name and
+	// every JSON key is therefore a published contract, and until now not one
+	// of them was pinned — the struct tags, the `imported` sub-map built by
+	// finalize(), the omitempty on the rename maps and the field order could
+	// all change with the suite green. Every number below is derived from the
+	// assertions above, not read off a run: 3 users (4 source, 1 bot) · 2
+	// channels · 3 topics · 4 channel + 3 DM messages · 2 reactions · 3 of 10
+	// subscription rows (active, stream-recipient, mapped both ends) · 1
+	// custom group with 2 human members and 1 surviving edge · 5 watermarks ·
+	// 3 conversations · 1 attachment · 1 attributed edit; losses: 1 bot, 1
+	// bot-tainted DM, 1 null-editor edit, 1 coarsened unread; 3 system groups
+	// mapped; the #general collision renamed; nothing pre-existing.
+	const wantJSON = `{
+  "dry_run": false,
+  "imported": {
+    "attachments": 1,
+    "channels": 2,
+    "dm_conversations": 3,
+    "dm_messages": 3,
+    "group_edges": 1,
+    "group_members": 2,
+    "groups": 1,
+    "message_edits": 1,
+    "messages": 4,
+    "reactions": 2,
+    "read_watermarks": 5,
+    "subscriptions": 3,
+    "threads": 3,
+    "users": 3
+  },
+  "bots_skipped": 1,
+  "dm_messages_skipped_unmappable_participants": 1,
+  "stream_messages_skipped_unmapped": 0,
+  "edit_entries_skipped_unattributable": 1,
+  "attachment_files_missing": 0,
+  "reactions_unmapped": 0,
+  "role_grants_skipped_existing_users": 0,
+  "matched_existing_by_email": 0,
+  "unread_below_watermark_coarsened": 1,
+  "already_imported": 0,
+  "renamed_channels": {
+    "general": "general-zulip1"
+  },
+  "system_groups_mapped": 3
+}`
+	gotJSON, err := json.MarshalIndent(rep, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal report: %v", err)
+	}
+	if string(gotJSON) != wantJSON {
+		t.Fatalf("import report JSON drifted.\n--- got ---\n%s\n--- want ---\n%s", gotJSON, wantJSON)
+	}
+
 	// Idempotency (D5): a re-run imports nothing new and duplicates nothing.
 	rep2, err := svc.Run(ctx, orgID, dir, false)
 	if err != nil {
@@ -732,6 +873,62 @@ func TestZulipImportShowcase(t *testing.T) {
 	if msgs != 7 {
 		t.Fatalf("after re-run message count = %d, want 7 (4 stream + 3 dm, no duplicates)", msgs)
 	}
+	// The event census AFTER the re-run, which is where the importer's
+	// idempotency actually lives: all seven eventlog.Append calls sit inside
+	// insert-succeeded branches, and the census above only ever ran on a
+	// virgin org, so hoisting ANY of them onto the conflict/resolve path
+	// would double the whole importer event surface on every re-import with
+	// nothing red. Rows do not duplicate (the check above); events must not
+	// either, and they are the durable spine every consumer replays.
+	if got := importerEventCensus(t, ctx, pool, orgID); !reflect.DeepEqual(got, wantEvents) {
+		t.Fatalf("importer events after re-run = %v, want %v (unchanged)", got, wantEvents)
+	}
+	// A re-run MATCHES its three users by email instead of creating them, and
+	// Iago's admin grant is the one role an import refuses to re-apply to an
+	// account that already exists. Both buckets exist precisely so that a
+	// merge is never invisible, and both were only ever observed as zero.
+	if rep2.MatchedExistingByEmail != 3 || rep2.RoleGrantsSkipped != 1 {
+		t.Fatalf("re-run matched=%d role-grants-skipped=%d, want 3/1 (the three humans "+
+			"re-matched by email; only Iago's role is above plain member)",
+			rep2.MatchedExistingByEmail, rep2.RoleGrantsSkipped)
+	}
+}
+
+// countingStore counts Puts on the way through to a real store, so "the dry
+// run writes nothing" can cover the blob seam and not just SQL.
+type countingStore struct {
+	blob.Store
+	puts atomic.Int64
+}
+
+func (c *countingStore) Put(ctx context.Context, key string, r io.Reader) error {
+	c.puts.Add(1)
+	return c.Store.Put(ctx, key, r)
+}
+
+// importerEventCensus is the verb→count map over the importer's actor kind.
+func importerEventCensus(t *testing.T, ctx context.Context, pool *pgxpool.Pool, orgID int64) map[string]int {
+	t.Helper()
+	rows, err := pool.Query(ctx, `
+		SELECT verb, count(*) FROM event_log
+		WHERE org_id = $1 AND actor_kind = 4 GROUP BY verb`, orgID)
+	if err != nil {
+		t.Fatalf("event census: %v", err)
+	}
+	defer rows.Close()
+	out := map[string]int{}
+	for rows.Next() {
+		var verb string
+		var n int
+		if err := rows.Scan(&verb, &n); err != nil {
+			t.Fatalf("scan event census: %v", err)
+		}
+		out[verb] = n
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("event census: %v", err)
+	}
+	return out
 }
 
 func containsMention(ast []byte, userID int64) bool {
