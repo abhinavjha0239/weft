@@ -102,22 +102,6 @@ func (r *Report) finalize() {
 	}
 }
 
-// weftRole maps Zulip UserProfile.role constants to Weft role presets.
-func weftRole(zulipRole int) int16 {
-	switch zulipRole {
-	case 100:
-		return 10 // realm owner → owner
-	case 200:
-		return 20 // realm administrator → admin
-	case 300:
-		return 30 // moderator
-	case 600:
-		return 50 // guest
-	default:
-		return 40 // member (400 and anything unknown)
-	}
-}
-
 // roleGroup names the seeded Weft group a role preset belongs to.
 func roleGroup(role int16) string {
 	switch role {
@@ -131,26 +115,6 @@ func roleGroup(role int16) string {
 		return "" // guests hold no role group in the seeded set
 	default:
 		return "role:members"
-	}
-}
-
-// zulipSystemGroup maps Zulip's system group names onto the seeded Weft
-// ones. role:fullmembers coarsens to role:members (Weft has no waiting
-// period); role:nobody and role:internet have no Weft counterpart.
-func zulipSystemGroup(name string) string {
-	switch name {
-	case "role:owners":
-		return "role:owners"
-	case "role:administrators":
-		return "role:admins"
-	case "role:moderators":
-		return "role:moderators"
-	case "role:members", "role:fullmembers":
-		return "role:members"
-	case "role:everyone":
-		return "role:everyone"
-	default:
-		return ""
 	}
 }
 
