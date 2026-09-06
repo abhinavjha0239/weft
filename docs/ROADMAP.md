@@ -3765,7 +3765,11 @@ and `finalize` are pure Weft and stay. Guarded by C1's table tests.
 four helpers stop taking `*Export`. **Source ids become `string`, never
 `any`** — `any` turns the three `%d`-on-source-id sites (`:247`, `:297`,
 `:718`) into silent `%!d(string=C123)` corruption that `go vet` does NOT
-catch, where `string` makes it a compile error. Twelve of thirteen
+catch, where `string` makes it a **`go vet` error** — corrected during
+execution: `fmt.Printf("%d", someString)` COMPILES; the printf analyzer is
+what flags it, and vet is a CI gate. The conclusion is unchanged (vet
+catches a concretely-typed string and cannot catch `any`); only the
+mechanism named here was wrong. Twelve of thirteen
 `origin_id` expressions collapse to pass-through; the thirteenth
 (`topic:%d:%s`, `:721`) must stay **byte-identical** or a post-upgrade
 re-import silently duplicates instead of counting `AlreadyImported`.
@@ -3788,11 +3792,24 @@ parsed and never read — drop it. **No migration: `origin_id` is already
    P-27b.
 3. **The loader owns the markup dialect** and emits already-normalized
    Weft markdown. One owner, per the LLD rule.
-4. **The loader owns upload-link rewriting too** (same seam as 3) and the
-   IR message carries an explicit `HasAttachment` rather than having the
-   write path infer it from a rewrite's boolean return.
+4. **The loader owns upload-link rewriting too** (same seam as 3).
+   ~~and the IR message carries an explicit `HasAttachment`~~ —
+   **WITHDRAWN during execution, and the reason generalises.** That flag's
+   value depends on which attachments actually LANDED: a body linking
+   bytes that are missing from the export gets `false` today, and a loader
+   cannot know that. Putting it on the IR flips exactly that case to
+   `true`, invisibly to CI. The boolean stays on the rewrite hook's return
+   where it is derivable. Anything whose value depends on write-time
+   outcomes cannot move to the IR.
 5. **Attachment bytes are an opaque per-attachment opener**, plus a cheap
    existence/size probe so the dry run does not have to open every blob.
+   **The opener must return `io.ReadSeekCloser`, not `io.ReadCloser`**
+   (established during execution): storage keys are content-addressed, so
+   the lane hashes the stream and must then REWIND and hand the same
+   stream to `blob.Put`. A plain `ReadCloser` forces either two opens
+   (double read I/O — an unobserved behaviour change) or buffering the
+   whole file. **This constrains P-27b:** it pushes the still-undecided
+   pre-fetch layout toward materialize-first.
    Record the pre-existing `Stat`/`Open` asymmetry (a directory at the
    path passes `Stat` and then aborts the whole import on `io.Copy`)
    as a gap; do not fix it here.
