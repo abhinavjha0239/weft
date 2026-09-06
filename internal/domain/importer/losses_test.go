@@ -82,9 +82,9 @@ func TestImportCountsUnmappableChannelMessagesAndReactions(t *testing.T) {
 		t.Fatalf("users = %d, bots skipped = %d, want 2/1 (%+v)", rep.Users, rep.BotsSkipped, rep)
 	}
 	// The bot's channel message is a COUNTED loss, not a silent one.
-	if rep.Messages != 1 || rep.StreamMessagesSkipped != 1 {
+	if rep.Messages != 1 || rep.ChannelMessagesSkipped != 1 {
 		t.Fatalf("messages = %d, channel messages skipped = %d, want 1/1 (%+v)",
-			rep.Messages, rep.StreamMessagesSkipped, rep)
+			rep.Messages, rep.ChannelMessagesSkipped, rep)
 	}
 	// Both reactions are unmappable: 201's message was dropped, 202's author
 	// is the bot. Neither may land, and both must be counted.

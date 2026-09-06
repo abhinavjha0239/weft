@@ -25,8 +25,6 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/blob"
 )
 
-const originZulip = "zulip"
-
 type Service struct {
 	pool  *pgxpool.Pool
 	store blob.Store
@@ -41,7 +39,11 @@ func New(pool *pgxpool.Pool, store blob.Store) *Service {
 // Report is the fidelity contract (ADR-001: "nobody trusts a migrator that
 // hides its losses"). Every source entity lands in exactly one bucket.
 type Report struct {
-	DryRun bool `json:"dry_run"`
+	// Source names the loader that produced these numbers. A deployment with
+	// two adapters cannot otherwise tell which one a stored report came from,
+	// and every bucket below means something slightly different per source.
+	Source string `json:"source"`
+	DryRun bool   `json:"dry_run"`
 
 	// Imported (lossless or transformed).
 	Users, Channels, Threads, Messages, Reactions, Subscriptions int            `json:"-"`
@@ -54,8 +56,10 @@ type Report struct {
 	// A DM conversation imports only when EVERY participant maps to a human
 	// account: dropping a bot participant would shrink the canonical key
 	// and wrongly merge the history into a different conversation.
-	DMMessagesSkipped     int `json:"dm_messages_skipped_unmappable_participants"`
-	StreamMessagesSkipped int `json:"stream_messages_skipped_unmapped"`
+	DMMessagesSkipped int `json:"dm_messages_skipped_unmappable_participants"`
+	// A channel message whose channel or whose author did not map. "Stream"
+	// was Zulip's word for it and does not belong in a source-neutral report.
+	ChannelMessagesSkipped int `json:"channel_messages_skipped_unmapped"`
 	// Edit-history entries without a mappable editor (bots, or the null
 	// user_id of pre-2017 Zulip history) are skipped — attribution is
 	// never invented. Topic/stream-move entries carry no prev_content and
@@ -131,11 +135,19 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 	if err != nil {
 		return Report{}, err
 	}
-	rep := Report{DryRun: dryRun,
+	rep := Report{Source: ex.Source, DryRun: dryRun,
 		RenamedChannels: map[string]string{}, RenamedGroups: map[string]string{}}
 
 	// Dry-run: pure accounting pass (no DB — collision renames and
 	// existing-user role skips are only knowable at write time).
+	//
+	// This branch is deliberately STILL Zulip-shaped, and is the last thing
+	// in the module that is. Moving it onto the IR cannot be behaviour
+	// preserving — Subscriptions alone reads 10 here against the write
+	// path's 3, because this counts what the export CONTAINS and the write
+	// path counts what LANDS — so reconciling the two is its own slice
+	// (P-27c), where changing an operator-visible number is the point rather
+	// than a side effect of a refactor.
 	if dryRun {
 		bots := map[int64]bool{}
 		for _, u := range ex.Users {
@@ -298,8 +310,9 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 		return rep, nil
 	}
 
+	ir := ex.toImport()
 	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
-		return s.write(ctx, tx, orgID, ex, &rep)
+		return s.write(ctx, tx, orgID, ir, &rep)
 	})
 	if err != nil {
 		return Report{}, err
@@ -308,7 +321,10 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 	return rep, nil
 }
 
-func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export, rep *Report) error {
+// write drains a source-neutral Import into the org. It never learns which
+// loader produced the IR: the provenance token, the container binding, the
+// message order and the upload dialect all arrive as data.
+func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import, rep *Report) error {
 	// Collision maps are pre-loaded because a unique-violation ERROR aborts
 	// the whole transaction — all conflict handling happens in Go, and the
 	// only ON CONFLICT used is the origin index (idempotent re-runs).
@@ -377,10 +393,10 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	// placeholders; existing emails are matched, not duplicated). Source
 	// roles carry over onto CREATED accounts only — an import never changes
 	// an existing user's role.
-	userMap := map[int64]int64{}  // zulip user id → our id
-	nameMap := map[string]int64{} // full name → our id (mention re-resolution)
-	for _, u := range ex.Users {
-		if u.IsBot {
+	userMap := map[string]int64{} // source user id → our id
+	nameMap := map[string]int64{} // display name → our id (mention re-resolution)
+	for _, u := range ir.Users {
+		if u.Bot {
 			rep.BotsSkipped++
 			continue
 		}
@@ -392,13 +408,13 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		// but '' satisfies that, so the alias survived re-runs too. Zulip
 		// always supplies emails, which is why this stayed latent; Slack does
 		// not (its export's user records routinely lack one).
-		key := strings.ToLower(u.BestEmail())
+		key := strings.ToLower(u.Email)
 		if existing, ok := emailToID[key]; ok && key != "" {
 			// Email matches an existing account → map, never duplicate (D4).
-			userMap[u.ID] = existing
-			nameMap[u.FullName] = existing
+			userMap[u.SourceID] = existing
+			nameMap[u.DisplayName] = existing
 			rep.MatchedExistingByEmail++
-			if weftRole(u.Role) != 40 {
+			if u.Role != 40 {
 				rep.RoleGrantsSkipped++
 			}
 			continue
@@ -408,10 +424,9 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		// emailless user would collide) while NULL does not.
 		var email *string
 		if key != "" {
-			e := u.BestEmail()
+			e := u.Email
 			email = &e
 		}
-		role := weftRole(u.Role)
 		var id int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO user_account
@@ -422,34 +437,34 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, enum.UserImportedPlaceholder, email, u.FullName, role,
-			ts(u.DateJoined), u.IsActive, originZulip, fmt.Sprint(u.ID)).Scan(&id)
+			orgID, enum.UserImportedPlaceholder, email, u.DisplayName, u.Role,
+			u.JoinedAt, u.Active, ir.Source, u.SourceID).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run: resolve by origin
 			if err := tx.QueryRow(ctx, `
 				SELECT id FROM user_account
 				WHERE org_id = $1 AND origin_system = $2 AND origin_id = $3`,
-				orgID, originZulip, fmt.Sprint(u.ID)).Scan(&id); err != nil {
-				return fmt.Errorf("resolve imported user %d: %w", u.ID, err)
+				orgID, ir.Source, u.SourceID).Scan(&id); err != nil {
+				return fmt.Errorf("resolve imported user %s: %w", u.SourceID, err)
 			}
 			rep.AlreadyImported++
 		} else if err != nil {
-			return fmt.Errorf("import user %d: %w", u.ID, err)
+			return fmt.Errorf("import user %s: %w", u.SourceID, err)
 		} else {
 			rep.Users++
 			if key != "" {
 				emailToID[key] = id
 			}
 		}
-		userMap[u.ID] = id
-		nameMap[u.FullName] = id
+		userMap[u.SourceID] = id
+		nameMap[u.DisplayName] = id
 		// Role-group membership so permissions resolve when the placeholder
 		// is claimed (idempotent on re-runs).
-		if gname := roleGroup(role); gname != "" {
+		if gname := roleGroup(u.Role); gname != "" {
 			if gid, ok := groupNameToID[gname]; ok {
 				if _, err := tx.Exec(ctx, `
 					INSERT INTO user_group_member (group_id, user_id)
 					VALUES ($1, $2) ON CONFLICT DO NOTHING`, gid, id); err != nil {
-					return fmt.Errorf("role group for user %d: %w", u.ID, err)
+					return fmt.Errorf("role group for user %s: %w", u.SourceID, err)
 				}
 			}
 		}
@@ -457,19 +472,17 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 
 	// --- Streams → channels (+ root thread). Name collisions with existing
 	// channels are renamed visibly (never silently merged).
-	channelMap := map[int64]int64{} // zulip stream id → our channel id
-	for _, st := range ex.Streams {
-		visibility := 1
-		if st.InviteOnly {
-			visibility = 2
-		}
+	channelMap := map[string]int64{} // source channel id → our channel id
+	for _, ch := range ir.Channels {
 		// Live-name collisions resolved in Go, visibly (never silent merges).
-		name := st.Name
-		for i := 0; !st.Deactivated && liveNames[strings.ToLower(name)]; i++ {
-			name = fmt.Sprintf("%s-%s%d", st.Name, originZulip, i+1)
+		// The suffix carries the SOURCE token, so the rename an operator sees
+		// says which import produced it.
+		name := ch.Name
+		for i := 0; !ch.Archived && liveNames[strings.ToLower(name)]; i++ {
+			name = fmt.Sprintf("%s-%s%d", ch.Name, ir.Source, i+1)
 		}
-		if name != st.Name {
-			rep.RenamedChannels[st.Name] = name
+		if name != ch.Name {
+			rep.RenamedChannels[ch.Name] = name
 		}
 		var id int64
 		reRun := false
@@ -481,22 +494,22 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, name, visibility, st.Description, ts(st.DateCreated),
-			st.Deactivated, originZulip, fmt.Sprint(st.ID)).Scan(&id)
+			orgID, name, ch.Visibility, ch.Description, ch.CreatedAt,
+			ch.Archived, ir.Source, ch.SourceID).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run
 			if err := tx.QueryRow(ctx, `
 				SELECT id FROM channel WHERE org_id = $1
 				 AND origin_system = $2 AND origin_id = $3`,
-				orgID, originZulip, fmt.Sprint(st.ID)).Scan(&id); err != nil {
-				return fmt.Errorf("resolve imported channel %d: %w", st.ID, err)
+				orgID, ir.Source, ch.SourceID).Scan(&id); err != nil {
+				return fmt.Errorf("resolve imported channel %s: %w", ch.SourceID, err)
 			}
 			rep.AlreadyImported++
 			reRun = true
 		} else if err != nil {
-			return fmt.Errorf("import stream %q: %w", st.Name, err)
+			return fmt.Errorf("import channel %q: %w", ch.Name, err)
 		}
 		if reRun {
-			channelMap[st.ID] = id
+			channelMap[ch.SourceID] = id
 			continue
 		}
 		liveNames[strings.ToLower(name)] = true
@@ -513,23 +526,20 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: orgID, ActorKind: enum.ActorImporter,
 			EntityType: enum.EntityChannel, EntityID: id, Verb: "channel.created",
-			OccurredAt: ts(st.DateCreated),
+			OccurredAt: ch.CreatedAt,
 			Payload:    eventlog.MustPayload(map[string]any{"channel_id": id, "name": name}),
 		}); err != nil {
 			return err
 		}
 		rep.Channels++
-		channelMap[st.ID] = id
+		channelMap[ch.SourceID] = id
 	}
 
-	// --- Subscriptions → channel_member.
-	for _, sub := range ex.Subscriptions {
-		streamID, ok := ex.StreamByRecipient[sub.Recipient]
-		if !ok || !sub.Active {
-			continue
-		}
-		chID, ok1 := channelMap[streamID]
-		uID, ok2 := userMap[sub.UserProfile]
+	// --- Memberships → channel_member. The loader already decided what
+	// counts as membership in its source; here it is only a pair of ids.
+	for _, mem := range ir.Memberships {
+		chID, ok1 := channelMap[mem.ChannelID]
+		uID, ok2 := userMap[mem.UserID]
 		if !ok1 || !ok2 {
 			continue
 		}
@@ -537,7 +547,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			INSERT INTO channel_member (channel_id, user_id)
 			VALUES ($1, $2) ON CONFLICT DO NOTHING`, chID, uID)
 		if err != nil {
-			return fmt.Errorf("subscription: %w", err)
+			return fmt.Errorf("membership: %w", err)
 		}
 		if ct.RowsAffected() > 0 {
 			rep.Subscriptions++
@@ -548,14 +558,14 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	// ones (never duplicated); custom groups import with provenance and
 	// visible rename on live-name collisions. Memberships of system groups
 	// are NOT copied — role fidelity flows through user_account.role above.
-	zgroupIsSystem := map[int64]bool{}
-	zgroupToWeft := map[int64]int64{} // zulip group id → weft group id
-	for _, g := range ex.NamedGroups {
-		if g.IsSystem {
-			zgroupIsSystem[g.ID] = true
-			if wname := zulipSystemGroup(g.Name); wname != "" {
-				if wid, ok := groupNameToID[wname]; ok {
-					zgroupToWeft[g.ID] = wid
+	systemGroup := map[string]bool{} // source group id → is a system group
+	groupMap := map[string]int64{}   // source group id → weft group id
+	for _, g := range ir.Groups {
+		if g.System {
+			systemGroup[g.SourceID] = true
+			if g.SystemName != "" {
+				if wid, ok := groupNameToID[g.SystemName]; ok {
+					groupMap[g.SourceID] = wid
 					rep.SystemGroupsMapped++
 				}
 			}
@@ -565,14 +575,10 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		// channels), so even deactivated groups rename on collision.
 		name := g.Name
 		for i := 0; groupNameToID[strings.ToLower(name)] != 0; i++ {
-			name = fmt.Sprintf("%s-%s%d", g.Name, originZulip, i+1)
+			name = fmt.Sprintf("%s-%s%d", g.Name, ir.Source, i+1)
 		}
 		if name != g.Name {
 			rep.RenamedGroups[g.Name] = name
-		}
-		created := time.Time{}
-		if g.DateCreated != nil {
-			created = ts(*g.DateCreated)
 		}
 		var id int64
 		err := tx.QueryRow(ctx, `
@@ -583,39 +589,39 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, name, g.Description, nullableTime(created), g.Deactivated,
-			originZulip, fmt.Sprint(g.ID)).Scan(&id)
+			orgID, name, g.Description, nullableTime(g.CreatedAt), g.Deactivated,
+			ir.Source, g.SourceID).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run
 			if err := tx.QueryRow(ctx, `
 				SELECT id FROM user_group WHERE org_id = $1
 				 AND origin_system = $2 AND origin_id = $3`,
-				orgID, originZulip, fmt.Sprint(g.ID)).Scan(&id); err != nil {
+				orgID, ir.Source, g.SourceID).Scan(&id); err != nil {
 				return fmt.Errorf("resolve imported group %q: %w", g.Name, err)
 			}
 			rep.AlreadyImported++
-			zgroupToWeft[g.ID] = id
+			groupMap[g.SourceID] = id
 			continue
 		} else if err != nil {
 			return fmt.Errorf("import group %q: %w", g.Name, err)
 		}
 		groupNameToID[strings.ToLower(name)] = id
-		zgroupToWeft[g.ID] = id
+		groupMap[g.SourceID] = id
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: orgID, ActorKind: enum.ActorImporter,
 			EntityType: enum.EntityGroup, EntityID: id, Verb: "usergroup.created",
-			OccurredAt: created,
+			OccurredAt: g.CreatedAt,
 			Payload:    eventlog.MustPayload(map[string]any{"group_id": id, "name": name}),
 		}); err != nil {
 			return err
 		}
 		rep.Groups++
 	}
-	for _, m := range ex.GroupMembers {
-		if zgroupIsSystem[m.UserGroup] {
+	for _, m := range ir.GroupMembers {
+		if systemGroup[m.GroupID] {
 			continue // roles carried via user_account.role, never via copy
 		}
-		gid, ok1 := zgroupToWeft[m.UserGroup]
-		uid, ok2 := userMap[m.UserProfile]
+		gid, ok1 := groupMap[m.GroupID]
+		uid, ok2 := userMap[m.UserID]
 		if !ok1 || !ok2 {
 			continue
 		}
@@ -629,9 +635,9 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			rep.GroupMembers++
 		}
 	}
-	for _, e := range ex.GroupEdges {
-		super, ok1 := zgroupToWeft[e.Supergroup]
-		sub, ok2 := zgroupToWeft[e.Subgroup]
+	for _, e := range ir.GroupEdges {
+		super, ok1 := groupMap[e.GroupID]
+		sub, ok2 := groupMap[e.SubgroupID]
 		// Equal ids arise when two source groups coarsen onto one Weft group
 		// (role:fullmembers + role:members); a self-edge is meaningless.
 		if !ok1 || !ok2 || super == sub {
@@ -651,38 +657,46 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	// --- Messages: topic → titled Thread (the showcase mapping); content
 	// re-rendered through OUR engine with mentions re-resolved against the
 	// imported directory; created_at backdated (E3).
-	resolve := func(label string) (int64, bool) {
-		id, ok := nameMap[label]
-		return id, ok
-	}
-	threadMap := map[string]int64{} // "streamID\x00subject" → thread id
-	messageMap := map[int64]int64{} // zulip message id → our id
-	msgThread := map[int64]int64{}  // zulip message id → our thread id
-	pathToFile, fileByAttach, err := s.importAttachments(ctx, tx, orgID, ex, userMap, rep)
+	threadMap := map[string]int64{}  // Thread.Key → thread id
+	messageMap := map[string]int64{} // source message id → our id
+	msgThread := map[string]int64{}  // source message id → our thread id
+	fileIDs, err := s.importAttachments(ctx, tx, orgID, ir, userMap, rep)
 	if err != nil {
 		return err
 	}
 
-	dmCache := map[string]dmInfo{} // canonical weft key → conversation
-	for _, m := range ex.Messages {
-		streamID, ok := ex.StreamByRecipient[m.Recipient]
-		if !ok {
-			if err := s.importDMMessage(ctx, tx, orgID, ex, m, userMap,
-				nameMap, dmCache, pathToFile, messageMap, msgThread, rep); err != nil {
+	// History order is the IR's to declare and ours to establish, once.
+	sortByOrdinal(ir.Messages)
+
+	dmCache := map[string]dmInfo{}     // canonical weft key → conversation
+	convByKey := map[string][]string{} // Conversation.SourceKey → participants
+	for _, c := range ir.Conversations {
+		convByKey[c.SourceKey] = c.MemberIDs
+	}
+	for i := range ir.Messages {
+		m := &ir.Messages[i]
+		if m.Container.Kind != ContainerChannel {
+			if err := s.importDirectMessage(ctx, tx, orgID, ir, m, convByKey,
+				userMap, nameMap, dmCache, fileIDs, messageMap, msgThread, rep); err != nil {
 				return err
 			}
 			continue
 		}
-		chID, ok1 := channelMap[streamID]
-		authorID, ok2 := userMap[m.Sender]
+		chID, ok1 := channelMap[m.Container.Key]
+		authorID, ok2 := userMap[m.AuthorID]
 		if !ok1 || !ok2 {
-			rep.StreamMessagesSkipped++
+			rep.ChannelMessagesSkipped++
 			continue
 		}
-		tkey := fmt.Sprintf("%d\x00%s", streamID, m.Subject)
-		thID, ok := threadMap[tkey]
+		if m.Thread == nil {
+			// Channel messages land in a titled thread, never on the
+			// channel's root: F-15 roots carry no counters and no root
+			// message, and the loader is the only place that knows how its
+			// source groups a conversation.
+			return fmt.Errorf("import message %s: channel message without a thread", m.SourceID)
+		}
+		thID, ok := threadMap[m.Thread.Key]
 		if !ok {
-			originID := fmt.Sprintf("topic:%d:%s", streamID, m.Subject)
 			err := tx.QueryRow(ctx, `
 				INSERT INTO thread (org_id, channel_id, kind, title,
 					last_activity_at, origin_system, origin_id)
@@ -690,34 +704,34 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 				ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 				DO NOTHING
 				RETURNING id`,
-				orgID, chID, m.Subject, ts(m.DateSent), originZulip, originID).Scan(&thID)
+				orgID, chID, m.Thread.Title, m.SentAt, ir.Source, m.Thread.SourceID).Scan(&thID)
 			if err == pgx.ErrNoRows {
 				if err := tx.QueryRow(ctx, `
 					SELECT id FROM thread WHERE org_id = $1
 					 AND origin_system = $2 AND origin_id = $3`,
-					orgID, originZulip, originID).Scan(&thID); err != nil {
-					return fmt.Errorf("resolve topic thread: %w", err)
+					orgID, ir.Source, m.Thread.SourceID).Scan(&thID); err != nil {
+					return fmt.Errorf("resolve imported thread: %w", err)
 				}
 				rep.AlreadyImported++
 			} else if err != nil {
-				return fmt.Errorf("topic thread %q: %w", m.Subject, err)
+				return fmt.Errorf("thread %q: %w", m.Thread.Title, err)
 			} else {
 				rep.Threads++
 				if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 					OrgID: orgID, ActorKind: enum.ActorImporter,
 					EntityType: enum.EntityThread, EntityID: thID, Verb: "thread.created",
-					OccurredAt: ts(m.DateSent),
+					OccurredAt: m.SentAt,
 					Payload: eventlog.MustPayload(map[string]any{
-						"thread_id": thID, "channel_id": chID, "title": m.Subject}),
+						"thread_id": thID, "channel_id": chID, "title": m.Thread.Title}),
 				}); err != nil {
 					return err
 				}
 			}
-			threadMap[tkey] = thID
+			threadMap[m.Thread.Key] = thID
 		}
 
-		src, hasAttach := rewriteUploads(m.Content, pathToFile)
-		doc := content.Parse(src, resolve)
+		src, hasAttach := ir.rewriteBody(m.Body, fileIDs)
+		doc := content.Parse(src, mentionResolver(m, nameMap, userMap))
 		var msgID int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO message (org_id, thread_id, channel_id, author_id,
@@ -729,24 +743,24 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			RETURNING id`,
 			orgID, thID, chID, authorID, src, doc.JSON(),
 			content.RenderHTML(doc), content.RenderVersion, doc.HasLink(), hasAttach,
-			ts(m.DateSent), originZulip, fmt.Sprint(m.ID)).Scan(&msgID)
+			m.SentAt, ir.Source, m.SourceID).Scan(&msgID)
 		if err == pgx.ErrNoRows {
 			rep.AlreadyImported++
 			if err := tx.QueryRow(ctx, `
 				SELECT id FROM message WHERE org_id = $1
 				 AND origin_system = $2 AND origin_id = $3`,
-				orgID, originZulip, fmt.Sprint(m.ID)).Scan(&msgID); err != nil {
+				orgID, ir.Source, m.SourceID).Scan(&msgID); err != nil {
 				return fmt.Errorf("resolve imported message: %w", err)
 			}
-			messageMap[m.ID] = msgID
-			msgThread[m.ID] = thID
+			messageMap[m.SourceID] = msgID
+			msgThread[m.SourceID] = thID
 			continue
 		}
 		if err != nil {
-			return fmt.Errorf("message %d: %w", m.ID, err)
+			return fmt.Errorf("message %s: %w", m.SourceID, err)
 		}
-		messageMap[m.ID] = msgID
-		msgThread[m.ID] = thID
+		messageMap[m.SourceID] = msgID
+		msgThread[m.SourceID] = thID
 		// F-15: only kind=1 threads carry denormalized counters. The gate is
 		// a no-op for the Zulip lane, which only ever reaches topic threads —
 		// it is here so that merging the channel and DM lanes (or adding a
@@ -759,29 +773,30 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			UPDATE thread SET message_count = message_count + 1,
 			       last_activity_at = GREATEST(last_activity_at, $2),
 			       root_message_id = COALESCE(root_message_id, $3)
-			WHERE id = $1 AND kind = 1`, thID, ts(m.DateSent), msgID); err != nil {
+			WHERE id = $1 AND kind = 1`, thID, m.SentAt, msgID); err != nil {
 			return err
 		}
 		if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 			OrgID: orgID, ActorKind: enum.ActorImporter,
 			EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
-			OccurredAt: ts(m.DateSent),
+			OccurredAt: m.SentAt,
 			Payload: eventlog.MustPayload(map[string]any{
 				"message_id": msgID, "channel_id": chID, "thread_id": thID,
 				"mentions": doc.Mentions()}),
 		}); err != nil {
 			return err
 		}
-		if err := s.importEditHistory(ctx, tx, msgID, m, userMap, resolve, rep); err != nil {
+		if err := s.importEditHistory(ctx, tx, msgID, m,
+			userMap, mentionResolver(m, nameMap, userMap), rep); err != nil {
 			return err
 		}
 		rep.Messages++
 	}
 
 	// --- Reactions.
-	for _, r := range ex.Reactions {
-		msgID, ok1 := messageMap[r.Message]
-		uID, ok2 := userMap[r.UserProfile]
+	for _, r := range ir.Reactions {
+		msgID, ok1 := messageMap[r.MessageID]
+		uID, ok2 := userMap[r.UserID]
 		if !ok1 || !ok2 {
 			rep.ReactionsUnmapped++
 			continue
@@ -789,7 +804,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 		ct, err := tx.Exec(ctx, `
 			INSERT INTO reaction (message_id, user_id, emoji, kind)
 			VALUES ($1, $2, $3, 1) ON CONFLICT DO NOTHING`,
-			msgID, uID, r.EmojiName)
+			msgID, uID, r.Emoji)
 		if err != nil {
 			return fmt.Errorf("reaction: %w", err)
 		}
@@ -801,9 +816,9 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	// --- Attachment references (the export's m2m is authoritative): each
 	// mapped (attachment, message) pair becomes a file_reference, and the
 	// message is flagged even when its content carried no inline link.
-	for _, am := range ex.AttachmentMsg {
-		fid, ok1 := fileByAttach[am.Attachment]
-		mid, ok2 := messageMap[am.Message]
+	for _, ref := range ir.AttachmentRefs {
+		fid, ok1 := fileIDs[ref.AttachmentID]
+		mid, ok2 := messageMap[ref.MessageID]
 		if !ok1 || !ok2 {
 			continue
 		}
@@ -826,30 +841,30 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 	// contract), exactly like live mark-read.
 	type rk struct{ user, thread int64 }
 	maxRead := map[rk]int64{}
-	for _, um := range ex.UserMessages {
-		if um.FlagsMask&umReadFlag == 0 {
+	for _, rs := range ir.ReadState {
+		if !rs.Read {
 			continue
 		}
-		uid, ok1 := userMap[um.UserProfile]
-		mid, ok2 := messageMap[um.Message]
+		uid, ok1 := userMap[rs.UserID]
+		mid, ok2 := messageMap[rs.MessageID]
 		if !ok1 || !ok2 {
-			continue // flags on unimported (DM) messages carry nothing
+			continue // flags on messages this import did not land carry nothing
 		}
-		k := rk{uid, msgThread[um.Message]}
+		k := rk{uid, msgThread[rs.MessageID]}
 		if mid > maxRead[k] {
 			maxRead[k] = mid
 		}
 	}
-	for _, um := range ex.UserMessages {
-		if um.FlagsMask&umReadFlag != 0 {
+	for _, rs := range ir.ReadState {
+		if rs.Read {
 			continue
 		}
-		uid, ok1 := userMap[um.UserProfile]
-		mid, ok2 := messageMap[um.Message]
+		uid, ok1 := userMap[rs.UserID]
+		mid, ok2 := messageMap[rs.MessageID]
 		if !ok1 || !ok2 {
 			continue
 		}
-		if wm, ok := maxRead[rk{uid, msgThread[um.Message]}]; ok && mid < wm {
+		if wm, ok := maxRead[rk{uid, msgThread[rs.MessageID]}]; ok && mid < wm {
 			rep.ReadCoarsened++
 		}
 	}
@@ -902,33 +917,33 @@ func nullableTime(t time.Time) *time.Time {
 
 type dmInfo struct{ spaceID, threadID int64 }
 
-// importDMMessage lands one direct message: resolve the participant set,
+// importDirectMessage lands one direct message: resolve the participant set,
 // create-or-get the conversation by its canonical key (the SAME derivation
 // the native dm module uses, so imported and native history share one
 // dm_space), then the provenance-idempotent message write. A conversation
 // with any unmappable participant (a bot) is skipped and counted — dropping
 // the participant would shrink the key and wrongly merge the history into a
 // different conversation.
-func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
-	ex *Export, m zulipMessage, userMap map[int64]int64,
-	nameMap map[string]int64, dmCache map[string]dmInfo, pathToFile map[string]int64,
-	messageMap, msgThread map[int64]int64, rep *Report) error {
+func (s *Service) importDirectMessage(ctx context.Context, tx pgx.Tx, orgID int64,
+	ir *Import, m *Message, convByKey map[string][]string, userMap map[string]int64,
+	nameMap map[string]int64, dmCache map[string]dmInfo, fileIDs map[string]int64,
+	messageMap, msgThread map[string]int64, rep *Report) error {
 
-	zulipIDs, ok := dmParticipants(ex, m)
+	sourceIDs, ok := convByKey[m.Container.Key]
 	if !ok {
 		rep.DMMessagesSkipped++
 		return nil
 	}
-	weftIDs := make([]int64, 0, len(zulipIDs))
-	for _, zid := range zulipIDs {
-		uid, mapped := userMap[zid]
+	weftIDs := make([]int64, 0, len(sourceIDs))
+	for _, sid := range sourceIDs {
+		uid, mapped := userMap[sid]
 		if !mapped {
 			rep.DMMessagesSkipped++
 			return nil
 		}
 		weftIDs = append(weftIDs, uid)
 	}
-	authorID, ok := userMap[m.Sender]
+	authorID, ok := userMap[m.AuthorID]
 	if !ok {
 		rep.DMMessagesSkipped++
 		return nil
@@ -985,7 +1000,7 @@ func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 				OrgID: orgID, ActorKind: enum.ActorImporter,
 				EntityType: enum.EntityDM, EntityID: info.spaceID, Verb: "dm.opened",
-				OccurredAt: ts(m.DateSent),
+				OccurredAt: m.SentAt,
 				Payload: eventlog.MustPayload(map[string]any{
 					"dm_space_id": info.spaceID, "root_thread_id": info.threadID,
 					"user_ids": weftIDs}),
@@ -997,11 +1012,8 @@ func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 		dmCache[key] = info
 	}
 
-	src, hasAttach := rewriteUploads(m.Content, pathToFile)
-	resolve := func(label string) (int64, bool) {
-		id, ok := nameMap[label]
-		return id, ok
-	}
+	src, hasAttach := ir.rewriteBody(m.Body, fileIDs)
+	resolve := mentionResolver(m, nameMap, userMap)
 	doc := content.Parse(src, resolve)
 	var msgID int64
 	err := tx.QueryRow(ctx, `
@@ -1014,28 +1026,28 @@ func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 		RETURNING id`,
 		orgID, info.threadID, info.spaceID, authorID, src, doc.JSON(),
 		content.RenderHTML(doc), content.RenderVersion, doc.HasLink(), hasAttach,
-		ts(m.DateSent), originZulip, fmt.Sprint(m.ID)).Scan(&msgID)
+		m.SentAt, ir.Source, m.SourceID).Scan(&msgID)
 	if err == pgx.ErrNoRows {
 		rep.AlreadyImported++
 		if err := tx.QueryRow(ctx, `
 			SELECT id FROM message WHERE org_id = $1
 			 AND origin_system = $2 AND origin_id = $3`,
-			orgID, originZulip, fmt.Sprint(m.ID)).Scan(&msgID); err != nil {
+			orgID, ir.Source, m.SourceID).Scan(&msgID); err != nil {
 			return fmt.Errorf("resolve imported dm message: %w", err)
 		}
-		messageMap[m.ID] = msgID
-		msgThread[m.ID] = info.threadID
+		messageMap[m.SourceID] = msgID
+		msgThread[m.SourceID] = info.threadID
 		return nil
 	}
 	if err != nil {
-		return fmt.Errorf("dm message %d: %w", m.ID, err)
+		return fmt.Errorf("dm message %s: %w", m.SourceID, err)
 	}
-	messageMap[m.ID] = msgID
-	msgThread[m.ID] = info.threadID
+	messageMap[m.SourceID] = msgID
+	msgThread[m.SourceID] = info.threadID
 	if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 		OrgID: orgID, ActorKind: enum.ActorImporter,
 		EntityType: enum.EntityMessage, EntityID: msgID, Verb: "message.created",
-		OccurredAt: ts(m.DateSent),
+		OccurredAt: m.SentAt,
 		Payload: eventlog.MustPayload(map[string]any{
 			"message_id": msgID, "dm_space_id": info.spaceID,
 			"thread_id": info.threadID, "mentions": doc.Mentions()}),
@@ -1051,18 +1063,28 @@ func (s *Service) importDMMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 
 // importAttachments stores every attachment blob (content-addressed through
 // files.StorageKey, so backfilled bytes dedup with live uploads) and records
-// provenance-idempotent file rows. Returns path_id→file id (for content
-// link rewriting) and attachment id→file id (for the m2m references).
-func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export, userMap map[int64]int64, rep *Report) (map[string]int64, map[int64]int64, error) {
-	pathToFile := map[string]int64{}
-	fileByAttach := map[int64]int64{}
-	for _, a := range ex.Attachments {
-		if a.PathID == "" || strings.Contains(a.PathID, "..") {
+// provenance-idempotent file rows. Returns attachment SourceID→file id, which
+// is both what the m2m references need and what the loader's link rewriter
+// resolves against.
+//
+// The bytes arrive as an opener, so this lane never learns where they live.
+// It reads each attachment ONCE and rewinds, because the storage key is the
+// content hash and the hash has to exist before the Put.
+func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import, userMap map[string]int64, rep *Report) (map[string]int64, error) {
+	fileIDs := map[string]int64{}
+	for _, a := range ir.Attachments {
+		// Bytes the source cannot produce are a counted loss, never a failed
+		// import: truncated exports are ordinary. A loader that supplied no
+		// opener at all is the same answer, not a panic.
+		if a.Probe == nil || a.Open == nil {
 			rep.AttachmentFilesMissing++
 			continue
 		}
-		full := filepath.Join(ex.Dir, "uploads", a.PathID)
-		f, err := os.Open(full)
+		if _, err := a.Probe(); err != nil {
+			rep.AttachmentFilesMissing++
+			continue
+		}
+		f, err := a.Open()
 		if err != nil {
 			rep.AttachmentFilesMissing++
 			continue
@@ -1071,11 +1093,11 @@ func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64,
 		size, err := io.Copy(h, f)
 		if err != nil {
 			f.Close()
-			return nil, nil, fmt.Errorf("hash attachment %d: %w", a.ID, err)
+			return nil, fmt.Errorf("hash attachment %s: %w", a.SourceID, err)
 		}
 		if _, err := f.Seek(0, io.SeekStart); err != nil {
 			f.Close()
-			return nil, nil, err
+			return nil, err
 		}
 		sum := h.Sum(nil)
 		key := files.StorageKey(orgID, hex.EncodeToString(sum))
@@ -1084,14 +1106,14 @@ func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64,
 		err = s.store.Put(ctx, key, f)
 		f.Close()
 		if err != nil {
-			return nil, nil, fmt.Errorf("store attachment %d: %w", a.ID, err)
+			return nil, fmt.Errorf("store attachment %s: %w", a.SourceID, err)
 		}
 		mime := "application/octet-stream"
-		if a.ContentType != nil && *a.ContentType != "" {
-			mime = *a.ContentType
+		if a.MIME != "" {
+			mime = a.MIME
 		}
 		var owner *int64
-		if uid, ok := userMap[a.Owner]; ok {
+		if uid, ok := userMap[a.OwnerID]; ok {
 			owner = &uid
 		}
 		var id int64
@@ -1102,99 +1124,82 @@ func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64,
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, a.FileName, mime, size, sum, key, owner,
-			ts(a.CreateTime), originZulip, fmt.Sprint(a.ID)).Scan(&id)
+			orgID, a.Name, mime, size, sum, key, owner,
+			a.CreatedAt, ir.Source, a.SourceID).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run
 			if err := tx.QueryRow(ctx, `
 				SELECT id FROM file WHERE org_id = $1
 				 AND origin_system = $2 AND origin_id = $3`,
-				orgID, originZulip, fmt.Sprint(a.ID)).Scan(&id); err != nil {
-				return nil, nil, fmt.Errorf("resolve imported file %d: %w", a.ID, err)
+				orgID, ir.Source, a.SourceID).Scan(&id); err != nil {
+				return nil, fmt.Errorf("resolve imported file %s: %w", a.SourceID, err)
 			}
 			rep.AlreadyImported++
 		} else if err != nil {
-			return nil, nil, fmt.Errorf("import attachment %d: %w", a.ID, err)
+			return nil, fmt.Errorf("import attachment %s: %w", a.SourceID, err)
 		} else {
 			if _, err := eventlog.Append(ctx, tx, eventlog.Event{
 				OrgID: orgID, ActorKind: enum.ActorImporter,
 				EntityType: enum.EntityFile, EntityID: id, Verb: "file.uploaded",
-				OccurredAt: ts(a.CreateTime),
+				OccurredAt: a.CreatedAt,
 				Payload: eventlog.MustPayload(map[string]any{
-					"file_id": id, "name": a.FileName, "size_bytes": size}),
+					"file_id": id, "name": a.Name, "size_bytes": size}),
 			}); err != nil {
-				return nil, nil, err
+				return nil, err
 			}
 			rep.Attachments++
 		}
-		pathToFile[a.PathID] = id
-		fileByAttach[a.ID] = id
+		fileIDs[a.SourceID] = id
 	}
-	return pathToFile, fileByAttach, nil
-}
-
-// rewriteUploads swaps /user_uploads/<path_id> links (relative or absolute)
-// for our managed-file URLs so imported content renders working links.
-func rewriteUploads(contentSrc string, pathToFile map[string]int64) (string, bool) {
-	if len(pathToFile) == 0 || !strings.Contains(contentSrc, "/user_uploads/") {
-		return contentSrc, false
-	}
-	changed := false
-	for path, id := range pathToFile {
-		needle := "/user_uploads/" + path
-		if strings.Contains(contentSrc, needle) {
-			contentSrc = strings.ReplaceAll(contentSrc, needle, fmt.Sprintf("/api/v1/files/%d", id))
-			changed = true
-		}
-	}
-	return contentSrc, changed
+	return fileIDs, nil
 }
 
 // importEditHistory materializes a message's content edits as kind-1
 // revisions, oldest first, re-parsing prior content through our engine.
-// Entries without an attributable editor are skipped and counted; topic and
-// stream moves carry no prev_content and are not message revisions.
-func (s *Service) importEditHistory(ctx context.Context, tx pgx.Tx, msgID int64, m zulipMessage, userMap map[int64]int64, resolve func(string) (int64, bool), rep *Report) error {
-	entries := parseEditHistory(m.EditHistory)
-	if len(entries) == 0 {
+// Entries without an attributable editor are skipped and counted; entries
+// that are not content revisions at all never reach the IR.
+func (s *Service) importEditHistory(ctx context.Context, tx pgx.Tx, msgID int64, m *Message, userMap map[string]int64, resolve func(string) (int64, bool), rep *Report) error {
+	if len(m.Edits) == 0 {
 		return nil
 	}
 	revNo := 0
-	var lastEdit float64
-	for _, e := range entries {
-		if e.PrevContent == nil {
-			continue
-		}
-		if e.UserID == nil {
+	// edited_at is stamped from the latest LANDED edit, and only when its
+	// timestamp is after the epoch — the same floor the shipped `lastEdit >
+	// 0` guard applied to a Unix float, kept so a source timestamp of zero
+	// still means "no usable edit time" rather than 1970.
+	epoch := time.Unix(0, 0).UTC()
+	lastEdit := epoch
+	for _, e := range m.Edits {
+		if e.EditorID == "" {
 			rep.EditEntriesSkipped++
 			continue
 		}
-		editor, ok := userMap[*e.UserID]
+		editor, ok := userMap[e.EditorID]
 		if !ok {
 			rep.EditEntriesSkipped++
 			continue
 		}
 		revNo++
-		prevDoc := content.Parse(*e.PrevContent, resolve)
+		prevDoc := content.Parse(e.PrevBody, resolve)
 		ct, err := tx.Exec(ctx, `
 			INSERT INTO message_revision
 				(message_id, revision_no, kind, prev_source, prev_ast, edited_by, edited_at)
 			VALUES ($1, $2, 1, $3, $4, $5, $6)
 			ON CONFLICT (message_id, revision_no) DO NOTHING`,
-			msgID, revNo, *e.PrevContent, prevDoc.JSON(), editor, ts(e.Timestamp))
+			msgID, revNo, e.PrevBody, prevDoc.JSON(), editor, e.At)
 		if err != nil {
 			return fmt.Errorf("import revision: %w", err)
 		}
 		if ct.RowsAffected() > 0 {
 			rep.MessageEdits++
 		}
-		if e.Timestamp > lastEdit {
-			lastEdit = e.Timestamp
+		if e.At.After(lastEdit) {
+			lastEdit = e.At
 		}
 	}
-	if lastEdit > 0 {
+	if lastEdit.After(epoch) {
 		if _, err := tx.Exec(ctx,
 			`UPDATE message SET edited_at = $1 WHERE id = $2 AND edited_at IS NULL`,
-			ts(lastEdit), msgID); err != nil {
+			lastEdit, msgID); err != nil {
 			return fmt.Errorf("stamp edited_at: %w", err)
 		}
 	}

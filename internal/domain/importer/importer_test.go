@@ -805,7 +805,13 @@ func TestZulipImportShowcase(t *testing.T) {
 	// 3 conversations · 1 attachment · 1 attributed edit; losses: 1 bot, 1
 	// bot-tainted DM, 1 null-editor edit, 1 coarsened unread; 3 system groups
 	// mapped; the #general collision renamed; nothing pre-existing.
+	//
+	// P-27a changed exactly two things here and the golden is the proof:
+	// `source` was added (a deployment with two adapters cannot otherwise
+	// tell whose numbers these are) and Zulip's word "stream" left the
+	// skipped-messages key. Every other byte survived the IR extraction.
 	const wantJSON = `{
+  "source": "zulip",
   "dry_run": false,
   "imported": {
     "attachments": 1,
@@ -825,7 +831,7 @@ func TestZulipImportShowcase(t *testing.T) {
   },
   "bots_skipped": 1,
   "dm_messages_skipped_unmappable_participants": 1,
-  "stream_messages_skipped_unmapped": 0,
+  "channel_messages_skipped_unmapped": 0,
   "edit_entries_skipped_unattributable": 1,
   "attachment_files_missing": 0,
   "reactions_unmapped": 0,
