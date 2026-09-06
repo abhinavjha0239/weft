@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -22,10 +24,11 @@ import (
 )
 
 // The fixture is a miniature but structurally faithful Zulip export:
-// two humans + one bot; #general (collides with the bootstrap channel) and a
-// private #core-team (deactivated=false, invite_only); two topics; a legacy-personal self-DM and a
-// 1:1 (both imported), a bot-tainted huddle (skipped whole, counted); a message with edit_history; an @**mention**;
-// a reaction; everything dated 2019 to prove backdating. Groups: four system
+// three humans + one bot; #general (collides with the bootstrap channel) and a
+// private #core-team (deactivated=false, invite_only); two topics; a legacy-personal self-DM, a
+// 1:1 and an ALL-HUMAN three-way huddle (all imported — the huddle is the
+// kind=2 group-DM lane), a bot-tainted huddle (skipped whole, counted); a message with edit_history; an @**mention**;
+// reactions in both message chunks; everything dated 2019 to prove backdating. Groups: four system
 // role groups (administrators/members map, fullmembers coarsens to members,
 // nobody is unmappable) + custom "engineering" with a bot member (skipped)
 // and a members⊇engineering nesting edge; the members⊇fullmembers edge must
@@ -34,7 +37,8 @@ const fixtureRealm = `{
   "zerver_userprofile": [
     {"id": 11, "delivery_email": "iago@zulip.test", "full_name": "Iago", "is_active": true, "is_bot": false, "role": 200, "date_joined": 1546300800},
     {"id": 12, "delivery_email": "hamlet@zulip.test", "full_name": "Hamlet", "is_active": true, "is_bot": false, "role": 400, "date_joined": 1546300800},
-    {"id": 13, "delivery_email": "welcome-bot@zulip.test", "full_name": "Welcome Bot", "is_active": true, "is_bot": true, "role": 400, "date_joined": 1546300800}
+    {"id": 13, "delivery_email": "welcome-bot@zulip.test", "full_name": "Welcome Bot", "is_active": true, "is_bot": true, "role": 400, "date_joined": 1546300800},
+    {"id": 14, "delivery_email": "portia@zulip.test", "full_name": "Portia", "is_active": true, "is_bot": false, "role": 400, "date_joined": 1546300800}
   ],
   "zerver_stream": [
     {"id": 21, "name": "general", "description": "imported general", "invite_only": false, "deactivated": false, "date_created": 1546300800},
@@ -45,7 +49,8 @@ const fixtureRealm = `{
     {"id": 32, "type": 2, "type_id": 22},
     {"id": 33, "type": 1, "type_id": 11},
     {"id": 34, "type": 3, "type_id": 77},
-    {"id": 35, "type": 1, "type_id": 12}
+    {"id": 35, "type": 1, "type_id": 12},
+    {"id": 36, "type": 3, "type_id": 78}
   ],
   "zerver_subscription": [
     {"id": 41, "user_profile": 11, "recipient": 31, "active": true},
@@ -54,7 +59,10 @@ const fixtureRealm = `{
     {"id": 44, "user_profile": 12, "recipient": 32, "active": false},
     {"id": 45, "user_profile": 11, "recipient": 34, "active": true},
     {"id": 46, "user_profile": 12, "recipient": 34, "active": true},
-    {"id": 47, "user_profile": 13, "recipient": 34, "active": true}
+    {"id": 47, "user_profile": 13, "recipient": 34, "active": true},
+    {"id": 48, "user_profile": 12, "recipient": 36, "active": true},
+    {"id": 49, "user_profile": 14, "recipient": 36, "active": true},
+    {"id": 50, "user_profile": 11, "recipient": 36, "active": true}
   ],
   "zerver_namedusergroup": [
     {"id": 51, "name": "role:administrators", "description": "", "is_system_group": true, "deactivated": false, "date_created": null},
@@ -82,24 +90,43 @@ const fixtureRealm = `{
   ]
 }`
 
-const fixtureMessages = `{
+// A real export chunks its history across messages-NNNNNN.json files. The two
+// chunks below are deliberately UNSORTED, within each file and across the pair
+// (103,102,106 then 108,101,105,107,104): the loader's merge must pick up all
+// three arrays from BOTH files, and its by-id sort must restore source order —
+// that ordering is what keeps the event log ≈ the original history, and it is
+// what decides which message a topic takes as its root. Each chunk carries a
+// reaction and user-message rows, and each references messages living in the
+// OTHER chunk, so dropping either file's arrays moves an assertion.
+const fixtureMessagesA = `{
   "zerver_message": [
-    {"id": 101, "sender": 11, "recipient": 31, "subject": "launch plan", "content": "kickoff for **v1** [notes](/user_uploads/2/ab/test.txt)", "date_sent": 1554100000, "edit_history": null},
-    {"id": 102, "sender": 12, "recipient": 31, "subject": "launch plan", "content": "ack @**Iago** :rocket:", "date_sent": 1554100600, "edit_history": null},
     {"id": 103, "sender": 12, "recipient": 31, "subject": "random", "content": "edited once", "date_sent": 1554200000, "edit_history": "[{\"prev_content\":\"original\",\"user_id\":12,\"timestamp\":1554210000},{\"prev_content\":\"most original\",\"timestamp\":1554205000}]"},
-    {"id": 104, "sender": 11, "recipient": 32, "subject": "secrets", "content": "private planning", "date_sent": 1554300000, "edit_history": null},
-    {"id": 105, "sender": 11, "recipient": 33, "subject": "", "content": "a note to self", "date_sent": 1554400000, "edit_history": null},
-    {"id": 106, "sender": 12, "recipient": 34, "subject": "", "content": "huddle with the bot — must be skipped whole", "date_sent": 1554500000, "edit_history": null},
-    {"id": 107, "sender": 11, "recipient": 35, "subject": "", "content": "ping me when the **beta** branch is cut", "date_sent": 1554600000, "edit_history": null}
+    {"id": 102, "sender": 12, "recipient": 31, "subject": "launch plan", "content": "ack @**Iago** :rocket:", "date_sent": 1554100600, "edit_history": null},
+    {"id": 106, "sender": 12, "recipient": 34, "subject": "", "content": "huddle with the bot — must be skipped whole", "date_sent": 1554500000, "edit_history": null}
   ],
   "zerver_reaction": [
-    {"id": 201, "user_profile": 11, "message": 102, "emoji_name": "tada"}
+    {"id": 202, "user_profile": 12, "message": 101, "emoji_name": "eyes"}
   ],
   "zerver_usermessage": [
     {"id": 301, "user_profile": 11, "flags_mask": 1, "message": 101},
     {"id": 302, "user_profile": 11, "flags_mask": 1, "message": 102},
     {"id": 303, "user_profile": 12, "flags_mask": 1, "message": 102},
-    {"id": 304, "user_profile": 12, "flags_mask": 0, "message": 101},
+    {"id": 304, "user_profile": 12, "flags_mask": 0, "message": 101}
+  ]
+}`
+
+const fixtureMessagesB = `{
+  "zerver_message": [
+    {"id": 108, "sender": 11, "recipient": 36, "subject": "", "content": "three-way sync on the **beta** cut", "date_sent": 1554700000, "edit_history": null},
+    {"id": 101, "sender": 11, "recipient": 31, "subject": "launch plan", "content": "kickoff for **v1** [notes](/user_uploads/2/ab/test.txt)", "date_sent": 1554100000, "edit_history": null},
+    {"id": 105, "sender": 11, "recipient": 33, "subject": "", "content": "a note to self", "date_sent": 1554400000, "edit_history": null},
+    {"id": 107, "sender": 11, "recipient": 35, "subject": "", "content": "ping me when the **beta** branch is cut", "date_sent": 1554600000, "edit_history": null},
+    {"id": 104, "sender": 11, "recipient": 32, "subject": "secrets", "content": "private planning", "date_sent": 1554300000, "edit_history": null}
+  ],
+  "zerver_reaction": [
+    {"id": 201, "user_profile": 11, "message": 102, "emoji_name": "tada"}
+  ],
+  "zerver_usermessage": [
     {"id": 305, "user_profile": 11, "flags_mask": 1, "message": 105},
     {"id": 306, "user_profile": 12, "flags_mask": 3, "message": 103},
     {"id": 307, "user_profile": 12, "flags_mask": 1, "message": 107}
@@ -112,7 +139,10 @@ func writeFixture(t *testing.T) string {
 	if err := os.WriteFile(filepath.Join(dir, "realm.json"), []byte(fixtureRealm), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(dir, "messages-000001.json"), []byte(fixtureMessages), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(dir, "messages-000001.json"), []byte(fixtureMessagesA), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "messages-000002.json"), []byte(fixtureMessagesB), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(dir, "uploads", "2", "ab"), 0o755); err != nil {
@@ -171,8 +201,8 @@ func TestZulipImportShowcase(t *testing.T) {
 	if err != nil {
 		t.Fatalf("dry run: %v", err)
 	}
-	if dry.Users != 2 || dry.BotsSkipped != 1 || dry.Channels != 2 ||
-		dry.Threads != 3 || dry.Messages != 4 || dry.Reactions != 1 {
+	if dry.Users != 3 || dry.BotsSkipped != 1 || dry.Channels != 2 ||
+		dry.Threads != 3 || dry.Messages != 4 || dry.Reactions != 2 {
 		t.Fatalf("dry-run report off: %+v", dry)
 	}
 	// Edits: hamlet's attributed entry imports; the null-editor entry is a
@@ -181,10 +211,10 @@ func TestZulipImportShowcase(t *testing.T) {
 		dry.Attachments != 1 || dry.AttachmentFilesMissing != 0 {
 		t.Fatalf("dry-run edit/attachment accounting off: %+v", dry)
 	}
-	// DMs: the self-DM and the 1:1 import (2 conversations, 2 messages);
-	// the bot-tainted huddle is skipped WHOLE — dropping the bot would
-	// shrink the canonical key onto the humans' real 1:1.
-	if dry.DMConversations != 2 || dry.DMMessages != 2 || dry.DMMessagesSkipped != 1 {
+	// DMs: the self-DM, the 1:1 and the all-human huddle import (3
+	// conversations, 3 messages); the bot-tainted huddle is skipped WHOLE —
+	// dropping the bot would shrink the canonical key onto the humans' real 1:1.
+	if dry.DMConversations != 3 || dry.DMMessages != 3 || dry.DMMessagesSkipped != 1 {
 		t.Fatalf("dry-run dm accounting off: %+v", dry)
 	}
 	// Groups: 1 custom; 3 mappable system groups (nobody has no counterpart);
@@ -217,8 +247,8 @@ func TestZulipImportShowcase(t *testing.T) {
 	if n, err := perms.NewRebuildWorker(pool, perms.New(pool), slog.Default()).RunOnce(ctx); err != nil || n != 1 {
 		t.Fatalf("closure rebuild drain = %d jobs (%v), want 1", n, err)
 	}
-	if rep.Users != 2 || rep.Channels != 2 || rep.Threads != 3 ||
-		rep.Messages != 4 || rep.Reactions != 1 || rep.Subscriptions != 3 {
+	if rep.Users != 3 || rep.Channels != 2 || rep.Threads != 3 ||
+		rep.Messages != 4 || rep.Reactions != 2 || rep.Subscriptions != 3 {
 		t.Fatalf("report off: %+v", rep)
 	}
 	if got := rep.RenamedChannels["general"]; got != "general-zulip1" {
@@ -273,6 +303,101 @@ func TestZulipImportShowcase(t *testing.T) {
 	}
 	if occurred.Year() != 2019 || recorded.Year() < 2026 {
 		t.Fatalf("E3 violated: occurred=%v recorded=%v", occurred, recorded)
+	}
+
+	// The WHOLE importer event surface, per verb. The importer feeds six
+	// verbs and the backfill contract (consumers key off actor_kind=4) is
+	// only worth anything if every one of them is actually appended — so
+	// every Append in the module is pinned by an exact count here, and an
+	// unexpected seventh verb fails the same comparison.
+	wantEvents := map[string]int{
+		"channel.created":   2, // both imported streams
+		"thread.created":    3, // launch plan, random, secrets (root threads are silent)
+		"usergroup.created": 1, // engineering; system groups MAP, never create
+		"dm.opened":         3, // self-DM, 1:1, human huddle
+		"file.uploaded":     1,
+		"message.created":   7, // 4 stream + 3 dm
+	}
+	gotEvents := map[string]int{}
+	evRows, err := pool.Query(ctx, `
+		SELECT verb, count(*) FROM event_log
+		WHERE org_id = $1 AND actor_kind = 4 GROUP BY verb`, orgID)
+	if err != nil {
+		t.Fatalf("importer event census: %v", err)
+	}
+	for evRows.Next() {
+		var verb string
+		var n int
+		if err := evRows.Scan(&verb, &n); err != nil {
+			evRows.Close()
+			t.Fatalf("scan event census: %v", err)
+		}
+		gotEvents[verb] = n
+	}
+	evRows.Close()
+	if err := evRows.Err(); err != nil {
+		t.Fatalf("importer event census: %v", err)
+	}
+	if !reflect.DeepEqual(gotEvents, wantEvents) {
+		t.Fatalf("importer events = %v, want %v", gotEvents, wantEvents)
+	}
+	// E3 holds for EVERY importer event, not just the first message: source
+	// time in 2019, ingest time now.
+	var badStamp int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM event_log
+		WHERE org_id = $1 AND actor_kind = 4
+		  AND NOT (extract(year from occurred_at) = 2019
+		           AND recorded_at > now() - interval '1 hour')`, orgID).Scan(&badStamp); err != nil {
+		t.Fatalf("E3 census: %v", err)
+	}
+	if badStamp != 0 {
+		t.Fatalf("%d importer events violate E3 (2019 occurred_at, fresh recorded_at)", badStamp)
+	}
+
+	// Chunk merge + by-id sort. The two message files are unsorted on disk
+	// (103,102,106 then 108,101,105,107,104), so imported ids must still
+	// ascend with SOURCE ids — without the loader's sort the event log would
+	// replay history in file order.
+	var misordered int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM (
+		  SELECT row_number() OVER (ORDER BY e.id)                 AS by_event,
+		         row_number() OVER (ORDER BY m.origin_id::bigint)  AS by_source
+		  FROM event_log e
+		  JOIN message m ON m.id = e.entity_id AND m.org_id = e.org_id
+		  WHERE e.org_id = $1 AND e.actor_kind = 4 AND e.verb = 'message.created'
+		) x WHERE by_event <> by_source`, orgID).Scan(&misordered); err != nil {
+		t.Fatalf("import order check: %v", err)
+	}
+	if misordered != 0 {
+		t.Fatalf("%d imported messages are out of source order (chunk merge/sort)", misordered)
+	}
+	// The first message of a topic becomes its root: zulip 101 by source id,
+	// but zulip 102 if the chunks were replayed in file order.
+	var rootIsFirst bool
+	if err := pool.QueryRow(ctx, `
+		SELECT t.root_message_id = m.id FROM message m
+		JOIN thread t ON t.id = m.thread_id
+		WHERE m.org_id = $1 AND m.origin_system = 'zulip' AND m.origin_id = '101'`,
+		orgID).Scan(&rootIsFirst); err != nil {
+		t.Fatalf("root message check: %v", err)
+	}
+	if !rootIsFirst {
+		t.Fatal("launch-plan root message is not zulip 101 (chunk order leaked through)")
+	}
+	// Both chunks' reaction arrays merged (201 rides chunk B, 202 chunk A).
+	var mergedReactions int
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM reaction r
+		JOIN message m ON m.id = r.message_id
+		WHERE m.org_id = $1 AND m.origin_system = 'zulip'
+		  AND (m.origin_id, r.emoji) IN (('102', 'tada'), ('101', 'eyes'))`,
+		orgID).Scan(&mergedReactions); err != nil {
+		t.Fatalf("merged reactions: %v", err)
+	}
+	if mergedReactions != 2 {
+		t.Fatalf("reactions merged across chunks = %d, want 2", mergedReactions)
 	}
 
 	// Placeholders are claimable deactivated accounts of the placeholder
@@ -347,7 +472,7 @@ func TestZulipImportShowcase(t *testing.T) {
 	if rep.Watermarks != 5 || rep.ReadCoarsened != 1 {
 		t.Fatalf("watermark report off: %+v", rep)
 	}
-	if rep.DMConversations != 2 || rep.DMMessages != 2 || rep.DMMessagesSkipped != 1 {
+	if rep.DMConversations != 3 || rep.DMMessages != 3 || rep.DMMessagesSkipped != 1 {
 		t.Fatalf("dm import report off: %+v", rep)
 	}
 	// The 1:1 landed in a dm_space whose canonical key matches what the
@@ -379,6 +504,62 @@ func TestZulipImportShowcase(t *testing.T) {
 		 AND origin_system = 'zulip' AND origin_id = '107'`, orgID).Scan(&weft107)
 	if dmMsgCount != 1 || weft107 == 0 {
 		t.Fatalf("1:1 dm thread has %d messages (weft107=%d), want the imported one", dmMsgCount, weft107)
+	}
+
+	// The kind=2 GROUP-DM lane: an all-human huddle keeps every participant,
+	// so its canonical key is the three sorted ids — the same derivation the
+	// native dm module uses, one id wider than the 1:1 above.
+	var portiaID int64
+	if err := pool.QueryRow(ctx, `
+		SELECT id FROM user_account WHERE org_id = $1
+		 AND origin_system = 'zulip' AND origin_id = '14'`, orgID).Scan(&portiaID); err != nil {
+		t.Fatalf("imported Portia: %v", err)
+	}
+	trio := []int64{iagoID, hamletID, portiaID}
+	sort.Slice(trio, func(i, j int) bool { return trio[i] < trio[j] })
+	wantGroupKey := fmt.Sprintf("%d:%d:%d", trio[0], trio[1], trio[2])
+	var groupSpace, groupThread int64
+	var groupKind int16
+	if err := pool.QueryRow(ctx, `
+		SELECT ds.id, ds.kind, t.id
+		FROM dm_space ds JOIN thread t ON t.dm_space_id = ds.id AND t.kind = 2
+		WHERE ds.org_id = $1 AND ds.dm_key = $2`,
+		orgID, wantGroupKey).Scan(&groupSpace, &groupKind, &groupThread); err != nil {
+		t.Fatalf("imported huddle dm_space (key %s): %v", wantGroupKey, err)
+	}
+	if groupKind != 2 {
+		t.Fatalf("huddle dm kind = %d, want 2 (group)", groupKind)
+	}
+	var groupParts int
+	_ = pool.QueryRow(ctx,
+		`SELECT count(*) FROM dm_participant WHERE dm_space_id = $1`, groupSpace).Scan(&groupParts)
+	if groupParts != 3 {
+		t.Fatalf("huddle participants = %d, want 3", groupParts)
+	}
+	// The huddle message landed in that space's root thread, attributed to
+	// its imported sender.
+	var msg108Thread, msg108Space, msg108Author int64
+	if err := pool.QueryRow(ctx, `
+		SELECT thread_id, dm_space_id, author_id FROM message
+		WHERE org_id = $1 AND origin_system = 'zulip' AND origin_id = '108'`,
+		orgID).Scan(&msg108Thread, &msg108Space, &msg108Author); err != nil {
+		t.Fatalf("imported huddle message: %v", err)
+	}
+	if msg108Thread != groupThread || msg108Space != groupSpace || msg108Author != iagoID {
+		t.Fatalf("huddle message thread=%d space=%d author=%d, want %d/%d/%d",
+			msg108Thread, msg108Space, msg108Author, groupThread, groupSpace, iagoID)
+	}
+	// dm.opened names all three participants (the payload IS the wire
+	// contract the gateway routes on).
+	var openedParts int
+	if err := pool.QueryRow(ctx, `
+		SELECT jsonb_array_length(payload->'user_ids') FROM event_log
+		WHERE org_id = $1 AND actor_kind = 4 AND verb = 'dm.opened' AND entity_id = $2`,
+		orgID, groupSpace).Scan(&openedParts); err != nil {
+		t.Fatalf("huddle dm.opened event: %v", err)
+	}
+	if openedParts != 3 {
+		t.Fatalf("huddle dm.opened user_ids = %d, want 3", openedParts)
 	}
 	// Hamlet's read flag became a watermark on the DM thread.
 	var dmWM int64
@@ -442,12 +623,13 @@ func TestZulipImportShowcase(t *testing.T) {
 	if seedMissing != 0 {
 		t.Fatalf("%d imported (user, channel) unread states have no counter row", seedMissing)
 	}
-	// The self-DM imported as kind 3; the bot huddle imported NOTHING.
+	// The self-DM imported as kind 3; the BOT huddle imported NOTHING (the
+	// human one above is the third space).
 	var selfCount, spaces int
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM dm_space WHERE org_id = $1 AND kind = 3`, orgID).Scan(&selfCount)
 	_ = pool.QueryRow(ctx, `SELECT count(*) FROM dm_space WHERE org_id = $1`, orgID).Scan(&spaces)
-	if selfCount != 1 || spaces != 2 {
-		t.Fatalf("dm spaces = %d (self %d), want 2 total (huddle skipped)", spaces, selfCount)
+	if selfCount != 1 || spaces != 3 {
+		t.Fatalf("dm spaces = %d (self %d), want 3 total (bot huddle skipped)", spaces, selfCount)
 	}
 	var hamletWM, weft102 int64
 	_ = pool.QueryRow(ctx, `
@@ -547,8 +729,8 @@ func TestZulipImportShowcase(t *testing.T) {
 	_ = pool.QueryRow(ctx,
 		`SELECT count(*) FROM message WHERE org_id = $1 AND origin_system = 'zulip'`,
 		orgID).Scan(&msgs)
-	if msgs != 6 {
-		t.Fatalf("after re-run message count = %d, want 6 (4 stream + 2 dm, no duplicates)", msgs)
+	if msgs != 7 {
+		t.Fatalf("after re-run message count = %d, want 7 (4 stream + 3 dm, no duplicates)", msgs)
 	}
 }
 

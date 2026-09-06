@@ -167,6 +167,16 @@ func (r *Runner) ProcessOrg(ctx context.Context, orgID int64) error {
 			if ev.Verb != "message.created" {
 				continue
 			}
+			// Backfill semantics (ADR-003 E4), as in notification.Runner and
+			// automation.match: imported history is HISTORY, not activity.
+			// Unfurling it would mean ONE outbound fetch per imported message
+			// carrying a link — a privacy and load problem on top of the
+			// correctness one, since an import is exactly the moment a cell
+			// ingests the most links at once. The event is still CONSUMED and
+			// acked below; only the fetch is skipped.
+			if ev.ActorKind == enum.ActorImporter {
+				continue
+			}
 			if err := r.handle(ctx, ev); err != nil {
 				return err
 			}
