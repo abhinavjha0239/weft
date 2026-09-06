@@ -2,6 +2,13 @@
 // intermediate representation → dry-run fidelity report → provenance-keyed
 // idempotent writes with backdated timestamps (E3).
 //
+// The IR lives in ir.go and the write path consumes ONLY it, so a second
+// source is a loader and not a second importer. One caveat, deliberate and
+// tracked as P-27c: the DRY-RUN accounting has not moved onto the IR yet. It
+// still reads this file's Zulip structures, and it disagrees with the write
+// path about what several buckets mean — reconciling those numbers changes
+// what an operator sees, which is a different slice from a refactor.
+//
 // LLD note (ARCHITECTURE.md exception, tracked in REALITY.md): the importer
 // writes owning-module tables directly in backfill mode. ADR-003 E4's
 // "through domain services with backfill flags" is the convergence target —
@@ -13,9 +20,11 @@ package importer
 import (
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 )
 
@@ -45,11 +54,54 @@ type zulipUser struct {
 	DateJoined    float64 `json:"date_joined"`
 }
 
+// BestEmail is Zulip's email precedence: delivery_email is the real address
+// and `email` may be a per-realm alias, so the delivery address wins when the
+// export carries one. An export may carry NEITHER, and an absent email is not
+// a match key — the write path guards for that.
 func (u zulipUser) BestEmail() string {
 	if u.DeliveryEmail != "" {
 		return u.DeliveryEmail
 	}
 	return u.Email
+}
+
+// weftRole maps Zulip UserProfile.role constants to Weft role presets. The
+// input domain is literally Zulip's (zerver/models/users.py: 100 owner, 200
+// administrator, 300 moderator, 400 member, 600 guest), which is why the
+// mapping belongs to the loader and not to the write path.
+func weftRole(zulipRole int) int16 {
+	switch zulipRole {
+	case 100:
+		return 10 // realm owner → owner
+	case 200:
+		return 20 // realm administrator → admin
+	case 300:
+		return 30 // moderator
+	case 600:
+		return 50 // guest
+	default:
+		return 40 // member (400 and anything unknown)
+	}
+}
+
+// zulipSystemGroup maps Zulip's system group names onto the seeded Weft
+// ones. role:fullmembers coarsens to role:members (Weft has no waiting
+// period); role:nobody and role:internet have no Weft counterpart.
+func zulipSystemGroup(name string) string {
+	switch name {
+	case "role:owners":
+		return "role:owners"
+	case "role:administrators":
+		return "role:admins"
+	case "role:moderators":
+		return "role:moderators"
+	case "role:members", "role:fullmembers":
+		return "role:members"
+	case "role:everyone":
+		return "role:everyone"
+	default:
+		return ""
+	}
 }
 
 type zulipStream struct {
@@ -172,9 +224,16 @@ type zulipReaction struct {
 	EmojiName   string `json:"emoji_name"`
 }
 
+// originZulip is this loader's provenance token. It reaches the database and
+// the operator's eyes only as Import.Source — every origin_system column and
+// the visible "-zulip1" collision-rename suffix come from there, so the write
+// path holds no Zulip literal at all.
+const originZulip = "zulip"
+
 // Export is the parsed source, pre-indexed for the writer.
 type Export struct {
 	Dir           string // the unpacked export root (uploads/ lives here)
+	Source        string // originZulip; travels onto Import.Source
 	Users         []zulipUser
 	Streams       []zulipStream
 	Subscriptions []zulipSubscription
@@ -205,6 +264,7 @@ func LoadZulipExport(dir string) (*Export, error) {
 	}
 	ex := &Export{
 		Dir:               dir,
+		Source:            originZulip,
 		Users:             realm.Users,
 		Streams:           realm.Streams,
 		Subscriptions:     realm.Subscriptions,
@@ -254,6 +314,247 @@ func LoadZulipExport(dir string) (*Export, error) {
 	// Deterministic id order keeps event-log ordering ≈ original history.
 	sort.Slice(ex.Messages, func(i, j int) bool { return ex.Messages[i].ID < ex.Messages[j].ID })
 	return ex, nil
+}
+
+// toImport projects the parsed export onto the source-neutral IR. This is
+// where every Zulip concept stops: the recipient indirection becomes explicit
+// containers and conversations, role integers become Weft presets, flags
+// masks become booleans, and the bytes behind an attachment become an opener.
+//
+// The two composite keys below are computed HERE and must stay
+// byte-identical. The topic provenance key in particular is a wire contract:
+// a re-import after an upgrade that changed its shape would fail to recognise
+// the threads it created last time and duplicate them instead of counting
+// AlreadyImported.
+func (ex *Export) toImport() *Import {
+	ir := &Import{Source: ex.Source}
+
+	for _, u := range ex.Users {
+		ir.Users = append(ir.Users, User{
+			SourceID:    fmt.Sprint(u.ID),
+			Email:       u.BestEmail(),
+			DisplayName: u.FullName,
+			Role:        weftRole(u.Role),
+			Active:      u.IsActive,
+			Bot:         u.IsBot,
+			JoinedAt:    ts(u.DateJoined),
+		})
+	}
+
+	for _, st := range ex.Streams {
+		visibility := int16(1)
+		if st.InviteOnly {
+			visibility = 2
+		}
+		ir.Channels = append(ir.Channels, Channel{
+			SourceID:    fmt.Sprint(st.ID),
+			Name:        st.Name,
+			Description: st.Description,
+			Visibility:  visibility,
+			Archived:    st.Deactivated,
+			CreatedAt:   ts(st.DateCreated),
+		})
+	}
+
+	// A subscription is channel membership only when it is ACTIVE and its
+	// recipient is a stream; the type-3 rows are DM participation and belong
+	// to Conversations, not here.
+	for _, sub := range ex.Subscriptions {
+		streamID, ok := ex.StreamByRecipient[sub.Recipient]
+		if !ok || !sub.Active {
+			continue
+		}
+		ir.Memberships = append(ir.Memberships, Membership{
+			ChannelID: fmt.Sprint(streamID),
+			UserID:    fmt.Sprint(sub.UserProfile),
+		})
+	}
+
+	for _, g := range ex.NamedGroups {
+		// An absent date_created stays the zero time, which the write path
+		// turns into now() — distinct from a date_created of 0, which is a
+		// real (epoch) timestamp the source asserted.
+		created := time.Time{}
+		if g.DateCreated != nil {
+			created = ts(*g.DateCreated)
+		}
+		systemName := ""
+		if g.IsSystem {
+			systemName = zulipSystemGroup(g.Name)
+		}
+		ir.Groups = append(ir.Groups, Group{
+			SourceID:    fmt.Sprint(g.ID),
+			Name:        g.Name,
+			Description: g.Description,
+			System:      g.IsSystem,
+			SystemName:  systemName,
+			Deactivated: g.Deactivated,
+			CreatedAt:   created,
+		})
+	}
+	for _, m := range ex.GroupMembers {
+		ir.GroupMembers = append(ir.GroupMembers, GroupMembership{
+			GroupID: fmt.Sprint(m.UserGroup), UserID: fmt.Sprint(m.UserProfile)})
+	}
+	for _, e := range ex.GroupEdges {
+		ir.GroupEdges = append(ir.GroupEdges, GroupEdge{
+			GroupID: fmt.Sprint(e.Supergroup), SubgroupID: fmt.Sprint(e.Subgroup)})
+	}
+
+	// Attachments: bytes live at uploads/<path_id> and message bodies link
+	// them as /user_uploads/<path_id>. Both facts stay inside this file.
+	pathByAttachment := map[string]string{}
+	for _, a := range ex.Attachments {
+		id := fmt.Sprint(a.ID)
+		pathByAttachment[id] = a.PathID
+		mime := ""
+		if a.ContentType != nil {
+			mime = *a.ContentType
+		}
+		att := Attachment{
+			SourceID:  id,
+			Name:      a.FileName,
+			MIME:      mime,
+			OwnerID:   fmt.Sprint(a.Owner),
+			CreatedAt: ts(a.CreateTime),
+		}
+		att.Probe, att.Open = ex.attachmentBytes(a.PathID)
+		ir.Attachments = append(ir.Attachments, att)
+	}
+	for _, am := range ex.AttachmentMsg {
+		ir.AttachmentRefs = append(ir.AttachmentRefs, AttachmentRef{
+			AttachmentID: fmt.Sprint(am.Attachment), MessageID: fmt.Sprint(am.Message)})
+	}
+	ir.RewriteAttachmentLinks = func(body string, fileIDs map[string]int64) (string, bool) {
+		return rewriteZulipUploads(body, pathByAttachment, fileIDs)
+	}
+
+	// Messages, and the containers they resolve to. Zulip ids ascend with
+	// history, so they double as the ordinal.
+	threads := map[string]*Thread{}
+	seenConversation := map[string]bool{}
+	for _, m := range ex.Messages {
+		msg := Message{
+			SourceID: fmt.Sprint(m.ID),
+			Ordinal:  m.ID,
+			AuthorID: fmt.Sprint(m.Sender),
+			Body:     m.Content,
+			SentAt:   ts(m.DateSent),
+		}
+		for _, e := range parseEditHistory(m.EditHistory) {
+			// No prev_content means a topic or channel move, which is not a
+			// message revision at all — dropped here rather than counted.
+			if e.PrevContent == nil {
+				continue
+			}
+			ed := Edit{At: ts(e.Timestamp), PrevBody: *e.PrevContent}
+			if e.UserID != nil {
+				ed.EditorID = fmt.Sprint(*e.UserID)
+			}
+			msg.Edits = append(msg.Edits, ed)
+		}
+		if streamID, ok := ex.StreamByRecipient[m.Recipient]; ok {
+			msg.Container = Container{Kind: ContainerChannel, Key: fmt.Sprint(streamID)}
+			key := fmt.Sprintf("%d\x00%s", streamID, m.Subject)
+			th, ok := threads[key]
+			if !ok {
+				th = &Thread{
+					Key:      key,
+					SourceID: fmt.Sprintf("topic:%d:%s", streamID, m.Subject),
+					Title:    m.Subject,
+				}
+				threads[key] = th
+			}
+			msg.Thread = th
+		} else {
+			// Not a stream recipient, so a direct message. An unresolvable
+			// recipient leaves the container Key empty, which no conversation
+			// can match — the write path counts it as an unmappable
+			// participant loss, exactly as it did when it asked per message.
+			msg.Container = Container{Kind: ContainerDirect}
+			if ids, ok := dmParticipants(ex, m); ok {
+				parts := make([]string, len(ids))
+				for i, id := range ids {
+					parts[i] = fmt.Sprint(id)
+				}
+				key := "dm:" + strings.Join(parts, ":")
+				msg.Container.Key = key
+				if !seenConversation[key] {
+					seenConversation[key] = true
+					ir.Conversations = append(ir.Conversations,
+						Conversation{SourceKey: key, MemberIDs: parts})
+				}
+			}
+		}
+		ir.Messages = append(ir.Messages, msg)
+	}
+
+	for _, r := range ex.Reactions {
+		ir.Reactions = append(ir.Reactions, Reaction{
+			UserID:    fmt.Sprint(r.UserProfile),
+			MessageID: fmt.Sprint(r.Message),
+			Emoji:     r.EmojiName,
+		})
+	}
+	for _, um := range ex.UserMessages {
+		ir.ReadState = append(ir.ReadState, ReadState{
+			UserID:    fmt.Sprint(um.UserProfile),
+			MessageID: fmt.Sprint(um.Message),
+			Read:      um.FlagsMask&umReadFlag != 0,
+		})
+	}
+	return ir
+}
+
+// attachmentBytes builds the probe/open pair for one path_id. An empty or
+// traversing path is refused outright — the export is naming a file it has no
+// business naming — and the refusal reaches the write path as the same
+// "bytes are not there" answer a truncated export gives, which is how it has
+// always been counted.
+func (ex *Export) attachmentBytes(pathID string) (func() (int64, error), func() (io.ReadSeekCloser, error)) {
+	if pathID == "" || strings.Contains(pathID, "..") {
+		refuse := fmt.Errorf("importer: unusable attachment path %q", pathID)
+		return func() (int64, error) { return 0, refuse },
+			func() (io.ReadSeekCloser, error) { return nil, refuse }
+	}
+	full := filepath.Join(ex.Dir, "uploads", pathID)
+	return func() (int64, error) {
+			fi, err := os.Stat(full)
+			if err != nil {
+				return 0, err
+			}
+			return fi.Size(), nil
+		}, func() (io.ReadSeekCloser, error) {
+			f, err := os.Open(full)
+			if err != nil {
+				return nil, err
+			}
+			return f, nil
+		}
+}
+
+// rewriteZulipUploads swaps /user_uploads/<path_id> links (relative or
+// absolute) for our managed-file URLs so imported content renders working
+// links. The scan is over the LANDED attachments for every message —
+// O(landed × messages) — which is the shape that shipped; a per-message link
+// index is a scale change, not a refactor, and belongs to whoever measures it.
+func rewriteZulipUploads(body string, pathByAttachment map[string]string, fileIDs map[string]int64) (string, bool) {
+	if len(fileIDs) == 0 || !strings.Contains(body, "/user_uploads/") {
+		return body, false
+	}
+	changed := false
+	for attachmentID, fileID := range fileIDs {
+		path := pathByAttachment[attachmentID]
+		if path == "" {
+			continue
+		}
+		needle := "/user_uploads/" + path
+		if strings.Contains(body, needle) {
+			body = strings.ReplaceAll(body, needle, fmt.Sprintf("/api/v1/files/%d", fileID))
+			changed = true
+		}
+	}
+	return body, changed
 }
 
 func readJSON(path string, v any) error {

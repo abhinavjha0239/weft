@@ -28,12 +28,22 @@ import (
 	"github.com/abhinavjha0239/weft/internal/platform/egress"
 )
 
-// importMessage writes a message the way the IMPORTER writes one — the real
-// insert shape from importer.go's message lane (source/ast/rendered/has_link
-// plus origin_system/origin_id), followed by a message.created event stamped
-// enum.ActorImporter. It is deliberately not a REST send: the whole point is
-// an event whose ONLY difference from a live send is its actor kind, so a pin
-// on it cannot pass for some incidental reason.
+// importMessage writes a message the way the IMPORTER writes one, followed by
+// a message.created event stamped enum.ActorImporter. It is deliberately not
+// a REST send: the whole point is an event whose ONLY difference from a live
+// send is its actor kind, so a pin on it cannot pass for some incidental
+// reason.
+//
+// The COLUMN LIST below is copied verbatim from the importer's channel
+// message lane (source/ast/rendered/has_link plus origin_system/origin_id)
+// and is what makes the resulting event indistinguishable from a real
+// backfill; P-27a's IR extraction left it byte for byte unchanged. The
+// CONTAINER is NOT copied: this lands in the channel's kind=2 root thread for
+// test convenience, and the importer never does that — its channel lane
+// always materializes a titled kind=1 thread, and since P-27a a channel
+// message with no thread is a hard error rather than a root landing. Nothing
+// here bumps a counter, so F-15 still holds; do not carry the container
+// choice back the other way.
 func importMessage(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	orgID, channelID int64, authorID int64, originID, src string) int64 {
 	t.Helper()
