@@ -299,6 +299,17 @@ func eventDepth(hint json.RawMessage) int {
 }
 
 func match(rl rule, ev eventlog.Row) bool {
+	// Backfill semantics (ADR-003 E4) — the same rule notification.Runner
+	// applies: imported history is HISTORY, not activity. Without this every
+	// imported message fires every enabled org-scope rule: one automation_run
+	// per imported message, plus post_message steps that mint ActorAutomation
+	// messages which DO notify (so "backfills never notify" fails
+	// transitively), plus http_request deliveries to third parties. It sits
+	// here rather than in the caller's loop so any future caller of match
+	// inherits it; the cost is one field compare per (rule, event).
+	if ev.ActorKind == enum.ActorImporter {
+		return false
+	}
 	if !triggerMatches(rl, ev) {
 		return false
 	}
