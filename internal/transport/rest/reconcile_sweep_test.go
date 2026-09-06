@@ -453,3 +453,190 @@ func TestReconcileIdleOrgSkip(t *testing.T) {
 		}
 	}
 }
+
+// TestReconcileSettleExpirySpread pins the PROPERTY that makes the settle
+// expiry safe at fleet scale: two orgs that settle at the SAME INSTANT must
+// not fall due in the same window.
+//
+// #128 recorded the cost of a flat TTL honestly — every org sharing one
+// deadline means a cell brought up at once settles together and therefore
+// expires together, paying one old-style full pass as a synchronised cohort
+// once per SettleTTL. This is that cohort being broken up, and the pin is
+// deliberately written against the property rather than the arithmetic: it
+// never names a bucket count or an offset, so retuning the spread leaves it
+// green while removing the spread turns it red.
+//
+// Two things are asserted, and the second is the one that keeps the spread
+// honest. The expiries must DIFFER — but they must differ EARLIER, never
+// later, because eventlog.SettleTTL's doc comment promises every org a full
+// verification at least once per SettleTTL and an offset in the other
+// direction would push some org's deadline straight through that promise.
+//
+// Time travel is a backdated settled_at, never a sleep: the probe walks the
+// effective age of an identical pair of markers upward and records the age at
+// which each org stops being suppressed, and the two ages are then fed back
+// into a REAL sweep to show the difference is load-bearing — at an age
+// between the two deadlines, one org's eventless drift is repaired while the
+// other's survives untouched.
+func TestReconcileSettleExpirySpread(t *testing.T) {
+	dbURL := os.Getenv("TEST_DATABASE_URL")
+	if dbURL == "" {
+		t.Skip("TEST_DATABASE_URL not set; skipping integration test")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	pool, err := pgxpool.New(ctx, dbURL)
+	if err != nil {
+		cancel()
+		t.Fatalf("connect: %v", err)
+	}
+	defer func() { cancel(); pool.Close() }()
+	resetAndMigrate(t, ctx, pool)
+
+	// Two independent orgs in one cell, each with a real channel, a real
+	// counter row and a real deliverability set for the sweeps to verify.
+	a := newSweepFixture(t, ctx, pool, "swpa")
+	b := newSweepFixture(t, ctx, pool, "swpb")
+	if a.orgID == b.orgID {
+		t.Fatalf("both fixtures landed on org %d; the pin needs two distinct orgs", a.orgID)
+	}
+
+	sweepBoth := func() {
+		t.Helper()
+		if err := a.msg.ReconcileUnreadOnce(ctx); err != nil {
+			t.Fatalf("unread sweep: %v", err)
+		}
+		if err := a.deliv.ReconcileOnce(ctx); err != nil {
+			t.Fatalf("deliverability sweep: %v", err)
+		}
+	}
+
+	// Settle both orgs. The first pass may legitimately repair (and so refuse
+	// to settle); the second runs against verified-clean state.
+	sweepBoth()
+	sweepBoth()
+	for _, f := range []*sweepFixture{a, b} {
+		high := orgHighWater(t, ctx, pool, f.orgID)
+		for _, sweep := range []string{messaging.UnreadCounterSweep.Name, notification.DeliverabilitySweep.Name} {
+			got, ok := settledMark(t, ctx, pool, sweep, f.orgID)
+			if !ok || got != high {
+				t.Fatalf("%s marker for org %d = %d (present=%v), want %d; the spread pin "+
+					"needs both orgs settled before it can time-travel their expiry",
+					sweep, f.orgID, got, ok, high)
+			}
+		}
+	}
+
+	// backdate puts EVERY settled marker in the cell at exactly the same age,
+	// so any difference in who is still suppressed comes from the org, never
+	// from when it settled.
+	backdate := func(age time.Duration) {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `
+			UPDATE sweep_org_state
+			SET settled_at = now() - make_interval(secs => $1::double precision)`,
+			age.Seconds()); err != nil {
+			t.Fatalf("backdate settle to age %s: %v", age, err)
+		}
+	}
+	// settledNow asks the PRODUCTION predicate (the same Sweeper.Orgs query
+	// both sweeps gate on) who is currently suppressed.
+	probe := eventlog.NewSweeper(pool, messaging.UnreadCounterSweep)
+	settledNow := func() map[int64]bool {
+		t.Helper()
+		orgs, err := probe.Orgs(ctx)
+		if err != nil {
+			t.Fatalf("sweep orgs: %v", err)
+		}
+		m := make(map[int64]bool, len(orgs))
+		for _, o := range orgs {
+			m[o.OrgID] = o.Settled
+		}
+		return m
+	}
+
+	// Walk the shared age upward and record, per org, the first age at which
+	// its marker stops suppressing work. The scan runs past SettleTTL so that
+	// an offset applied in the WRONG direction reports a real number instead
+	// of a missing map entry.
+	const step = 15 * time.Minute
+	dueAt := map[int64]time.Duration{}
+	for age := time.Duration(0); age <= eventlog.SettleTTL+4*time.Hour; age += step {
+		backdate(age)
+		for orgID, settled := range settledNow() {
+			prev, seen := dueAt[orgID]
+			switch {
+			case !settled && !seen:
+				dueAt[orgID] = age
+			case settled && seen:
+				t.Fatalf("org %d is suppressed again at age %s after falling due at %s; "+
+					"an expiry must be monotone in the age of the marker", orgID, age, prev)
+			}
+		}
+	}
+	if len(dueAt) != 2 {
+		t.Fatalf("%d of 2 orgs fell due within %s of settling, want both; an org that "+
+			"never expires has an effective TTL past SettleTTL, which breaks the "+
+			"\"every org is verified at least once per SettleTTL\" guarantee",
+			len(dueAt), eventlog.SettleTTL+4*time.Hour)
+	}
+
+	// The guarantee at the boundary: the spread moves expiries EARLIER only.
+	for orgID, due := range dueAt {
+		if due > eventlog.SettleTTL {
+			t.Fatalf("org %d only fell due at age %s, past SettleTTL (%s); the per-org "+
+				"offset must be SUBTRACTED — an offset that delays an expiry breaks the "+
+				"promise that every org is fully verified at least once per SettleTTL",
+				orgID, due, eventlog.SettleTTL)
+		}
+	}
+
+	// The spread itself: identical settled_at, different deadlines.
+	dueA, dueB := dueAt[a.orgID], dueAt[b.orgID]
+	if dueA == dueB {
+		t.Fatalf("orgs %d and %d settled at the SAME instant and both fall due at age "+
+			"%s; the settle expiry is not spread per org, so every org in a cell "+
+			"brought up together expires in one window and pays a full pass as a "+
+			"synchronised cohort", a.orgID, b.orgID, dueA)
+	}
+
+	// Which org is which is derived from the observation, not assumed: early
+	// is whichever one the probe says expires first.
+	early, late := a, b
+	dueEarly := dueA
+	if dueB < dueA {
+		early, late = b, a
+		dueEarly = dueB
+	}
+	backdate(dueEarly)
+	if st := settledNow(); st[early.orgID] || !st[late.orgID] {
+		t.Fatalf("at age %s org %d settled=%v and org %d settled=%v; want exactly the "+
+			"earlier org due", dueEarly, early.orgID, st[early.orgID], late.orgID, st[late.orgID])
+	}
+
+	// And the difference is load-bearing, not a number in a map: eventless
+	// drift (a counter change appends nothing, so neither org's high-water
+	// mark moves and the activity signal cannot see it) is repaired in the
+	// org whose lease has expired and survives in the org whose has not.
+	const bogus = 4242
+	early.seedDrift(t, ctx, bogus)
+	late.seedDrift(t, ctx, bogus)
+	backdate(dueEarly)
+	sweepBoth()
+	if u, _ := counterRow(t, ctx, pool, early.bobID, early.channelID); u != early.sent {
+		t.Fatalf("org %d passed its deadline at age %s but its drift was not repaired: "+
+			"counter = %d, want %d", early.orgID, dueEarly, u, early.sent)
+	}
+	assertLiveEquals(t, ctx, pool, early.bobID, early.channelID, early.sent)
+	if n := early.setRows(t, ctx); n != 1 {
+		t.Fatalf("org %d passed its deadline but holds %d set rows, want 1", early.orgID, n)
+	}
+	if u, _ := counterRow(t, ctx, pool, late.bobID, late.channelID); u != bogus {
+		t.Fatalf("org %d is still inside its effective TTL at age %s but was swept "+
+			"anyway: counter = %d, want the seeded %d untouched — the two orgs are "+
+			"sharing one deadline", late.orgID, dueEarly, u, bogus)
+	}
+	if n := late.setRows(t, ctx); n != 0 {
+		t.Fatalf("org %d is still inside its effective TTL but its deliverability drift "+
+			"was repaired: %d set rows, want the seeded 0", late.orgID, n)
+	}
+}
