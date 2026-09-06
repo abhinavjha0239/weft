@@ -69,6 +69,11 @@ type Report struct {
 	// never elevates or demotes a live user. Counted when the source role
 	// was anything above plain member.
 	RoleGrantsSkipped int `json:"role_grants_skipped_existing_users"`
+	// A source user MAPPED onto an account that already existed, rather than
+	// creating one. It is not a loss, but it is not a plain import either —
+	// the fidelity contract is that every source entity lands in exactly one
+	// bucket, and before this it landed in none, so a merge was invisible.
+	MatchedExistingByEmail int `json:"matched_existing_by_email"`
 	// The F-7 watermark marks everything up to the highest READ message as
 	// read; sparse unread gaps BELOW that point are coarsened away. Counted,
 	// never silent.
@@ -415,14 +420,32 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			rep.BotsSkipped++
 			continue
 		}
-		if existing, ok := emailToID[strings.ToLower(u.BestEmail())]; ok {
+		// The match key is the source email, lowercased — and an ABSENT email
+		// is NOT a key. Without this guard the first emailless user inserts
+		// email = '' and caches itself under "", so every LATER emailless user
+		// matches it: messages re-attributed, DM canonical keys merged, and no
+		// bucket incremented. The preload above selects `email IS NOT NULL`,
+		// but '' satisfies that, so the alias survived re-runs too. Zulip
+		// always supplies emails, which is why this stayed latent; Slack does
+		// not (its export's user records routinely lack one).
+		key := strings.ToLower(u.BestEmail())
+		if existing, ok := emailToID[key]; ok && key != "" {
 			// Email matches an existing account → map, never duplicate (D4).
 			userMap[u.ID] = existing
 			nameMap[u.FullName] = existing
+			rep.MatchedExistingByEmail++
 			if weftRole(u.Role) != 40 {
 				rep.RoleGrantsSkipped++
 			}
 			continue
+		}
+		// SQL NULL, never '': user_account_email_key is partial on
+		// `email IS NOT NULL`, so '' occupies a real unique slot (a second
+		// emailless user would collide) while NULL does not.
+		var email *string
+		if key != "" {
+			e := u.BestEmail()
+			email = &e
 		}
 		role := weftRole(u.Role)
 		var id int64
@@ -435,7 +458,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
 			DO NOTHING
 			RETURNING id`,
-			orgID, enum.UserImportedPlaceholder, u.BestEmail(), u.FullName, role,
+			orgID, enum.UserImportedPlaceholder, email, u.FullName, role,
 			ts(u.DateJoined), u.IsActive, originZulip, fmt.Sprint(u.ID)).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run: resolve by origin
 			if err := tx.QueryRow(ctx, `
@@ -449,7 +472,9 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ex *Export,
 			return fmt.Errorf("import user %d: %w", u.ID, err)
 		} else {
 			rep.Users++
-			emailToID[strings.ToLower(u.BestEmail())] = id
+			if key != "" {
+				emailToID[key] = id
+			}
 		}
 		userMap[u.ID] = id
 		nameMap[u.FullName] = id
