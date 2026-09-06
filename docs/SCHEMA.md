@@ -162,8 +162,12 @@ with its scale-tier replacement designed:
   stops suppressing work after `eventlog.SettleTTL` (24h), which is what
   bounds the drift classes the event log cannot see (writes that append no
   event — channel level, thread follow, alert words, the concurrent
-  first-ever mark-read). The rung, stated in time: an idle org costs nothing
-  for up to 24h, and EVERY org is fully verified at least once per 24h
+  first-ever mark-read). That expiry is SPREAD per org — the deadline is
+  `SettleTTL - (org_id % 8) * 1h`, subtracted so it can only move EARLIER —
+  because one flat TTL means a cell brought up together settles together and
+  therefore expires together, paying the full pass as a synchronised cohort.
+  The rung, stated in time: an idle org costs nothing for 17-24h depending on
+  its org id, and EVERY org is fully verified at least once per 24h
   regardless of activity.
 - ~~**NOTIFY per append**~~ — DONE (S4): the wake is coalesced per
   (transaction, org) by `event_log_wake` (0024) and folded into `Append`'s

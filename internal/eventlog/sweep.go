@@ -115,13 +115,15 @@ func (s *Sweeper) Claim(ctx context.Context) (release func(), ok bool, err error
 	}, true, nil
 }
 
-// SettleTTL bounds how long a settled marker may suppress work: once an org's
-// settle is older than this, the next pass walks it regardless of activity.
-// The guarantee a sweep can therefore state in TIME rather than in window
-// counts is
+// SettleTTL is the CEILING on how long a settled marker may suppress work:
+// once an org's settle is older than that org's own effective TTL — SettleTTL
+// minus a per-org spread offset, see settleSpreadBuckets — the next pass walks
+// it regardless of activity. The guarantee a sweep can therefore state in TIME
+// rather than in window counts is
 //
-//	an idle org costs nothing for up to SettleTTL, and EVERY org is fully
-//	verified at least once per SettleTTL no matter what it did.
+//	an idle org costs nothing for its own effective TTL (17-24h, spread by
+//	org id), and EVERY org is fully verified at least once per SettleTTL no
+//	matter what it did.
 //
 // It exists because the activity signal is the event log, and not every write
 // that can move a maintained cache appends an event: the settings legs of the
@@ -130,10 +132,47 @@ func (s *Sweeper) Claim(ctx context.Context) (release func(), ok bool, err error
 // an expiry, drift that entered an already-settled org through one of those
 // and then went quiet would sit there INDEFINITELY, which is not a word this
 // ledger may contain when the fix is one predicate. A day is the trade: at
-// the hourly cadence it leaves ~23 of every 24 windows free for an idle org
-// while holding worst-case repair latency to one day instead of "until
-// somebody posts".
+// the hourly cadence it leaves at worst 16 of every 17 windows free for an
+// idle org while holding worst-case repair latency to one day instead of
+// "until somebody posts".
 const SettleTTL = 24 * time.Hour
+
+// settleSpreadBuckets and settleSpreadSlot spread the settle EXPIRY across
+// orgs, so a fleet that settles together does not expire together. With one
+// flat TTL every org shares one deadline: the orgs of a cell brought up at
+// once settle in the same window, so SettleTTL later they ALL fall due in the
+// same window and the cell pays one old-style full pass as a synchronised
+// cohort — the exact thundering herd the idle-org skip exists to remove, just
+// 24x rarer. At the 100k-org target that is a predictable daily spike.
+//
+// An org's effective TTL is
+//
+//	SettleTTL - (org_id % settleSpreadBuckets) * settleSpreadSlot
+//
+// and the direction of that sign is the whole safety argument. ADDING an
+// offset would push some org's deadline PAST SettleTTL and break the
+// guarantee stated above; SUBTRACTING one keeps every org verified at least
+// once per SettleTTL and merely moves most of them earlier. Best case
+// (bucket 0) is exactly SettleTTL = 24h, worst case (bucket 7) is 17h.
+//
+// Why 8 slots of an hour. The slot IS the sweep tick: the reconcile cadence
+// is hourly (notification.reconcileInterval), so a spread finer than one tick
+// lands in the same window and buys nothing. The bucket count is the trade
+// between peak and total — an org in bucket k pays a forced pass every 24-k
+// hours instead of every 24, so B buckets cut the worst window B-fold while
+// multiplying the fleet's steady-state sweep cost by avg(24/(24-k)): 1.19x at
+// B=8, 1.35x at B=12, and 3.78x (the 24th harmonic number) at B=24, where the
+// last bucket's TTL has collapsed to a single hour and most of the ~24x
+// saving the skip bought has been handed back. Eight buys an 8x lower peak
+// for ~19% more total background work, with a worst case that is still
+// same-day.
+//
+// org ids come from a sequence, so a fleet created in bulk lands one org per
+// bucket round-robin; a hash would buy nothing at this granularity.
+const (
+	settleSpreadBuckets = 8
+	settleSpreadSlot    = time.Hour
+)
 
 // OrgPass is one org's pass-start snapshot: everything a sweep needs to
 // decide whether to walk the org at all, and what to record if the walk comes
@@ -147,9 +186,10 @@ type OrgPass struct {
 	// the next window redundant, never blind.
 	HighWater int64
 	// Settled is true when a previous pass verified this org clean at exactly
-	// HighWater, RECENTLY ENOUGH (within SettleTTL) — nothing has happened in
-	// the org since, and the forced-verification deadline has not arrived. The
-	// sweep skips it.
+	// HighWater, RECENTLY ENOUGH (within the org's effective TTL, which is
+	// SettleTTL less its spread offset) — nothing has happened in the org
+	// since, and the forced-verification deadline has not arrived. The sweep
+	// skips it.
 	Settled bool
 	// Lagging is true when the maintenance consumer has not reached
 	// HighWater. The pass should still repair, but must not settle: the
@@ -164,10 +204,13 @@ type OrgPass struct {
 // is state the system already maintains.
 //
 // The staleness term is what turns a settled marker from a permanent excuse
-// into a lease: a marker older than SettleTTL stops suppressing work, so a
-// full verification happens at least that often for EVERY org. Age is
-// measured in DATABASE time on both sides (settled_at is written with now()),
-// so no node's clock can extend another node's lease.
+// into a lease: a marker older than the org's effective TTL stops suppressing
+// work, so a full verification happens at least once per SettleTTL for EVERY
+// org. That TTL is per-org — SettleTTL less the spread offset, computed here
+// from o.id so orgs that settled together do not all fall due together (see
+// settleSpreadBuckets). Age is measured in DATABASE time on both sides
+// (settled_at is written with now()), so no node's clock can extend another
+// node's lease.
 func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 	rows, err := s.pool.Query(ctx, `
 		SELECT o.id,
@@ -175,7 +218,10 @@ func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 		       COALESCE(st.settled_event_id IS NOT NULL
 		                AND st.settled_event_id = COALESCE(h.high, 0)
 		                AND st.settled_at > now() - make_interval(
-		                        secs => $3::double precision), false),
+		                        secs => $3::double precision
+		                                - $4::double precision
+		                                  * (o.id % $5::bigint)::double precision),
+		                false),
 		       COALESCE(c.last_id, 0) < COALESCE(h.high, 0)
 		FROM org o
 		LEFT JOIN LATERAL (
@@ -183,7 +229,8 @@ func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 		) h ON true
 		LEFT JOIN sweep_org_state st ON st.sweep = $1 AND st.org_id = o.id
 		LEFT JOIN event_consumer_cursor c ON c.consumer = $2 AND c.org_id = o.id
-		ORDER BY o.id`, s.id.Name, s.id.Consumer, SettleTTL.Seconds())
+		ORDER BY o.id`, s.id.Name, s.id.Consumer, SettleTTL.Seconds(),
+		settleSpreadSlot.Seconds(), int64(settleSpreadBuckets))
 	if err != nil {
 		return nil, fmt.Errorf("eventlog: sweep %s orgs: %w", s.id.Name, err)
 	}
@@ -209,9 +256,10 @@ func (s *Sweeper) Orgs(ctx context.Context) ([]OrgPass, error) {
 // org whose next window must look again, and skipping repair of drift that
 // already exists is the one thing this marker must never cause.
 //
-// settled_at is stamped with DATABASE now() and is what SettleTTL ages, so
-// every settle also renews the org's lease: an org that keeps coming back
-// clean keeps being skipped, but never for longer than SettleTTL at a time.
+// settled_at is stamped with DATABASE now() and is what the effective TTL
+// ages, so every settle also renews the org's lease: an org that keeps coming
+// back clean keeps being skipped, but never for longer than its own effective
+// TTL — at most SettleTTL — at a time.
 func (s *Sweeper) Settle(ctx context.Context, orgID, highWater int64) error {
 	if _, err := s.pool.Exec(ctx, `
 		INSERT INTO sweep_org_state (sweep, org_id, settled_event_id, settled_at)

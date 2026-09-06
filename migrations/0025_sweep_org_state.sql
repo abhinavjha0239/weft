@@ -39,17 +39,23 @@
 -- suppressing work and the org is swept regardless of activity. What this
 -- table buys is therefore statable in TIME, not in window counts:
 --
---     an idle org costs nothing for up to SettleTTL, and EVERY org is fully
---     verified at least once per SettleTTL no matter what it did.
+--     an idle org costs nothing for its own effective TTL, and EVERY org is
+--     fully verified at least once per SettleTTL no matter what it did.
 --
 -- No free signal for those writes exists (channel_member carries no
 -- updated_at, alert_word no timestamp at all), and touching a shared per-org
 -- row on every settings write would buy an hour of latency with permanent
--- write contention — the trade the scale contract rejects. Recorded cost of
--- the expiry: orgs that settle in the same window expire in the same window,
--- so a fleet deployed at once pays one old-style full pass per SettleTTL as a
--- cohort; spreading expiry with a per-org offset is the one-line upgrade if
--- that ever matters.
+-- write contention — the trade the scale contract rejects.
+--
+-- The expiry is SPREAD across orgs rather than flat, which is why "effective
+-- TTL" above is per-org. With one shared deadline the orgs of a cell brought
+-- up at once settle in the same window and so expire in the same window,
+-- paying one old-style full pass as a synchronised cohort — the very
+-- thundering herd this table exists to remove, just 24x rarer. The deadline
+-- is SettleTTL less (org_id % 8) hours, subtracted so it can only move an
+-- expiry EARLIER: 17-24h by org id, and the "at least once per SettleTTL"
+-- guarantee above survives intact. See eventlog.settleSpreadBuckets for the
+-- peak-versus-total trade behind the bucket count.
 --
 -- Cell-safe: one row per (sweep, org), org-pinned like everything else. No
 -- cross-org state is introduced.
