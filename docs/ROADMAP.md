@@ -3191,6 +3191,22 @@ importer mapping of Zulip announcement-only streams → kind=4; the
 > fixed inline by a dispatcher: the channel-ref target, the email/NULL
 > rule, the read-state policy, the bot policy, and the pre-fetch layout.
 > The entry needs a re-spec, not a patch.
+>
+> **RE-SPEC DONE for the parts that had no blocked decisions
+> (2026-09-07).** A five-lens surface map against dev @ #140 confirmed
+> all seven structural claims above and falsified two others (see P-27a),
+> and the work is now split three ways:
+> - **P-27a — SPEC-READY**, the source-neutral IR extraction,
+>   behaviour-preserving by construction. Its test-guard prerequisite
+>   already landed in #140.
+> - **P-27c — SPEC-READY**, the dry-run reconciliation, split out
+>   BECAUSE it cannot be behaviour-preserving (`dry.Subscriptions` is
+>   empirically 10 against the write path's 3).
+> - **P-27b — still BLOCKED**, the Slack loader, holding four of the five
+>   design questions. The fifth (the email/NULL rule) was resolved as a
+>   shipped BUG FIX in #140, not as a spec decision.
+>
+> This entry stays as the audit record. Dispatch P-27a.
 
 **Grounding done.** Zulip ships a mature Slack importer —
 `~/Documents/zulip/zerver/data_import/slack.py` (1951 lines) +
@@ -3663,6 +3679,225 @@ knowledge. The remaining ADR-006 verbs still land with their features;
 the `create_channel` public/private/web-public split, Jira's own/all
 comment and attachment pairs, `rank_items`, and the DM verbs stay queued
 as their own slices; custom groups still have no API (P-3 governance).
+
+### P-27a `importer: Extract the source-neutral IR.` — L — ZERO migrations — **SPEC-READY (behaviour-preserving by construction; the dry-run reconciliation is deliberately SPLIT OUT as P-27c because it cannot be)**
+
+**What & why.** The importer's write path is *documented* as source-neutral
+(`ARCHITECTURE.md:27` — "source adapters → IR → domain writers"; the
+package doc says the same) and is not: it consumes a Zulip-shaped
+`Export`. P-27a makes those two shipped documentation claims true for the
+first time, so a second loader is a loader and not a second importer.
+
+**Grounded in a full surface map** (five parallel readers, every claim
+re-verified against dev @ #140, empirical probes run under `go test
+-overlay` with the repo untouched). The map confirmed all seven of the
+pre-flight audit's structural claims and **falsified two**, which is why
+this entry is shaped the way it is:
+- *"Dry/write parity is asserted by a test"* — **FALSE.** No such
+  assertion exists (the suite's only `reflect.DeepEqual` compares the
+  event census), and the two paths genuinely diverge. Corrected in
+  REALITY by #141 and split out below.
+- *"The group collision-rename loop is unexercised"* — **FALSE.** It is
+  executed by the showcase's own re-run, just never asserted — and it
+  emits a phantom rename, the same wart channels have.
+
+**THE SPLIT, and why it matters.** The audit recommended P-27a/P-27b.
+The surface map shows a THIRD piece hiding inside P-27a: the 161-line
+dry-run branch (`importer.go:175-335`) is a second Zulip-shaped consumer
+the write path never sees, and unifying it **cannot be a no-op** —
+`dry.Subscriptions` is empirically **10** against the write path's **3**,
+and no test in the repo says which is right. Bundling that into a
+"pure refactor" would make the refactor's central claim untrue.
+- **P-27a (this entry)** — behaviour-preserving. Nothing an operator can
+  observe changes.
+- **P-27c** (below) — the dry-run reconciliation, where changing an
+  observable number is the POINT rather than a side effect.
+- **P-27b** — the Slack loader, still blocked on its four design
+  decisions.
+
+**THE STOP RULE HAD TO CHANGE, because the old one was vacuous.** The
+first draft said "if a test needs editing, the refactor is not pure".
+The entire in-package suite touches only `New` and `Run`; no test
+references `Export`, `LoadZulipExport`, or any `zulip*` type, so **the
+whole extraction could land with zero test edits and prove nothing.**
+The rule is now: **no existing ASSERTION may change**, and C1 adds the
+assertions that make that mean something.
+
+---
+
+**C1 — TEST GUARD (test-only; lands first; green on unmodified dev).**
+The post-#140 guard is strong where it exists (per-verb event census,
+cross-chunk order, E3 stamps, the kind=2 group-DM lane, S6 unread seed,
+blob round-trip, row-count idempotency) and blind everywhere else. Add,
+all green today: channel-root F-15 counters (`message_count=0`,
+`last_activity_at IS NULL`, `root_message_id IS NULL` on all six roots —
+zero occurrences of `message_count` in the suite today); `channel.visibility`
+(1 vs 2 — never asserted); `user_account.deactivated_at` **polarity**
+(scanned at `importer_test.go:406` and never compared, so the
+`CASE WHEN $7` at `:457` is invertible invisibly); the `ImportedCounts`
+golden JSON (the only serialization, printed by the CLI); the event
+census **after the re-run** (all seven `Append` calls sit inside
+insert-succeeded branches, so hoisting one duplicates events on re-run,
+green today); table tests for `weftRole`/`roleGroup`/`zulipSystemGroup`
+(profile-confirmed uncovered rows — and these three functions ARE the
+Zulip semantic layer C3 moves); and broaden "the dry run writes nothing"
+beyond its single-table check to users, channels, dm_spaces, files and
+blob `Put`s. Widen the fixture so the loss buckets are observed NON-zero
+at least once: `StreamMessagesSkipped` and `ReactionsUnmapped` appear
+**zero times in the suite, even as names**, and `MatchedExistingByEmail`
+/ `RoleGrantsSkipped` are only ever asserted as 0 while the re-run
+actually produces 3 and 1.
+
+**C2 — THE F-15 KIND GATE (must precede any lane unification).** The
+bump at `importer.go:786-792` is unconditional and writes a third column
+no native bump touches (`root_message_id`). It is a no-op for Zulip today
+because the Zulip lane only writes kind=1 threads — but `root_message_id`
+in particular makes a message permanently unmovable (`messaging/move.go:51-54`
+does not filter by kind), so gate it on `kind = 1` BEFORE anything merges
+the channel and DM lanes. Pinned by C1's counter fence.
+
+**C3 — MOVE THE ZULIP SEMANTICS INTO THE LOADER (pure).** Move
+`weftRole` (input domain is literally Zulip's role ints), `zulipSystemGroup`,
+and `BestEmail` precedence into `zulip.go`. `roleGroup`, `nullableTime`
+and `finalize` are pure Weft and stay. Guarded by C1's table tests.
+
+**C4 — THE IR (the big commit).** One neutral top type; `write()` and its
+four helpers stop taking `*Export`. **Source ids become `string`, never
+`any`** — `any` turns the three `%d`-on-source-id sites (`:247`, `:297`,
+`:718`) into silent `%!d(string=C123)` corruption that `go vet` does NOT
+catch, where `string` makes it a compile error. Twelve of thirteen
+`origin_id` expressions collapse to pass-through; the thirteenth
+(`topic:%d:%s`, `:721`) must stay **byte-identical** or a post-upgrade
+re-import silently duplicates instead of counting `AlreadyImported`.
+`ts()` becomes loader-private (14 call sites). `zulipAttachment.Size` is
+parsed and never read — drop it. **No migration: `origin_id` is already
+`TEXT` on all six tables.**
+
+**Decisions, made here so no executor improvises them:**
+1. **Container binding: the IR carries per-message `{ContainerKind,
+   ContainerKey}` plus an explicit `[]Membership` and an explicit per-DM
+   participant list.** Zulip's recipient indirection has no Slack
+   analogue; resolving it in the loader deletes three write-path call
+   sites, two dry-run copies and `dmParticipants` outright. The cheaper
+   "re-key the indirection map to strings" keeps a Zulip concept in the
+   neutral layer and is rejected.
+2. **Message order is an EXPLICIT ordinal on the IR message**, not an
+   implicit "the loader emits them sorted". Four consumers depend on the
+   order and two are unpinned; more importantly Slack `ts` strings have
+   no `>` that means "later", so an implicit contract silently breaks at
+   P-27b.
+3. **The loader owns the markup dialect** and emits already-normalized
+   Weft markdown. One owner, per the LLD rule.
+4. **The loader owns upload-link rewriting too** (same seam as 3) and the
+   IR message carries an explicit `HasAttachment` rather than having the
+   write path infer it from a rewrite's boolean return.
+5. **Attachment bytes are an opaque per-attachment opener**, plus a cheap
+   existence/size probe so the dry run does not have to open every blob.
+   Record the pre-existing `Stat`/`Open` asymmetry (a directory at the
+   path passes `Stat` and then aborts the whole import on `io.Copy`)
+   as a gap; do not fix it here.
+6. **The IR exposes BOTH mention lanes** — by display name (Zulip's
+   content references names) and by source id (Slack's `<@U123>`).
+7. **The IR gets a `Meta map[string]any` affordance now and P-27a writes
+   NOTHING to it.** `origin_meta JSONB` exists on all six importer-written
+   tables with zero writers tree-wide; deciding the shape now stops
+   P-27b inventing one.
+8. **Slices, not iterators.** Streaming stays the recorded deferral it
+   already is.
+9. **`Report` gains a `source` field** (a two-source future cannot
+   otherwise tell which loader produced the JSON) and the Zulip-vocabulary
+   key `stream_messages_skipped_unmapped` is renamed to a neutral one.
+   **Operator-visible JSON change** — the only one in P-27a; it is
+   printed, never persisted, and pinned by no test.
+
+**C5 — ORIGIN TOKEN AS DATA.** Fourteen of sixteen references are
+provenance columns and are mechanical; the regression gate is free and
+strong — **17 `origin_system = 'zulip'` literals** in the suite stay
+green unedited if the Zulip loader supplies `"zulip"`. The two
+user-visible ones are the collision-rename suffixes (`:505`, `:604`),
+pinned by exact string at `importer_test.go:254-256`.
+
+**C6 — SOURCE SELECTOR: the self-describing IR.** The loader carries its
+own token, so **`Run`'s signature does not change in P-27a** and the CLI
+stays exactly as shipped; `import-slack` is entirely P-27b's. This keeps
+the blast radius outside the package at zero.
+
+---
+
+**Behaviour-preservation boundary — the things that would make this NOT a
+refactor, every one of them currently invisible to CI.** Unifying the
+channel and DM lanes before C2's kind gate lands. Flattening
+insert/conflict/resolve into a helper that bumps on the resolve path
+(double-counts every re-run). Hoisting any of the seven `eventlog.Append`
+calls out of their insert-succeeded branches (duplicates the whole event
+surface on re-run — the census never re-runs). Changing the Zulip message
+`origin_id` or the `topic:%d:%s` composite. Letting an IR field rename
+propagate into an event payload key that `gateway.go:995-1001` or
+`notification/runner.go:251-257` routes on. Replacing
+`GREATEST(last_activity_at, ts(...))` with the native `now()` while
+"unifying with the send path" — that destroys E3 for every imported
+thread. Tidying the org-wide `liveNames` preload or moving the rename
+computation after the conflict check (both change operator-visible
+`renamed_channels`). Typing the source id as `any`. **And do NOT treat
+coverage as any part of the no-op proof: deleting the dry-run branch
+would RAISE the number, and the 72% floor cannot see an untested new IR
+layer.**
+
+**Also do not "fix" while passing through** (each pre-existing, each
+recorded): the importer never sets `eventlog.MessageCreatedAtKey` while
+`unfurl` does — the absence is currently fail-closed; the attachment
+filename is written raw where the live upload path sanitizes; the direct
+`file_reference` write bypasses `files.AttachEntityReferences` (a
+documented LLD exception); the bot whole-skip rule and its transitive
+drops; the `O(n·m)` `strings.Contains` loop in the rewrite.
+
+**One manual sync point, not a code change.**
+`internal/transport/rest/backfill_side_effects_test.go` hand-copies the
+importer's message INSERT column list and its comment claims to be "the
+real insert shape from importer.go's message lane". The refactor can
+falsify that comment with nothing going red — re-read it at the end.
+
+**Gaps to record:** the CLI's closure-rebuild drain failure is silent
+(a FAILED job is treated as settled, the count is discarded, and the
+poller only claims `status = 1`, so an import whose rebuild failed prints
+success and exits 0) — two lines in `main.go`, its own slice, and a
+second source doubles the exposure; `cmd/weftd/` has no test files at all;
+Zulip's `is_web_public` / `history_public_to_subscribers` are not parsed,
+so visibility 3 and `history_mode 2` are never written.
+
+---
+
+### P-27c `importer: Reconcile the dry run with the write path.` — M — ZERO migrations — **SPEC-READY (the slice that is ALLOWED to change an observable number, which is why it is not part of P-27a)**
+
+**What & why.** The dry-run branch and the write path have drifted, and
+#141 recorded the divergence honestly rather than papering it: fixture
+`Subscriptions` reads **10 dry / 3 write**; a re-run reports full counts
+with `already_imported: 0` against all-zeros with `already_imported: 17`;
+a bot-authored message with unmappable reactions makes **six buckets
+disagree at once**; `StreamMessagesSkipped` and `ReactionsUnmapped` are
+**structurally dead** in the dry branch; `SystemGroupsMapped` increments
+on a different condition in each.
+
+**Decisions:**
+1. **A bucket means WHAT THE WRITE WOULD LAND**, not what the source
+   contains. That is the only reading an operator can act on, and it
+   moves `Subscriptions` from 10 to 3.
+2. **Both paths derive from ONE planner over the IR**, and the planner
+   takes a resolution context (existing origin keys, live names, the
+   email index) read-only. Without it "the dry run tells you what an
+   import will do" is true only for a virgin org — which is exactly when
+   nobody needs to ask.
+3. **Counting unit is unified** on what the planner projects; today dry
+   counts KEYS and write counts ROWS AFFECTED, which diverge whenever a
+   native watermark already sits at or above an imported one.
+4. The watermark reducer stops being a max-over-int64 source ids and uses
+   P-27a's explicit ordinal — a max over Slack `ts` strings is meaningless.
+
+**Red/green:** the pin is **equality of the two reports** over every
+bucket for the same fixture (the assertion that does not exist today),
+plus a NON-virgin-org case where dry predicts the re-run's
+`already_imported` correctly. RED: restore either path's private
+accounting → the equality assert fails on the bucket that drifted.
 
 ---
 
