@@ -325,69 +325,17 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 // loader produced the IR: the provenance token, the container binding, the
 // message order and the upload dialect all arrive as data.
 func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import, rep *Report) error {
-	// Collision maps are pre-loaded because a unique-violation ERROR aborts
-	// the whole transaction — all conflict handling happens in Go, and the
+	// The target org's current shape, read ONCE inside this transaction:
+	// the D4 email index, the live channel names the visible rename walks,
+	// and every group name (both the system-group mapping target and the
+	// group rename's collision set). Collision handling happens in Go
+	// because a unique-violation ERROR aborts the whole transaction — the
 	// only ON CONFLICT used is the origin index (idempotent re-runs).
-	emailToID := map[string]int64{}
-	rows, err := tx.Query(ctx, `
-		SELECT lower(email), id FROM user_account
-		WHERE org_id = $1 AND email IS NOT NULL`, orgID)
+	rc, err := loadResolution(ctx, tx, orgID, ir.Source)
 	if err != nil {
 		return err
 	}
-	for rows.Next() {
-		var email string
-		var id int64
-		if err := rows.Scan(&email, &id); err != nil {
-			rows.Close()
-			return err
-		}
-		emailToID[email] = id
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-	liveNames := map[string]bool{}
-	rows, err = tx.Query(ctx, `
-		SELECT lower(name) FROM channel
-		WHERE org_id = $1 AND archived_at IS NULL`, orgID)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var n string
-		if err := rows.Scan(&n); err != nil {
-			rows.Close()
-			return err
-		}
-		liveNames[n] = true
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	// Seeded role/system groups, for role grants and system-group mapping.
-	groupNameToID := map[string]int64{}
-	rows, err = tx.Query(ctx,
-		`SELECT lower(name), id FROM user_group WHERE org_id = $1`, orgID)
-	if err != nil {
-		return err
-	}
-	for rows.Next() {
-		var n string
-		var id int64
-		if err := rows.Scan(&n, &id); err != nil {
-			rows.Close()
-			return err
-		}
-		groupNameToID[n] = id
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return err
-	}
+	emailToID, liveNames, groupNameToID := rc.emailToID, rc.liveNames, rc.groupNameToID
 
 	// --- Users (ADR-001 D4: unmatched authors become claimable deactivated
 	// placeholders; existing emails are matched, not duplicated). Source
