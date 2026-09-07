@@ -203,6 +203,100 @@ func TestFannedRowCarriesACLColumns(t *testing.T) {
 	}
 }
 
+// TestSpaceViewFailsClosed pins the fail-closed defaults of the SHARED space
+// view, which is where hoisting the set to the org shard could most easily have
+// reopened the hole #132 closed.
+//
+// It is a pure-logic unit test because the states it pins are ones a real
+// connection passes through for microseconds, or reaches only when the database
+// says no: registered-before-its-org's-view-loaded, and load-failed. Both must
+// WITHHOLD every space-scoped event rather than fall through to the org-wide
+// branch. Nothing here is mocked — spaceView and client.filter are the real
+// types, and the integration proof that a guest holds exactly this state lives
+// in TestGatewaySharedSpaceSet against real Postgres and real sockets.
+//
+// RED: make spaceView.visible answer true on a nil receiver, or
+// spaceView.itemSecurity answer false on one — each has its own assert below.
+func TestSpaceViewFailsClosed(t *testing.T) {
+	const space, other = int64(7), int64(8)
+	item := eventRow{verb: "workitem.created", entityType: enum.EntityWorkItem,
+		payload: json.RawMessage(`{"space_id":7,"item_id":1}`)}
+	otherItem := eventRow{verb: "workitem.created", entityType: enum.EntityWorkItem,
+		payload: json.RawMessage(`{"space_id":8,"item_id":2}`)}
+	sprint := eventRow{verb: "sprint.created", entityType: enum.EntitySprint,
+		payload: json.RawMessage(`{"space_id":7,"sprint_id":1}`)}
+	orgWide := eventRow{verb: "emoji.created", entityType: enum.EntityEmoji,
+		payload: json.RawMessage(`{"name":"party"}`)}
+
+	// NO VIEW. One state, three ways in: a connection registered before its
+	// org's view loaded, a connection whose load failed, and every GUEST —
+	// which is the whole reason the guest restriction could move out of the SQL
+	// without adding a role branch to filter.
+	blind := &client{}
+	if blind.filter(item).deliver || blind.filter(sprint).deliver {
+		t.Fatal("a connection with no space view delivered a space-scoped event: " +
+			"not-yet-loaded must WITHHOLD, never fall through to the org-wide fan")
+	}
+	if !blind.filter(orgWide).deliver {
+		t.Fatal("a connection with no space view stopped delivering a genuinely " +
+			"org-wide event; the withholding must be no wider than the space gate")
+	}
+
+	// LOADED, no item security: the positive anchor. Without it every negative
+	// above would be satisfied by a filter that simply delivered nothing.
+	open := &client{spaces: &spaceView{spaces: map[int64]bool{space: true}}}
+	if !open.filter(item).deliver || !open.filter(sprint).deliver {
+		t.Fatal("a loaded view withheld events for a Space it contains")
+	}
+	if open.filter(otherItem).deliver {
+		t.Fatalf("an event for Space %d was delivered against a view that does not contain it", other)
+	}
+
+	// LOADED with item security: work items are withheld wholesale (there is no
+	// evaluator for visibility_scope.rule) while space events that cannot carry
+	// a scope keep flowing — the blackout stays as narrow as the hook.
+	secured := &client{spaces: &spaceView{
+		spaces: map[int64]bool{space: true}, itemSecurityActive: true}}
+	if secured.filter(item).deliver {
+		t.Fatal("a work-item event was delivered while the org defines a visibility_scope")
+	}
+	if !secured.filter(sprint).deliver {
+		t.Fatal("item security blacked out a NON-work-item space event")
+	}
+
+	// The refresh signal is the announced Space ID, not a bare flag: that is
+	// what lets the org load its view ONCE per new Space instead of once per
+	// connection, and what keeps a resume lane replaying old space.created
+	// events from loading at all.
+	created := eventRow{verb: "space.created", entityType: enum.EntitySpace,
+		payload: json.RawMessage(`{"space_id":7}`)}
+	if got := blind.filter(created).newSpace; got != space {
+		t.Fatalf("space.created reported newSpace=%d, want %d: the org would reload "+
+			"its view on every announcement, or never", got, space)
+	}
+	if blind.filter(created).deliver {
+		t.Fatal("space.created was delivered to a connection whose view does not yet " +
+			"contain it; the envelope is decided against the PRE-refresh view")
+	}
+
+	// visible doubles as the single-flight test the space.created refresh uses
+	// (Hub.refreshSpaceView): a view that already holds the announced Space is
+	// accepted as-is — which is what makes ONE space.created cost ONE query for
+	// the whole org — and one that does not must force the reload.
+	var none *spaceView
+	if none.visible(space) {
+		t.Fatal("a nil view accepted a Space: the org would never issue the load and " +
+			"every connection would withhold forever")
+	}
+	loaded := &spaceView{spaces: map[int64]bool{space: true}}
+	if !loaded.visible(space) {
+		t.Fatal("a loaded view rejected a Space it holds: the reload would run per connection")
+	}
+	if loaded.visible(other) {
+		t.Fatalf("a view without Space %d accepted it: a new Space would never be picked up", other)
+	}
+}
+
 type stubHub struct {
 	hub     *Hub
 	shard   *orgShard
