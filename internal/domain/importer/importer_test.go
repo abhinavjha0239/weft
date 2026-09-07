@@ -210,6 +210,23 @@ func TestZulipImportShowcase(t *testing.T) {
 		dry.Threads != 3 || dry.Messages != 4 || dry.Reactions != 2 {
 		t.Fatalf("dry-run report off: %+v", dry)
 	}
+	// Subscriptions is the bucket this reconciliation moved, and this is the
+	// number it moved TO. The export holds TEN zerver_subscription rows; three of them
+	// become channel_member rows (one is inactive, and six are type-3 huddle
+	// rows, which are DM participation and not channel membership). The dry
+	// run used to answer 10 — the row count of a Zulip table — which is not
+	// something an operator can act on, and was asserted nowhere.
+	// TestDryRunPredictsTheWrite carries the general form of this claim over
+	// every bucket; here it is the one number by name.
+	if dry.Subscriptions != 3 {
+		t.Fatalf("dry-run subscriptions = %d, want 3 (what the write LANDS, not "+
+			"what the export contains)", dry.Subscriptions)
+	}
+	// And the dry run predicts the visible transform too, because it reads the
+	// org's live channel names. The bootstrap #general is what it collides with.
+	if got := dry.RenamedChannels["general"]; got != "general-zulip1" {
+		t.Fatalf("dry-run rename = %q, want general-zulip1", got)
+	}
 	// Edits: hamlet's attributed entry imports; the null-editor entry is a
 	// counted skip. The attachment's bytes are present on disk.
 	if dry.MessageEdits != 1 || dry.EditEntriesSkipped != 1 ||

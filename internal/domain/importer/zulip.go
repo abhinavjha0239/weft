@@ -3,11 +3,10 @@
 // idempotent writes with backdated timestamps (E3).
 //
 // The IR lives in ir.go and the write path consumes ONLY it, so a second
-// source is a loader and not a second importer. One caveat, deliberate and
-// tracked as P-27c: the DRY-RUN accounting has not moved onto the IR yet. It
-// still reads this file's Zulip structures, and it disagrees with the write
-// path about what several buckets mean — reconciling those numbers changes
-// what an operator sees, which is a different slice from a refactor.
+// source is a loader and not a second importer. Nothing outside this file is
+// Zulip-shaped any more: the dry run and the write path share one planner
+// (plan.go) over the IR, so a bucket has one meaning — what the write would
+// LAND in THIS org — and one implementation.
 //
 // LLD note (ARCHITECTURE.md exception, tracked in REALITY.md): the importer
 // writes owning-module tables directly in backfill mode. ADR-003 E4's

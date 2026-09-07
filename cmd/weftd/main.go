@@ -120,7 +120,7 @@ func importZulip(ctx context.Context, cfg config.Config) error {
 	fs := flag.NewFlagSet("import-zulip", flag.ExitOnError)
 	orgSlug := fs.String("org", "", "target org slug (must exist)")
 	dir := fs.String("dir", "", "unpacked Zulip export directory")
-	dryRun := fs.Bool("dry-run", false, "report fidelity without writing")
+	dryRun := fs.Bool("dry-run", false, "report what this import would do, without writing")
 	_ = fs.Parse(os.Args[2:])
 	if *orgSlug == "" || *dir == "" {
 		return fmt.Errorf("import-zulip: -org and -dir are required")

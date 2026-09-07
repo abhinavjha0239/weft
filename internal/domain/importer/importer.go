@@ -6,8 +6,6 @@ import (
 	"encoding/hex"
 	"fmt"
 	"io"
-	"os"
-	"path/filepath"
 	"sort"
 	"strings"
 	"time"
@@ -124,200 +122,55 @@ func roleGroup(role int16) string {
 
 // Run imports an unpacked Zulip export into an existing org. Idempotent:
 // every entity upserts by (org, origin_system, origin_id); re-runs count
-// AlreadyImported instead of duplicating (ADR-001 D5). dryRun parses and
-// reports without writing.
+// AlreadyImported instead of duplicating (ADR-001 D5).
 //
-// One transaction for atomicity (an import is all-or-nothing); chunked
-// streaming per messages file is the scale-tier follow-up for multi-GB
-// exports and keeps this exact call shape.
+// dryRun answers the same question WITHOUT writing: it loads the same
+// resolution context, builds the same plan, and returns the plan's report.
+// Both modes therefore produce one number per bucket from one implementation,
+// which is what makes "the dry run tells you what this import will do" a
+// checkable claim instead of a hopeful one — and it is only true because the
+// plan is taken against the REAL org, so a re-run's dry pass says
+// "already_imported" exactly where the write would.
+//
+// One transaction for atomicity (an import is all-or-nothing); the dry run
+// uses one too, for a consistent snapshot of an org other people are using.
+// Chunked streaming per messages file is the scale-tier follow-up for
+// multi-GB exports and keeps this exact call shape.
 func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool) (Report, error) {
 	ex, err := LoadZulipExport(dir)
 	if err != nil {
 		return Report{}, err
 	}
-	rep := Report{Source: ex.Source, DryRun: dryRun,
-		RenamedChannels: map[string]string{}, RenamedGroups: map[string]string{}}
+	ir := ex.toImport()
 
-	// Dry-run: pure accounting pass (no DB — collision renames and
-	// existing-user role skips are only knowable at write time).
-	//
-	// This branch is deliberately STILL Zulip-shaped, and is the last thing
-	// in the module that is. Moving it onto the IR cannot be behaviour
-	// preserving — Subscriptions alone reads 10 here against the write
-	// path's 3, because this counts what the export CONTAINS and the write
-	// path counts what LANDS — so reconciling the two is its own slice
-	// (P-27c), where changing an operator-visible number is the point rather
-	// than a side effect of a refactor.
 	if dryRun {
-		bots := map[int64]bool{}
-		for _, u := range ex.Users {
-			if u.IsBot {
-				rep.BotsSkipped++
-				bots[u.ID] = true
-			} else {
-				rep.Users++
+		var rep Report
+		err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+			rc, err := loadResolution(ctx, tx, orgID, ir.Source)
+			if err != nil {
+				return err
 			}
+			pl, err := newPlan(ir, rc)
+			if err != nil {
+				return err
+			}
+			rep = pl.rep
+			return nil
+		})
+		if err != nil {
+			return Report{}, err
 		}
-		rep.Channels = len(ex.Streams)
-		humans := map[int64]bool{}
-		for _, u := range ex.Users {
-			if !u.IsBot {
-				humans[u.ID] = true
-			}
-		}
-		// DM tkeys feed the watermark accounting below; a conversation with
-		// any non-human participant is skipped whole (write-path rule).
-		dmTkey := map[int64]string{}
-		dmConvos := map[string]bool{}
-		topics := map[string]bool{}
-		for _, m := range ex.Messages {
-			if _, ok := ex.StreamByRecipient[m.Recipient]; !ok {
-				ids, ok := dmParticipants(ex, m)
-				allHuman := ok && humans[m.Sender]
-				if ok {
-					for _, id := range ids {
-						if !humans[id] {
-							allHuman = false
-							break
-						}
-					}
-				}
-				if !ok || !allHuman {
-					rep.DMMessagesSkipped++
-					continue
-				}
-				parts := make([]string, len(ids))
-				for i, id := range ids {
-					parts[i] = fmt.Sprint(id)
-				}
-				key := "dm:" + strings.Join(parts, ":")
-				dmTkey[m.ID] = key
-				if !dmConvos[key] {
-					dmConvos[key] = true
-					rep.DMConversations++
-				}
-				rep.DMMessages++
-				for _, e := range parseEditHistory(m.EditHistory) {
-					if e.PrevContent == nil {
-						continue
-					}
-					if e.UserID == nil || !humans[*e.UserID] {
-						rep.EditEntriesSkipped++
-					} else {
-						rep.MessageEdits++
-					}
-				}
-				continue
-			}
-			rep.Messages++
-			for _, e := range parseEditHistory(m.EditHistory) {
-				if e.PrevContent == nil {
-					continue
-				}
-				if e.UserID == nil || !humans[*e.UserID] {
-					rep.EditEntriesSkipped++
-				} else {
-					rep.MessageEdits++
-				}
-			}
-			topics[fmt.Sprintf("%d\x00%s", ex.StreamByRecipient[m.Recipient], m.Subject)] = true
-		}
-		rep.Threads = len(topics)
-		rep.Reactions = len(ex.Reactions)
-		rep.Subscriptions = len(ex.Subscriptions)
-		for _, a := range ex.Attachments {
-			if a.PathID == "" || strings.Contains(a.PathID, "..") {
-				rep.AttachmentFilesMissing++
-				continue
-			}
-			if _, err := os.Stat(filepath.Join(ex.Dir, "uploads", a.PathID)); err != nil {
-				rep.AttachmentFilesMissing++
-			} else {
-				rep.Attachments++
-			}
-		}
-		// Groups: mirror the write-path mapping (system → seeded, fullmembers
-		// coarsening → potential self-edges dropped) without touching the DB.
-		sysWeft := map[int64]string{}
-		custom := map[int64]bool{}
-		for _, g := range ex.NamedGroups {
-			if g.IsSystem {
-				if wname := zulipSystemGroup(g.Name); wname != "" {
-					sysWeft[g.ID] = wname
-					rep.SystemGroupsMapped++
-				}
-				continue
-			}
-			custom[g.ID] = true
-			rep.Groups++
-		}
-		for _, m := range ex.GroupMembers {
-			if custom[m.UserGroup] && !bots[m.UserProfile] {
-				rep.GroupMembers++
-			}
-		}
-		for _, e := range ex.GroupEdges {
-			superSys, superOK := sysWeft[e.Supergroup]
-			subSys, subOK := sysWeft[e.Subgroup]
-			mapped := (superOK || custom[e.Supergroup]) && (subOK || custom[e.Subgroup])
-			selfEdge := superOK && subOK && superSys == subSys
-			if mapped && !selfEdge {
-				rep.GroupEdges++
-			}
-		}
-		// Read watermarks: source ids are imported in order, so
-		// max-by-source-id selects the same message the write pass lands on.
-		msgTkey := map[int64]string{}
-		for _, m := range ex.Messages {
-			if sid, ok := ex.StreamByRecipient[m.Recipient]; ok {
-				msgTkey[m.ID] = fmt.Sprintf("%d\x00%s", sid, m.Subject)
-			} else if tk, ok := dmTkey[m.ID]; ok {
-				msgTkey[m.ID] = tk
-			}
-		}
-		type drk struct {
-			user int64
-			tkey string
-		}
-		dmax := map[drk]int64{}
-		for _, um := range ex.UserMessages {
-			if um.FlagsMask&umReadFlag == 0 || bots[um.UserProfile] {
-				continue
-			}
-			tk, ok := msgTkey[um.Message]
-			if !ok {
-				continue
-			}
-			k := drk{um.UserProfile, tk}
-			if um.Message > dmax[k] {
-				dmax[k] = um.Message
-			}
-		}
-		rep.Watermarks = len(dmax)
-		for _, um := range ex.UserMessages {
-			if um.FlagsMask&umReadFlag != 0 || bots[um.UserProfile] {
-				continue
-			}
-			tk, ok := msgTkey[um.Message]
-			if !ok {
-				continue
-			}
-			if wm, ok := dmax[drk{um.UserProfile, tk}]; ok && um.Message < wm {
-				rep.ReadCoarsened++
-			}
-		}
-		rep.finalize()
+		rep.DryRun = true
 		return rep, nil
 	}
 
-	ir := ex.toImport()
-	err = db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
+	rep := Report{Source: ir.Source, DryRun: false,
+		RenamedChannels: map[string]string{}, RenamedGroups: map[string]string{}}
+	if err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
 		return s.write(ctx, tx, orgID, ir, &rep)
-	})
-	if err != nil {
+	}); err != nil {
 		return Report{}, err
 	}
-	rep.finalize()
 	return rep, nil
 }
 

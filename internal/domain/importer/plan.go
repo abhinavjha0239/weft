@@ -614,7 +614,7 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 			threadID[m.Thread.Key] = thID
 		}
 		if id, ok := rc.messages[m.SourceID]; ok {
-			msgLanding[m.SourceID] = landing{id: id}
+			msgLanding[m.SourceID] = landing{id: id, ordinal: m.Ordinal}
 			msgThread[m.SourceID] = thID
 			rep.AlreadyImported++
 			continue // a re-run imports no edits: the message row is not new
@@ -703,7 +703,7 @@ func (pl *plan) planDirectMessage(m *Message, rc *resolution, convByKey map[stri
 		dmCache[key] = info
 	}
 	if id, ok := rc.messages[m.SourceID]; ok {
-		msgLanding[m.SourceID] = landing{id: id}
+		msgLanding[m.SourceID] = landing{id: id, ordinal: m.Ordinal}
 		msgThread[m.SourceID] = info.threadID
 		rep.AlreadyImported++
 		return
