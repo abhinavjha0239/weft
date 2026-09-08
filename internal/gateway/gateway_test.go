@@ -215,8 +215,11 @@ func TestFannedRowCarriesACLColumns(t *testing.T) {
 // types, and the integration proof that a guest holds exactly this state lives
 // in TestGatewaySharedSpaceSet against real Postgres and real sockets.
 //
-// RED: make spaceView.visible answer true on a nil receiver, or
-// spaceView.itemSecurity answer false on one — each has its own assert below.
+// RED: make spaceView.visible answer true on a nil receiver; make
+// spaceView.itemSecurity answer false on one; make it answer false always —
+// each has its own assert below, and the nil-itemSecurity one is asserted on
+// the method rather than on a delivery outcome precisely because the space gate
+// already withholds there, so a delivery assert could not go red.
 func TestSpaceViewFailsClosed(t *testing.T) {
 	const space, other = int64(7), int64(8)
 	item := eventRow{verb: "workitem.created", entityType: enum.EntityWorkItem,
@@ -288,12 +291,63 @@ func TestSpaceViewFailsClosed(t *testing.T) {
 		t.Fatal("a nil view accepted a Space: the org would never issue the load and " +
 			"every connection would withhold forever")
 	}
+	// itemSecurity on a nil view is DEFENCE IN DEPTH, not a path filter can
+	// reach today — visible() withholds first — so it is asserted DIRECTLY
+	// rather than through a delivery outcome that would pass whatever this
+	// answered. It is the structural replacement for client's old
+	// `itemSecurityActive: true` seed, and what stops a future reordering of
+	// the two gates from turning "no view" into "deliver every work item".
+	if !none.itemSecurity() {
+		t.Fatal("a nil space view reported item security INACTIVE; a view that cannot " +
+			"answer must withhold work-item events, not wave them through")
+	}
 	loaded := &spaceView{spaces: map[int64]bool{space: true}}
 	if !loaded.visible(space) {
 		t.Fatal("a loaded view rejected a Space it holds: the reload would run per connection")
 	}
 	if loaded.visible(other) {
 		t.Fatalf("a view without Space %d accepted it: a new Space would never be picked up", other)
+	}
+}
+
+// TestSpaceViewLivesOnTheOrgShard pins WHERE the shared space view is kept.
+// One org's set must never be readable through another org's shard, and the
+// only structural guarantee of that is that the view is shard state — a hub
+// field, a package-level memo or a map keyed by anything but the org would all
+// compile and would all hand org A's Spaces to org B.
+//
+// It exists because the end-to-end two-org subtest in TestGatewaySharedSpaceSet
+// CANNOT reproduce that shape deterministically: the connect-time freshness
+// rule makes every registering connection load through its OWN shard, and Space
+// ids are globally unique so the space.created refresh always reloads too. So
+// the behavioural claim (org two's item security must not reach org one) is
+// pinned there, and the placement claim is pinned here.
+//
+// No pool is needed and none is used: the predicate accepts whatever the shard
+// already holds, so orgSpaceView answers from state and never queries. The
+// nil pool is itself part of the pin — a version that reached the database here
+// would panic rather than pass.
+//
+// RED: cache the view on the Hub (or anywhere else shared) instead of the
+// orgShard — the first assert fires with "(<nil>, <nil>)", i.e. the view is no
+// longer where the org's own shard can find it.
+func TestSpaceViewLivesOnTheOrgShard(t *testing.T) {
+	h := NewHub(nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	a := &orgShard{orgID: 1}
+	b := &orgShard{orgID: 2}
+	viewA := &spaceView{spaces: map[int64]bool{11: true}}
+	a.spaces.Store(viewA)
+	anything := func(*spaceView) bool { return true }
+
+	got, err := h.orgSpaceView(context.Background(), a, anything)
+	if err != nil || got != viewA {
+		t.Fatalf("a view stored on an org's own shard read back as (%v, %v); the shared "+
+			"view must live on the shard, not anywhere hub-wide", got, err)
+	}
+	got, err = h.orgSpaceView(context.Background(), b, anything)
+	if err != nil || got != nil {
+		t.Fatalf("a shard holding no space view answered with %v (%v): one org's Space "+
+			"set must never be reachable through another org's shard", got, err)
 	}
 }
 
