@@ -13,6 +13,14 @@
 // catch-up (the per-connection pump) only until it reaches the head, then joins
 // the live lane; the per-connection query survives for the resume gap alone.
 //
+// The ACL STATE those filters read is placed by the same rule. What is
+// per-USER — channel membership, DM participation, the protected-history floor
+// — is held per connection and refreshed by events about that user. What is
+// per-ORG — the space-visibility set and the item-security flag — is held ONCE
+// on the org shard (see spaceView) and shared by that org's connections, so a
+// new Space costs the org ONE query rather than one per connection, and
+// resident state is O(spaces) rather than O(connections x spaces).
+//
 // Both lanes read through the event-feed seam (eventlog.Tail, P-45), so the
 // operator's driver choice reaches live fan-out too. Under the commit-ordered
 // logical driver an event with a LOWER id can legitimately arrive AFTER a
@@ -29,10 +37,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/coder/websocket"
@@ -95,13 +105,56 @@ type client struct {
 	// creator). Loaded and refreshed with `channels` by loadChannels, so the
 	// same membership events that widen the view also carry the floor.
 	historyFloor map[int64]time.Time
-	// spaces is the connection's space-visibility set — the third container
-	// view, loaded and refreshed exactly like channels/dms. Space-scoped
-	// events (space, work item, sprint, field def) have no channel or DM to
-	// gate on and used to fan ORG-WIDE; they now resolve their space against
-	// this set. Empty for a guest (P-5: a guest sees nothing beyond their own
-	// channels), which is what lets guests ride the SAME predicate with no
-	// role branch in filter.
+	// spaces is this connection's handle on the ORG's shared space-visibility
+	// view (orgShard.spaces) — the third container view. Space-scoped events
+	// (space, work item, sprint, field def) have no channel or DM to gate on
+	// and used to fan ORG-WIDE; they resolve their space against this view.
+	//
+	// It is a POINTER to per-org state, not a per-connection set, because the
+	// answer is per-ORG: see spaceView. nil means "this connection may resolve
+	// no Space at all" and covers BOTH withholding cases with one predicate —
+	// a GUEST, who is never handed the shared view (P-5: a guest sees nothing
+	// beyond their own channels), and a connection whose view has not loaded
+	// yet or failed to load. That is what keeps filter free of a role branch
+	// and fail-closed by construction (see spaceView's nil-receiver methods).
+	//
+	// Written only by this connection's own goroutine (Serve's attach and
+	// deliverShared's refresh), exactly like channels/dms; the view it points
+	// at is immutable once published, so sharing it across the org's
+	// connections needs no lock on the read path.
+	spaces *spaceView
+	// Inbound signal-frame budget (typing storms, abuse).
+	frameLimit *rate.Limiter
+	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
+	writeMu sync.Mutex
+}
+
+// spaceView is ONE org's space-visibility answer, shared by every non-guest
+// connection in that org and owned by the org shard.
+//
+// It is per-ORG rather than per-connection because the query that produces it
+// has exactly two inputs — the org id and whether the reader is a guest — and
+// so has exactly two possible answers in an org: the full set (non-guest) or
+// nothing at all (guest, P-5). Spaces are org-visible in the v1 worktrack
+// slice (see its package doc), so there is no per-user narrowing to represent.
+// Holding it once per org instead of once per connection is what turns one
+// space.created in an org with N live connections from N space queries into
+// ONE, and resident state from O(connections x spaces) into O(spaces).
+//
+// A view is IMMUTABLE once published: a change builds a whole new view and
+// swaps the shard's pointer, so a connection reading it needs no lock and can
+// never observe a half-updated set. Archival is deliberately not filtered — it
+// is a lifecycle state, not an ACL state, and REST still reads an archived
+// space's items.
+//
+// NIL IS THE WITHHOLDING ANSWER, and the methods below are written on a nil
+// receiver so that every way of not having a view — a guest, a view that has
+// not loaded yet, a view whose load failed — resolves through the SAME
+// predicate in filter, with no role branch and no fall-through to the org-wide
+// fan. That fall-through is the hole #132 closed, so it is expressed in the
+// type rather than left to a caller to remember.
+type spaceView struct {
+	// spaces is the org's Space ids. Read-only after publication.
 	spaces map[int64]bool
 	// itemSecurityActive reports whether this org defines ANY visibility_scope
 	// (P-4 item security). work_item.security_scope_id can only reference such
@@ -110,12 +163,35 @@ type client struct {
 	// which items it covers without a per-event query — and it has no
 	// evaluator for visibility_scope.rule at all — so every work-item event is
 	// withheld: an unresolvable scope must never fall through to org-wide
-	// delivery. Defaults to true (withhold) so a partial load fails closed.
+	// delivery.
+	//
+	// Unlike the space set this flag has NO refresh verb — nothing in the
+	// product writes visibility_scope yet (P-4 owns that, and must emit one) —
+	// so the only way a connection learns it flipped is a fresh read. That is
+	// what the connect-time freshness rule in Hub.attachSpaceView exists for:
+	// reconnecting is the documented recovery, and sharing a cached view across
+	// connects would have quietly removed it.
 	itemSecurityActive bool
-	// Inbound signal-frame budget (typing storms, abuse).
-	frameLimit *rate.Limiter
-	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
-	writeMu sync.Mutex
+	// startedAt is when the load that produced this view BEGAN. It is the
+	// connect-time freshness test (see Hub.attachSpaceView): a registering
+	// connection may reuse a shared view only if that view's read started after
+	// the connection did, so it can never inherit an answer sampled before a
+	// change it should see. Set by Hub.orgSpaceView, never read by the ACL.
+	startedAt time.Time
+}
+
+// visible reports whether the holder of this view may resolve spaceID. A nil
+// view resolves nothing: a guest, and a connection registered before its org's
+// view loaded, both withhold every space-scoped event.
+func (v *spaceView) visible(spaceID int64) bool {
+	return v != nil && v.spaces[spaceID]
+}
+
+// itemSecurity reports whether work-item events must be withheld wholesale. A
+// nil view answers YES — the same seeding the per-connection flag had, now
+// structural: a partial or missing load can only ever under-deliver.
+func (v *spaceView) itemSecurity() bool {
+	return v == nil || v.itemSecurityActive
 }
 
 // feedBuffer bounds how many multicast batches may queue for one connection
@@ -197,6 +273,26 @@ type orgShard struct {
 	// stop ends the reader goroutine when the shard is dropped (last connection
 	// leaves) or the hub shuts down.
 	stop context.CancelFunc
+	// spaces is the ORG's shared space-visibility view (see spaceView), held
+	// once here instead of once per connection. Atomic rather than under mu
+	// because it is read on the delivery path by every connection in the org
+	// and mu is the fan lock: a shard lock taken per space-scoped event would
+	// put 100k connections back in each other's way, which is exactly what the
+	// S3 lock split removed. nil until the org's first connection loads it, and
+	// nil again if a load fails — both WITHHOLD (spaceView's nil methods).
+	//
+	// It lives on the SHARD, not the hub, so it dies with the org's last
+	// connection: an idle org costs nothing, a live org costs O(spaces), and
+	// there is no hub-wide map in which one org's set could be handed to
+	// another's connection.
+	spaces atomic.Pointer[spaceView]
+	// spaceMu single-flights loads of `spaces`. Deliberately NOT mu: the load
+	// is a pool round trip, and holding the fan lock across it would stall the
+	// org's whole multicast (S3's "never do I/O under the shard lock"). Its
+	// only job is that N connections reacting to the same space.created issue
+	// ONE query between them — each waiter re-checks `spaces` under the lock
+	// and takes the winner's result.
+	spaceMu sync.Mutex
 	// Per-user derived presence (connection count + last activity + idle flag);
 	// per-process, never stored (the UNLOGGED presence table is unused).
 	userConns map[int64]*userPresence // userID → presence
@@ -259,6 +355,11 @@ type Hub struct {
 	// rises O(events), not O(connections). A regression to per-connection
 	// marshaling makes it rise ~O(connections) (the red/green pin).
 	encoded metrics.Counter
+	// spaceQueries counts reads of the space-visibility set. Since the set is
+	// held per ORG it rises once per org's first connection plus once per
+	// space.created — CONSTANT in the number of live connections, which is the
+	// pin: reverting to a per-connection load makes it rise with N.
+	spaceQueries metrics.Counter
 }
 
 func NewHub(pool *pgxpool.Pool, log *slog.Logger) *Hub {
@@ -390,6 +491,7 @@ func (h *Hub) SetMetrics(reg metrics.Registry) {
 	h.deliveries = reg.Counter("fanout_deliveries_total")
 	h.connections = reg.Gauge("gateway_connections", "org")
 	h.encoded = reg.Counter("gateway_envelopes_encoded_total")
+	h.spaceQueries = reg.Counter("gateway_space_queries_total")
 }
 
 // encodeEnvelope is the SINGLE Envelope-marshal choke point, so the encoded
@@ -503,14 +605,15 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	}
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+	// Seeded WITHHOLDING: every container view starts at its zero value and
+	// every zero value denies — nil channel/dm maps deny by lookup, and a nil
+	// spaces view resolves no Space AND reports item security active
+	// (spaceView's nil methods). So a connection whose ACL load never ran, or
+	// failed, can only ever under-deliver. loadChannels and syncSpaceView below
+	// are the only things that relax any of it.
 	c := &client{conn: ws, id: id, cancel: cancel, lastID: lastID,
 		feed: make(chan []eventRow, feedBuffer),
-		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter(),
-		// Seeded WITHHOLDING: nil container views deny by lookup, and item
-		// security starts active, so a connection whose ACL load never ran
-		// (or failed) can only ever under-deliver. loadChannels below is the
-		// only thing that relaxes any of it.
-		itemSecurityActive: true}
+		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter()}
 
 	// Setup order matters (fixes a startup race): load the membership view and
 	// register the connection BEFORE reading any client frame, so the sender's
@@ -532,6 +635,20 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 		}
 		ws.CloseNow()
 	}()
+
+	// Take the ORG's shared space view. Two orderings are load-bearing here.
+	// It comes AFTER register because it hangs off the shard, which is safe in
+	// the only direction that matters: until it lands c.spaces is nil and every
+	// space-scoped event is WITHHELD, so a connection that is already a fan
+	// target can under-deliver for an instant but can never fall through to the
+	// org-wide branch. And it comes AFTER the tail.Head sample above, which is
+	// what makes the two halves of the view's freshness meet: a Space this read
+	// misses committed after lastID was taken, so its space.created is above
+	// this connection's cursor and will drive a refresh rather than be skipped.
+	if err := h.attachSpaceView(ctx, c); err != nil {
+		ws.Close(websocket.StatusInternalError, "space view load failed")
+		return
+	}
 
 	// The reader goroutine serves two jobs: prompt disconnect detection, and
 	// the ephemeral signal plane (typing, read_marker — ADR-002 P5). Durable
@@ -856,13 +973,25 @@ func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) er
 		if c.passed(r.id, h.ordered) {
 			continue
 		}
-		deliver, refresh := c.filter(r)
-		if refresh {
+		out := c.filter(r)
+		if out.membership {
 			if err := c.loadChannels(ctx, h.pool); err != nil {
 				return err
 			}
 		}
-		if deliver {
+		if out.newSpace != 0 {
+			// Applied AFTER the verdict above, so the space.created envelope
+			// itself is still decided against the PRE-refresh view and withheld
+			// (the member.joined precedent) while every LATER row in this batch
+			// sees the new Space. Costs ONE query for the whole org, or none
+			// when the shared view already resolves that Space — which is the
+			// whole point of hoisting it: this line used to run a per-connection
+			// three-query reload on each of the org's delivery goroutines.
+			if err := h.refreshSpaceView(ctx, c, out.newSpace); err != nil {
+				return err
+			}
+		}
+		if out.deliver {
 			// Live lane: reuse the reader's marshal-once bytes. Resume lane
 			// (enc nil) marshals its own — rare, bounded by the replay gap.
 			var err error
@@ -967,6 +1096,29 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 	return nil
 }
 
+// aclOutcome is one row's verdict from client.filter: whether the connection
+// may see the row, and which of its container views the row says are now
+// stale. The two are separate because they are applied at DIFFERENT times —
+// the verdict decides THIS row (against the pre-refresh views, the
+// member.joined precedent) while the refreshes take effect from the NEXT row —
+// and because they cost wildly different things.
+type aclOutcome struct {
+	deliver bool
+	// membership marks an event about THIS user's own channel/DM membership:
+	// the per-connection channel and DM views must be re-read. Genuinely
+	// per-connection (it is that user's membership), so it stays a
+	// per-connection load — and it is scoped to one user's connections, never
+	// the org's.
+	membership bool
+	// newSpace is the Space id a space.created announced, or 0. An ID and not
+	// a flag on purpose: the shared per-org view is reloaded only when it does
+	// not ALREADY know that Space (spaceView.covers), which is what collapses
+	// one space.created in an org with N live connections to ONE query instead
+	// of N, and what keeps a resume lane replaying historical space.created
+	// events — whose Spaces the current view already has — from querying at all.
+	newSpace int64
+}
+
 // filter applies the read ACL: channel-scoped events require membership AND
 // clear the channel's protected-history floor, DM-scoped events require
 // participation, SPACE-scoped events require space visibility, and only what
@@ -991,7 +1143,7 @@ func (h *Hub) resume(ctx context.Context, c *client) error {
 // That is exactly messaging.ListMessages' `created_at >= history_from` and the
 // negation of messaging.Get's `created_at < history_from` hide-rule, so the
 // realtime plane and the REST read answer identically at the boundary instant.
-func (c *client) filter(r eventRow) (deliver, refresh bool) {
+func (c *client) filter(r eventRow) (out aclOutcome) {
 	var p struct {
 		ChannelID int64   `json:"channel_id"`
 		DMSpaceID int64   `json:"dm_space_id"`
@@ -1014,24 +1166,27 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	}
 	_ = json.Unmarshal(r.payload, &p)
 	if (r.verb == "member.joined" || r.verb == "member.left") && p.UserID == c.id.UserID {
-		refresh = true
+		out.membership = true
 	}
-	// A new Space widens (or, for a guest, does not widen) every connection's
-	// space set, so it drives the same event-driven refresh membership does.
-	// The event itself is decided against the PRE-refresh set and so is
-	// withheld — the member.joined precedent: the view catches up, the
-	// envelope that caused it does not arrive, and the client's next REST read
-	// closes the gap (F-2 tolerates a detectable gap, not a leak).
+	// A new Space widens (or, for a guest, does not widen) the ORG's space
+	// view, so it drives the same event-driven refresh membership does — but
+	// against per-org state, so the org pays for it once however many
+	// connections observe it. The event itself is decided against the
+	// PRE-refresh view and so is withheld — the member.joined precedent: the
+	// view catches up, the envelope that caused it does not arrive, and the
+	// client's next REST read closes the gap (F-2 tolerates a detectable gap,
+	// not a leak).
 	if r.verb == "space.created" {
-		refresh = true
+		out.newSpace = p.SpaceID
 	}
 	if r.verb == "dm.opened" || r.verb == "dm.participants_changed" {
 		for _, uid := range p.UserIDs {
 			if uid == c.id.UserID {
-				return true, true
+				out.deliver, out.membership = true, true
+				return out
 			}
 		}
-		return false, refresh
+		return out
 	}
 	// The container gates below are CONJUNCTIVE, not a first-match dispatch: an
 	// event may name MORE than one container and must clear every gate it
@@ -1044,33 +1199,39 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	// more) and it is why neither gate may return true early.
 	if p.ChannelID != 0 {
 		if !c.channels[p.ChannelID] {
-			return false, refresh
+			return out
 		}
 		// Protected-history floor. Absent key = no boundary (shared channel or
 		// the protected channel's creator) — the common case, one map miss.
 		if floor, bounded := c.historyFloor[p.ChannelID]; bounded &&
 			floorAt(r.boundaryAt, p.MessageCreatedAt).Before(floor) {
-			return false, refresh
+			return out
 		}
 	}
 	if p.DMSpaceID != 0 && !c.dms[p.DMSpaceID] {
-		return false, refresh
+		return out
 	}
 	if spaceScoped(r.entityType) {
 		// These events belong to a Space, so they resolve one instead of
 		// fanning. Everything here fails CLOSED — an unresolvable scope is
 		// withheld, never dropped through to the org-wide return below, which
 		// is exactly the hole this closes.
-		//   · space_id missing from the payload  → withhold (unresolvable)
-		//   · space not in this connection's set → withhold (includes every
-		//     guest, whose set is empty — the same predicate, no role branch)
+		//   · space_id missing from the payload   → withhold (unresolvable)
+		//   · space not resolvable by this view   → withhold. ONE predicate
+		//     covers three cases with no role branch, because all three hold a
+		//     view that resolves nothing: a GUEST (never handed the org's
+		//     shared view — see Hub.syncSpaceView, which is where the P-5
+		//     restriction lives now that it is no longer a SQL parameter), a
+		//     connection whose view has not loaded yet, and one whose load
+		//     failed. See spaceView's nil-receiver methods.
 		//   · a work item while the org defines any visibility_scope →
-		//     withhold (no evaluator exists for the scope's rule)
-		if p.SpaceID == 0 || !c.spaces[p.SpaceID] {
-			return false, refresh
+		//     withhold (no evaluator exists for the scope's rule), and a view
+		//     that cannot answer at all reports it ACTIVE.
+		if p.SpaceID == 0 || !c.spaces.visible(p.SpaceID) {
+			return out
 		}
-		if r.entityType == enum.EntityWorkItem && c.itemSecurityActive {
-			return false, refresh
+		if r.entityType == enum.EntityWorkItem && c.spaces.itemSecurity() {
+			return out
 		}
 	}
 	// Cleared every gate it named. An event that named NO container and is not
@@ -1078,7 +1239,8 @@ func (c *client) filter(r eventRow) (deliver, refresh bool) {
 	// and the space-governed THREAD traffic (message.*/thread.*) that the v1
 	// visibility slice makes org-visible over REST too — withholding it here
 	// would over-withhold against messaging.Get, not close a hole.
-	return true, refresh
+	out.deliver = true
+	return out
 }
 
 // floorAt is the timestamp the protected-history floor judges ONE event at:
@@ -1139,6 +1301,14 @@ func spaceScoped(t enum.EntityType) bool {
 	return false
 }
 
+// loadChannels reloads the two GENUINELY per-connection container views:
+// channel membership (with its protected-history floors) and DM participation.
+// Both are this user's own membership, so they cannot be shared with the org;
+// they are also only ever refreshed by an event about THIS user, so the cost is
+// bounded to that user's connections. The space view is deliberately NOT
+// chained here any more — it is per-ORG (see spaceView) and refreshed through
+// Hub.syncSpaceView, which is what stopped one space.created from costing three
+// pool queries per live connection.
 func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
 	// The membership set and its protected-history floors load together, so a
 	// refresh can never widen the view without carrying the boundary that
@@ -1195,50 +1365,182 @@ func (c *client) loadChannels(ctx context.Context, pool *pgxpool.Pool) error {
 	if err := drows.Err(); err != nil {
 		return err
 	}
-	return c.loadSpaces(ctx, pool)
+	return nil
 }
 
-// loadSpaces builds the space-visibility set — the container view for events
-// that have neither a channel nor a DM. Spaces are org-visible in the v1
-// worktrack slice (see its package doc), and a GUEST sees none (P-5, the same
-// `NOT $2` shape messaging.ListChannels uses), so the guest restriction lives
-// in the SQL and filter keeps ONE predicate for everyone. Archival is
-// deliberately not filtered: it is a lifecycle state, not an ACL state, and
-// REST still reads an archived space's items — withholding here would
-// over-withhold against the read path rather than close a hole.
+// attachSpaceView is the CONNECT-time half of the refresh protocol: it gives a
+// registering connection its org's space view, requiring a view whose read
+// BEGAN after this connection did.
+//
+// That freshness rule is not paranoia, it is the item-security contract.
+// itemSecurityActive has no refresh verb (nothing writes visibility_scope yet;
+// P-4 must emit one), so reconnecting is the ONLY way a connection learns the
+// org's first scope appeared — a recovery `gateway_acl_test.go` pins directly.
+// Reusing an arbitrarily old shared view here would have deleted it silently,
+// in the DELIVERING direction. So a connect costs the same one space query it
+// always did; what this slice removes is the per-connection query on the FAN
+// path, which is where the herd was.
+//
+// It is still shared where sharing is free: connections that arrive WHILE a
+// load is running all take that load's result, because it started after they
+// did. A thundering herd of registrations therefore collapses to roughly one
+// query per load latency instead of one per connection, and a steady trickle
+// pays exactly what it paid before.
+func (h *Hub) attachSpaceView(ctx context.Context, c *client) error {
+	arrived := time.Now()
+	return h.syncSpaceView(ctx, c, func(v *spaceView) bool {
+		return v != nil && v.startedAt.After(arrived)
+	})
+}
+
+// refreshSpaceView is the EVENT-driven half: a space.created announced spaceID,
+// so the org's view must resolve it. Any view that already does is accepted
+// as-is, which is what turns one space.created into ONE query for the whole org
+// however many connections observe it — and what keeps a resume lane replaying
+// historical space.created events, whose Spaces the current view already holds,
+// from querying at all.
+func (h *Hub) refreshSpaceView(ctx context.Context, c *client, spaceID int64) error {
+	return h.syncSpaceView(ctx, c, func(v *spaceView) bool { return v.visible(spaceID) })
+}
+
+// syncSpaceView points c at its org's shared space view, loading one if the
+// shard holds nothing `fresh` accepts.
+//
+// THIS IS WHERE THE GUEST RESTRICTION LIVES. It used to be a SQL parameter
+// (`AND NOT $2`), which only worked while the query was per-connection: a view
+// loaded once for the whole org cannot carry a per-reader role. So a guest is
+// never HANDED the view at all — it keeps the nil view it was born with, which
+// resolves no Space and reports item security active. The restriction therefore
+// stays out of filter (one predicate for everyone, no role branch, exactly as
+// #132 built it), it is stated once here, and a guest costs the org nothing: it
+// does not even trigger a load.
+//
+// A load failure leaves c.spaces at whatever it was — nil for a fresh
+// connection (withhold), or its last good view for an established one, which
+// can only be MISSING Spaces, never carrying extra — and propagates, so the
+// caller drops the connection exactly as a failed membership load does.
+func (h *Hub) syncSpaceView(ctx context.Context, c *client, fresh func(*spaceView) bool) error {
+	if c.id.IsGuest() {
+		return nil
+	}
+	// Shared state is where cross-org bugs live, so the org pin is asserted at
+	// the hand-off as well as carried in the query below: a view built for
+	// another org must never reach this connection.
+	if c.shard.orgID != c.id.OrgID {
+		return fmt.Errorf("gateway: shard org %d serving connection org %d",
+			c.shard.orgID, c.id.OrgID)
+	}
+	v, err := h.orgSpaceView(ctx, c.shard, fresh)
+	if err != nil {
+		return err
+	}
+	c.spaces = v
+	return nil
+}
+
+// orgSpaceView returns the org's shared space view, loading one when the shard
+// holds nothing the caller accepts — and loading it AT MOST ONCE however many
+// connections ask at the same instant.
+//
+// The refresh protocol in full:
+//   - WHO loads: a connection, never the multicast reader. The reader could not
+//     be the only trigger anyway — a registering connection needs a coherent
+//     view before its first batch and Serve must not block on another
+//     goroutine to get one — and a pool round trip inside the reader would
+//     stall the org's ENTIRE fan on a rare event.
+//   - WHEN: on register (attachSpaceView's freshness rule) and on a
+//     space.created naming a Space the shared view does not hold
+//     (refreshSpaceView). Nothing else changes the set — space.created is the
+//     only verb worktrack appends that adds a Space — and a guest never asks.
+//   - HOW ONCE: the double check around spaceMu. N connections handed the same
+//     space.created all fail `fresh`, all reach for spaceMu, and the winner
+//     publishes; every loser re-checks INSIDE the lock, accepts the winner's
+//     view and returns without querying. spaceMu is not the shard's fan lock,
+//     so the org's multicast is never held up by this (S3's rule: no I/O under
+//     the lock that fans).
+//   - MID-REFRESH REGISTRATION: coherent by construction. A view is immutable
+//     and published by ONE atomic Store, so a connection registering during a
+//     reload takes the old view or the new one, never a torn one — and its
+//     freshness rule then rejects any view whose read began before it did.
+//   - A SPACE COMMITTED BUT NOT YET FANNED: also covered, by ORDER in Serve.
+//     The connection samples the org head BEFORE this load runs, so a Space
+//     that commits after the load has an event id ABOVE the connection's
+//     cursor; that space.created is therefore never skipped as already-handled
+//     and drives refreshSpaceView normally. A Space that commits before the
+//     load is simply in it.
+//   - ON FAILURE: WITHHOLD, and never cache the failure. The shard's view is
+//     reset to nil so the next asker retries with a real query instead of
+//     inheriting a half-built set, and the error propagates to the caller,
+//     which drops the connection exactly as a failed membership load does.
+func (h *Hub) orgSpaceView(ctx context.Context, sh *orgShard, fresh func(*spaceView) bool) (*spaceView, error) {
+	if v := sh.spaces.Load(); fresh(v) {
+		return v, nil
+	}
+	sh.spaceMu.Lock()
+	defer sh.spaceMu.Unlock()
+	if v := sh.spaces.Load(); fresh(v) {
+		return v, nil // another connection loaded it while we waited
+	}
+	// The one place the space set is read from the database. Counted so the
+	// per-ORG claim is measurable: this rises once per space.created for the
+	// whole org, NOT once per connection (docs/PERF.md).
+	h.spaceQueries.Add(1)
+	startedAt := time.Now()
+	v, err := loadSpaceView(ctx, h.pool, sh.orgID)
+	if err != nil {
+		sh.spaces.Store(nil) // a failed load is never cached; nil withholds
+		return nil, err
+	}
+	v.startedAt = startedAt
+	sh.spaces.Store(v)
+	return v, nil
+}
+
+// loadSpaceView reads ONE org's space-visibility answer — the container view
+// for events that have neither a channel nor a DM. Spaces are org-visible in
+// the v1 worktrack slice (see its package doc), so the org id is the ONLY input
+// and the answer is shared by every non-guest connection in the org; the guest
+// case is not a narrower set but NO set, and lives at the hand-off
+// (Hub.syncSpaceView) rather than in this SQL. Archival is deliberately not
+// filtered: it is a lifecycle state, not an ACL state, and REST still reads an
+// archived space's items — withholding here would over-withhold against the
+// read path rather than close a hole.
 //
 // The uncorrelated EXISTS is Postgres's InitPlan (evaluated once, not per row)
 // and rides the same round trip as the set.
-func (c *client) loadSpaces(ctx context.Context, pool *pgxpool.Pool) error {
+//
+// It returns a view only on complete success: a partial set published under an
+// error would be a set that silently withholds real Spaces, and worse, one
+// whose itemSecurityActive could be read off a truncated scan.
+func loadSpaceView(ctx context.Context, pool *pgxpool.Pool, orgID int64) (*spaceView, error) {
 	rows, err := pool.Query(ctx, `
 		SELECT sp.id,
 		       EXISTS (SELECT 1 FROM visibility_scope vs
 		               JOIN space s2 ON s2.id = vs.space_id
 		               WHERE s2.org_id = $1)
 		FROM space sp
-		WHERE sp.org_id = $1 AND NOT $2`, c.id.OrgID, c.id.IsGuest())
+		WHERE sp.org_id = $1`, orgID)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer rows.Close()
-	// Fail closed on the way in: until a row proves otherwise the connection
-	// behaves as if item security were active. Zero rows leaves it true, which
-	// is moot — an empty space set already withholds every space-scoped event.
+	// Fail closed on the way in: until a row proves otherwise the org behaves as
+	// if item security were active. Zero rows leaves it true, which is moot — an
+	// empty space set already withholds every space-scoped event.
 	set, scoped := map[int64]bool{}, true
 	for rows.Next() {
 		var id int64
 		var active bool
 		if err := rows.Scan(&id, &active); err != nil {
-			return err
+			return nil, err
 		}
 		set[id] = true
 		scoped = active
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
-	c.spaces, c.itemSecurityActive = set, scoped
-	return nil
+	return &spaceView{spaces: set, itemSecurityActive: scoped}, nil
 }
 
 // send serializes writes per connection: coder/websocket forbids concurrent
