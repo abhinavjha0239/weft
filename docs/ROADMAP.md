@@ -3018,9 +3018,25 @@ directive 8).
 > counter row is safe") is also **enforced nowhere**: one `AssignVerb`
 > call can point the verb at `role:everyone` org-wide.
 >
-> **Recommended next step: re-spec, not patch.** The intent stands and
-> the membership axis still needs an answer; the subtraction mechanism
-> is what failed. A per-reader design that keeps `unread_count`'s
+> **RE-SPEC DONE — SPLIT THREE WAYS (2026-09-10).** Both decisions above
+> unblock work that does NOT depend on the failed unread mechanism, so
+> the entry is superseded by:
+> - **P-44a — SPEC-READY**, channel-scope verb assignment. Far smaller
+>   than "the surface does not exist" implied: the RESOLVER ALREADY READS
+>   channel scope (five production call sites), so only the WRITE is
+>   missing. It also unblocks the seven verbs P-47 created, all of which
+>   are org-scope-only today for the same reason.
+> - **P-44b — SPEC-READY**, the scope-owned automation principal, which
+>   is how decision (b) gets implemented without copying Zulip's
+>   owner-inheritance that AU-2 deliberately designed out.
+> - **P-44c — NEEDS-DESIGN**, announcement mode itself. The unread
+>   mechanism is the ONE thing still unsolved, and the entry records both
+>   candidates (the audit's four fixes to subtraction, and a capped
+>   index-range-scan alternative) plus a mandatory surface map first.
+>
+> This entry stays as the audit record. **Recommended next step: re-spec,
+> not patch.** The intent stands and the membership axis still needs an
+> answer; the subtraction mechanism is what failed. A per-reader design that keeps `unread_count`'s
 > semantics while removing the per-message fan-out is worth exploring
 > before re-writing this entry bullet by bullet.
 
@@ -4113,6 +4129,174 @@ Slack Enterprise/compliance export shapes; canvases, huddles, workflows,
 saved items; custom profile fields; per-channel notification prefs;
 shared/Connect channels (ADR-004 territory). Plus **P-27d** (bots) and
 **P-27e** (`slack_incoming`).
+
+### P-44a `perms: Assign verbs at channel scope.` — S — ZERO migrations — **SPEC-READY (the write half of a scope the resolver ALREADY reads)**
+
+**What & why.** P-44's decision (a) — settled on evidence in #147 — needs
+posting restricted per channel. The blocker was recorded as "the
+channel-scope assignment surface does not exist", which is true but
+smaller than it sounds: **the READ side already works.**
+`perms.ChannelScope` builds a chain starting `{ScopeChannel, channelID}`
+and walking up, and five production call sites already resolve through
+it (`automation/runner.go`, `automation/automation.go`, `messaging/move.go`,
+`messaging/edit.go`, and the channel gates). `permission_assignment`
+already carries `scope_type`/`scope_id` and is UNIQUE on them.
+
+What is missing is only the WRITE: `identity.AssignVerb` hardcodes
+`perms.OrgRef(actor.OrgID)`, and `perms.ChannelRef` has **zero non-test
+callers**. So this slice is "let an admin write the row the resolver has
+always known how to read".
+
+**This is not only P-44's prerequisite.** P-47 (#138) split `manage_org`
+into seven verbs and every one of them is org-scope-only today, purely
+because there is no way to assign at any other scope.
+
+**Design (decided):**
+- Extend the admin surface to take an optional channel scope. Keep the
+  existing org-scope call shape working unchanged — this is additive.
+- **The gate is `manage_permissions` resolved AT THE TARGET SCOPE**, not
+  at the org: a channel admin may retarget a verb for their own channel
+  without holding org-wide permission reassignment. Resolve it through
+  `ChannelScope` so the org chain still grants it, which preserves
+  today's behaviour for org admins exactly.
+- **Oracle-free**: a channel id that does not exist, is in another org,
+  or that the actor may not administer must be one indistinguishable
+  404 (`ChannelScope` already 404s an absent/foreign channel — reuse it,
+  do not add a second lookup).
+- The event payload gains the scope. `org.verb_assigned` is a wire
+  contract; **add a field, do not repurpose one**, and consider whether
+  a channel-scoped assignment deserves its own verb rather than
+  overloading an org-named one — decide and state which.
+- `manage_permissions` itself must NOT become channel-assignable: its
+  holder can grant themselves every other verb, so allowing it at
+  channel scope hands a channel admin an org-wide escalation. **Refuse
+  it explicitly with a named error**, and pin that refusal.
+
+**Edge cases:** assigning at channel scope a verb that is meaningless
+there (`manage_billing`, `manage_auth_providers`) — decide whether the
+registry gains a per-verb "assignable scopes" fact or whether any verb
+may be assigned anywhere and simply never consulted; the honest-rungs
+rule points at the former, since the latter stores config nothing
+enforces. Deleting a channel with assignments (the FK); a group deleted
+out from under one (no deletion path exists today — defensive only).
+
+**Tests.** The load-bearing one is **precedence**: a channel-scope
+assignment must beat the org default for that channel and leave every
+other channel untouched — `TestMostSpecificWins` already pins the read
+side, so extend it through the new write. Plus: a channel admin may
+assign for their channel and not for another; the `manage_permissions`
+refusal; the oracle-free 404 for absent/foreign/unadministered channels,
+byte-identical bodies. **RED/GREEN:** drop the target-scope resolution
+and require org `manage_permissions` → the channel-admin case goes red;
+allow `manage_permissions` at channel scope → the escalation pin fires.
+
+---
+
+### P-44b `automation: Gate posts on a scope-owned principal.` — M — migration 0027 — **SPEC-READY (implements P-44's decision (b); AU-2 is AMENDED here, not left contradicted)**
+
+**What & why.** Decision (b), settled on evidence in #147: automations
+do **not** get an exemption from posting restrictions. Today
+`PostToChannelAsAutomation` posts with **no permission gate at all** —
+its own comment says so, citing AU-2 ("the scope's admin authorized the
+rule at creation"), and an org-scope rule sees every channel.
+
+Under Weft's own honest-rungs invariant, a posting restriction that
+automations ignore is precisely a knob whose lane does not exist. The
+external evidence is one-sided: Slack's equivalent bypass is a
+**documented hole it declined to fix** — an answer a self-hosted
+governance product cannot borrow — while Zulip enforces on bots at one
+chokepoint and permits exactly one bypass, guarded by a runtime assert.
+
+**The structural obstacle, and the shape that resolves it.** ADR-014
+AU-2 deliberately removed the owning user — "owned by the scope, not a
+user — Slack's creator-orphaning footgun designed out" — so Zulip's
+owner-inheritance **cannot be copied literally**. The resolution is a
+principal that is not a user and still holds verbs:
+
+- **One agent principal per org** (`user_account` kind 2), seeded at
+  bootstrap alongside the role groups, and placed in a new seeded
+  `role:automations` group. Migration 0027 seeds it for existing orgs —
+  and note P-47's lesson: `SeedOrg` writes explicit rows, so **existing
+  orgs need a backfill; the seed helps future orgs only.**
+- **`PostToChannelAsAutomation` resolves `send_message` for that
+  principal at the TARGET channel** and refuses when it is not granted.
+  Because the principal is a group member, an admin controls automation
+  posting with the machinery that already exists — including, after
+  P-44a, per channel.
+- **AU-2 is amended in ADR-014** to say the scope's authorization
+  governs which RULES may exist, and the principal's verbs govern where
+  they may POST. Leaving AU-2 stating the old rule while the code does
+  otherwise is the failure mode this project keeps correcting.
+- The event actor stays `ActorAutomation` + the rule id — that is the
+  loop guard's input and a wire contract. **Do not repoint it at the
+  principal.**
+
+**Edge cases:** an org whose principal is missing (a pre-migration row,
+or a hand-deleted account) must **fail closed** — the post is refused,
+never allowed; the automation run records the refusal with a reason
+rather than failing silently, since a rule that quietly stops posting is
+worse than one that visibly errors. Deactivating the principal disables
+all automation posting org-wide — decide whether that is permitted and
+say so. The importer must not create these (actor kind 4 backfills).
+
+**Tests.** An org-scope rule targeting a channel where the principal
+lacks `send_message` is REFUSED with a recorded reason; the same rule
+where it is granted posts normally. The refusal must not stall the
+runner's cursor. **RED/GREEN:** remove the gate → the refused post lands,
+which is today's behaviour and the thing this slice removes; delete the
+principal → the post is refused rather than allowed (fail-closed).
+
+---
+
+### P-44c `channels: Announcement mode.` — XL — **[!] NEEDS-DESIGN — the unread mechanism is still unsolved. Do NOT dispatch.**
+
+**What is now settled** (so a future session does not re-litigate it):
+posting is restricted **per channel** (decision (a), P-44a builds the
+surface); automations are **not exempt** (decision (b), P-44b);
+`channel.kind = 4` has been the dormant hook since 0003. What remains
+unsolved is the ONE thing the original spec got wrong at the model
+level: **how unread works without an O(members) write per message.**
+
+**Do not simply revive the subtraction design — but do not discard it
+unexamined either.** The audit killed it on four counts, and then
+supplied a fix for each: the multi-poster author wipe becomes
+`read_total + 1` rather than `= total`; the delete credit needs
+`read_total = LEAST(read_total, live_countable_total)` wherever the
+total moves down; a partial `MarkRead` maps to
+`count(live countable messages with id <= applied)`, which is O(the
+marked range) and not O(1); and every mention clamp must be expressed
+against the computed unread rather than `unread_count`. **Whether those
+four fixes are sufficient or merely patch the symptoms is the design
+question this entry exists to answer.**
+
+**A second candidate worth costing before choosing.** Because an
+announcement channel is send-restricted and flat, a reader is never far
+behind, so unread may be a **capped index range scan** — `count(*)`
+over `(channel_id, id)` above the reader's watermark, `LIMIT` at some
+cap and reported as "N+" beyond it, which is what Slack and Discord
+show anyway. That needs no per-message write at all and no new column;
+its cost is a bounded scan per container per read, and its risk is the
+never-read member of a large channel. **Cost both against the real
+index situation before writing the spec.**
+
+**Mandatory before this is specced at all: map the surface against the
+current tree.** The failed spec predates #117, #118, #128, #143 and
+#145 — every one of which moved the unread machinery — and the P-27a
+experience showed that a spec written against a remembered tree fails
+its pre-flight. The map must cover at least: what `ApplyMessageUnread`,
+`applyMarkReadDelta`, `decrementUnreadOnDelete`, `reconcileUnreadOrg`
+and `SeedUnreadCounters` do TODAY; which of them a kind=4 arm would
+have to touch; and how the reconcile's claim, idle-skip and per-org
+expiry interact with a channel whose counters are derived rather than
+stored.
+
+**Also still true and still unaddressed:** the design's premise —
+*send-restricted ⇒ low write rate ⇒ a hot counter row is safe* — is
+**enforced nowhere.** After P-44a it is enforceable per channel, which
+is an improvement, but a channel whose `send_message` is pointed at
+`role:everyone` is still an announcement channel by kind with no write-
+rate bound. Decide whether kind=4 constrains the assignment, or whether
+the design must survive an unbounded write rate.
 
 ---
 
