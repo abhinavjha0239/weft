@@ -94,6 +94,57 @@ func TestMentions(t *testing.T) {
 	rejects(t, render(t, "@**<b>x</b>**", nil), "<b>")
 }
 
+func TestChannelRefs(t *testing.T) {
+	resolve := func(label string) (int64, bool) {
+		if label == "general" {
+			return 5, true
+		}
+		return 0, false
+	}
+	// OPT-IN: without the option the syntax does not exist, so every caller
+	// that predates it renders byte-identically to before.
+	off := render(t, "see #**general**", nil)
+	wants(t, off, "<strong>general</strong>")
+	rejects(t, off, "channel-ref")
+
+	got := RenderHTML(Parse("see #**general** and #**gone**", nil, WithChannelRefs(resolve)))
+	wants(t, got,
+		`<span class="channel-ref" data-channel-id="5">#general</span>`,
+		`<span class="channel-ref channel-ref-unresolved">#gone</span>`)
+	// INERT in both states: no anchor, no href, nothing clickable. A link
+	// would have to survive SafeURL, which rejects relative hrefs outright.
+	rejects(t, got, "<a ", "href=")
+
+	// The node carries the label ALWAYS and the id only when it resolved.
+	doc := Parse("#**general** #**gone**", nil, WithChannelRefs(resolve))
+	var refs []map[string]any
+	doc.walk(func(n *Node) {
+		if n.Type == NodeChannelRef {
+			refs = append(refs, n.Attrs)
+		}
+	})
+	if len(refs) != 2 {
+		t.Fatalf("channel_ref nodes = %d, want 2", len(refs))
+	}
+	if refs[0]["label"] != "general" || refs[0]["channel_id"] != int64(5) {
+		t.Fatalf("resolved ref attrs = %v", refs[0])
+	}
+	if refs[1]["label"] != "gone" {
+		t.Fatalf("unresolved ref label = %v", refs[1])
+	}
+	if _, ok := refs[1]["channel_id"]; ok {
+		t.Fatalf("unresolved ref must carry no channel_id: %v", refs[1])
+	}
+
+	// A '#' run followed by a space is still an ATX heading, and a channel
+	// reference at the start of a line is still a channel reference.
+	wants(t, RenderHTML(Parse("# Title", nil, WithChannelRefs(resolve))), "<h1>Title</h1>")
+	wants(t, RenderHTML(Parse("#**general**", nil, WithChannelRefs(resolve))),
+		`<span class="channel-ref" data-channel-id="5">#general</span>`)
+	// Labels are escaped like every other text byte.
+	rejects(t, RenderHTML(Parse("#**<b>x</b>**", nil, WithChannelRefs(resolve))), "<b>")
+}
+
 func TestEmojiAndFlags(t *testing.T) {
 	wants(t, render(t, "ship it :rocket:", nil), "🚀", `title=":rocket:"`)
 	// Unknown shortcodes stay literal text.

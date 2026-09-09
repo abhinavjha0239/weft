@@ -48,8 +48,21 @@ const (
 	NodeTableRow    = "table_row"
 	NodeTableCell   = "table_cell"
 	NodeMention     = "mention"
-	NodeEmoji       = "emoji"
-	NodeText        = "text"
+	// NodeChannelRef is a reference to a CHANNEL, and it is deliberately
+	// INERT in both states: `label` is always present, `channel_id` only when
+	// the reference resolved, and the two render identically apart from a
+	// class. It is not a link, because SafeURL allowlists schemes and rejects
+	// a relative href, so `/channels/5` would silently degrade to bare text —
+	// and making it work means punching a hole in the one function that gates
+	// every link in a renderer that is XSS-safe by construction.
+	//
+	// Emitting the same bytes to every reader is also what keeps the
+	// oracle-free-404 posture intact: a resolved reference must not tell a
+	// reader that a channel they cannot see exists, and a per-reader render
+	// with no acting user takes the widest branch and bakes exactly that in.
+	NodeChannelRef = "channel_ref"
+	NodeEmoji      = "emoji"
+	NodeText       = "text"
 )
 
 const (
@@ -199,6 +212,15 @@ func renderNode(b *strings.Builder, n *Node) {
 				strconv.FormatInt(id, 10) + `">@` + label + `</span>`)
 		} else {
 			b.WriteString(`<span class="mention mention-unresolved">@` + label + `</span>`)
+		}
+	case NodeChannelRef:
+		// Inert in BOTH branches — no anchor, no href, only a class differs.
+		label := html.EscapeString(attrString(n.Attrs, "label"))
+		if id := attrInt64(n.Attrs, "channel_id"); id != 0 {
+			b.WriteString(`<span class="channel-ref" data-channel-id="` +
+				strconv.FormatInt(id, 10) + `">#` + label + `</span>`)
+		} else {
+			b.WriteString(`<span class="channel-ref channel-ref-unresolved">#` + label + `</span>`)
 		}
 	case NodeEmoji:
 		b.WriteString(`<span class="emoji" title=":` +
