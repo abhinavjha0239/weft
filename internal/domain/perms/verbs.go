@@ -76,6 +76,49 @@ var knownVerbs = map[string]bool{
 // KnownVerb reports whether verb is in the registry.
 func KnownVerb(verb string) bool { return knownVerbs[verb] }
 
+// channelAssignable is the per-verb "assignable scopes" fact (P-44a). The
+// table has carried scope_type/scope_id since 0002 and the resolver has
+// always walked channel → workspace → org, but nothing could WRITE a
+// non-org row, so "which verbs mean anything at channel scope" never had to
+// be answered. The write half exists now, and the honest-rungs rule answers
+// it: a verb may be assigned only where something CONSULTS it, or the row is
+// config nothing enforces — assigning manage_billing or manage_auth_providers
+// "for #general" would store a preference no code path can ever read.
+//
+// The set is exactly the verbs whose Require/HoldersAt call is handed a chain
+// built by ChannelScope:
+//
+//	send_message        messaging.SendMessage, CreateThread, requireChannelSend
+//	create_thread       messaging.CreateThread
+//	edit_thread_title   messaging.UpdateThread (title arm)
+//	resolve_threads     messaging.UpdateThread (resolved arm)
+//	moderate_messages   messaging.MoveMessage, DeleteMessage (others' messages)
+//	administer_channel  messaging.SetPinned, UpdateChannel,
+//	                    automation.requireScopeAdmin, runner alert audience
+//
+// A verb joins this set in the slice that gives it a channel-scope consumer,
+// exactly as a verb joins knownVerbs with its feature.
+//
+// manage_permissions is the one exclusion that is a SECURITY rule rather than
+// a dead-row rule, and it would still be excluded if the whole registry became
+// channel-assignable tomorrow: it is the verb that points every OTHER verb, so
+// a channel-scope grant of it is a standing delegation of permission
+// administration. identity.AssignVerb refuses it with its own named error for
+// that reason — two independent guards, so removing either leaves one standing.
+var channelAssignable = map[string]bool{
+	VerbSendMessage:       true,
+	VerbCreateThread:      true,
+	VerbEditThreadTitle:   true,
+	VerbResolveThreads:    true,
+	VerbModerateMessages:  true,
+	VerbAdministerChannel: true,
+}
+
+// ChannelAssignable reports whether verb may be ASSIGNED at channel scope —
+// the write-side counterpart of KnownVerb. Every channel-assignable verb is
+// necessarily a known verb; the converse is deliberately false.
+func ChannelAssignable(verb string) bool { return channelAssignable[verb] }
+
 // System role groups (ADR-006 P-2: roles are presets over groups), nested
 // owners ⊂ admins ⊂ moderators ⊂ members ⊂ everyone.
 const (
