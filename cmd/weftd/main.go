@@ -65,12 +65,23 @@ func main() {
 	case "serve":
 		run(serve)
 	case "import-zulip":
-		run(importZulip)
+		run(func(ctx context.Context, cfg config.Config) error {
+			return importExport(ctx, cfg, "import-zulip",
+				"unpacked Zulip export directory",
+				(*importer.Service).Run)
+		})
+	case "import-slack":
+		run(func(ctx context.Context, cfg config.Config) error {
+			return importExport(ctx, cfg, "import-slack",
+				"unpacked Slack export directory (attachment bytes pre-fetched "+
+					"into __uploads/<file id>/<filename>)",
+				(*importer.Service).RunSlack)
+		})
 	case "gen-vapid-keys":
 		genVAPIDKeys()
 	default:
 		fmt.Printf("%s v%s — %s\n", brand.Name, version, brand.Tagline)
-		fmt.Println("usage: serve | migrate | import-zulip | gen-vapid-keys | version")
+		fmt.Println("usage: serve | migrate | import-zulip | import-slack | gen-vapid-keys | version")
 	}
 }
 
@@ -100,7 +111,6 @@ func run(fn func(context.Context, config.Config) error) {
 	}
 }
 
-// importZulip: weftd import-zulip -org <slug> -dir <unpacked-export> [-dry-run]
 // openBlob picks the storage driver from config (P-07): s3 needs its own
 // multi-arg constructor (bucket/region/endpoint/prefix), everything else is
 // blob.Open's single data-directory dsn. Operators swap backends by env alone.
@@ -116,14 +126,24 @@ func openBlob(ctx context.Context, cfg config.Config) (blob.Store, error) {
 	return blob.Open(cfg.BlobDriver, cfg.BlobDir)
 }
 
-func importZulip(ctx context.Context, cfg config.Config) error {
-	fs := flag.NewFlagSet("import-zulip", flag.ExitOnError)
+// importExport is the body of BOTH import commands:
+//
+//	weftd import-zulip -org <slug> -dir <unpacked-export> [-dry-run]
+//	weftd import-slack -org <slug> -dir <unpacked-export> [-dry-run]
+//
+// They differ only in which loader builds the IR — which is the whole point of
+// the source-neutral write path — so `load` is a method expression and
+// everything below it is shared. A third source adds a case, not a command.
+func importExport(ctx context.Context, cfg config.Config, cmd, dirUsage string,
+	load func(*importer.Service, context.Context, int64, string, bool) (importer.Report, error),
+) error {
+	fs := flag.NewFlagSet(cmd, flag.ExitOnError)
 	orgSlug := fs.String("org", "", "target org slug (must exist)")
-	dir := fs.String("dir", "", "unpacked Zulip export directory")
+	dir := fs.String("dir", "", dirUsage)
 	dryRun := fs.Bool("dry-run", false, "report what this import would do, without writing")
 	_ = fs.Parse(os.Args[2:])
 	if *orgSlug == "" || *dir == "" {
-		return fmt.Errorf("import-zulip: -org and -dir are required")
+		return fmt.Errorf("%s: -org and -dir are required", cmd)
 	}
 	pool, err := db.Connect(ctx, cfg.DatabaseURL)
 	if err != nil {
@@ -142,7 +162,7 @@ func importZulip(ctx context.Context, cfg config.Config) error {
 		`SELECT id FROM org WHERE slug = $1`, *orgSlug).Scan(&orgID); err != nil {
 		return fmt.Errorf("org %q not found: %w", *orgSlug, err)
 	}
-	rep, err := importer.New(pool, store).Run(ctx, orgID, *dir, *dryRun)
+	rep, err := load(importer.New(pool, store), ctx, orgID, *dir, *dryRun)
 	if err != nil {
 		return err
 	}

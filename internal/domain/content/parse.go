@@ -17,25 +17,51 @@ import (
 // leaves the mention unresolved (rendered as inert text-like span).
 type MentionResolver func(label string) (int64, bool)
 
+// ChannelResolver maps a channel-reference label ("general") to a channel id;
+// ok=false leaves the reference unresolved. BOTH answers render inert — the
+// id only adds a data attribute a client may use to navigate.
+type ChannelResolver func(label string) (int64, bool)
+
+// Option tunes Parse beyond the mention lane.
+type Option func(*parseOptions)
+
+type parseOptions struct{ channels ChannelResolver }
+
+// WithChannelRefs enables the #**name** channel-reference syntax and resolves
+// each label through fn. It is OPT-IN so that every caller that does not pass
+// it keeps byte-identical output: a native message typing #**x** still parses
+// as a literal '#' followed by bold text, exactly as it did before this
+// syntax existed. The importer opts in because a Slack export's <#C123|name>
+// references have to land as something, and inert text loses the reference.
+func WithChannelRefs(fn ChannelResolver) Option {
+	return func(o *parseOptions) { o.channels = fn }
+}
+
 // Parse converts markdown source to the portable AST. Chat semantics: soft
 // line breaks are hard breaks (Slack/Zulip convention — a newline is a
 // newline). GFM tables, strikethrough, task lists, and autolinks are on.
 // Raw HTML in source is treated as literal text (never parsed, never
 // emitted).
-func Parse(source string, resolve MentionResolver) *Node {
+func Parse(source string, resolve MentionResolver, opts ...Option) *Node {
+	var o parseOptions
+	for _, fn := range opts {
+		fn(&o)
+	}
+	inline := []util.PrioritizedValue{
+		util.Prioritized(&mentionParser{}, 150),
+		util.Prioritized(&emojiParser{}, 160),
+	}
+	if o.channels != nil {
+		inline = append(inline, util.Prioritized(&channelRefParser{}, 155))
+	}
 	md := goldmark.New(
 		goldmark.WithExtensions(extension.Table, extension.Strikethrough,
 			extension.TaskList, extension.Linkify),
-		goldmark.WithParserOptions(
-			parser.WithInlineParsers(
-				util.Prioritized(&mentionParser{}, 150),
-				util.Prioritized(&emojiParser{}, 160),
-			),
-		),
+		goldmark.WithParserOptions(parser.WithInlineParsers(inline...)),
 	)
 	src := []byte(source)
 	root := md.Parser().Parse(text.NewReader(src))
-	c := &converter{src: src, resolve: resolve}
+	c := &converter{src: src, resolve: resolve, channels: o.channels}
 	doc := &Node{Type: NodeDoc}
 	for child := root.FirstChild(); child != nil; child = child.NextSibling() {
 		if n := c.block(child); n != nil {
@@ -49,8 +75,9 @@ func Parse(source string, resolve MentionResolver) *Node {
 }
 
 type converter struct {
-	src     []byte
-	resolve MentionResolver
+	src      []byte
+	resolve  MentionResolver
+	channels ChannelResolver
 }
 
 func (c *converter) block(n gast.Node) *Node {
@@ -212,6 +239,14 @@ func (c *converter) inlines(dst *Node, parent gast.Node, marks []Mark) {
 				}
 			}
 			dst.Content = append(dst.Content, &Node{Type: NodeMention, Attrs: attrs})
+		case *channelRefNode:
+			attrs := map[string]any{"label": v.label}
+			if c.channels != nil {
+				if id, ok := c.channels(v.label); ok {
+					attrs["channel_id"] = id
+				}
+			}
+			dst.Content = append(dst.Content, &Node{Type: NodeChannelRef, Attrs: attrs})
 		case *emojiNode:
 			dst.Content = append(dst.Content, &Node{Type: NodeEmoji, Text: v.unicode,
 				Attrs: map[string]any{"shortcode": v.shortcode}})
@@ -270,6 +305,44 @@ func (p *mentionParser) Parse(parent gast.Node, block text.Reader, pc parser.Con
 	label := string(rest[:end])
 	block.Advance(3 + end + 2)
 	return &mentionNode{label: label}
+}
+
+// ---- Weft inline syntax: #**channel name** references ----
+//
+// Modelled on the mention parser above, delimiter for delimiter. '#' is safe
+// as a trigger because an ATX heading requires the '#' run to be followed by
+// a space, a tab or the end of the line (CommonMark 4.2), so "#**general**"
+// is never a heading and always reaches the inline pass.
+
+type channelRefNode struct {
+	gast.BaseInline
+	label string
+}
+
+var kindChannelRef = gast.NewNodeKind("ContentChannelRef")
+
+func (n *channelRefNode) Kind() gast.NodeKind { return kindChannelRef }
+func (n *channelRefNode) Dump(src []byte, level int) {
+	gast.DumpHelper(n, src, level, map[string]string{"label": n.label}, nil)
+}
+
+type channelRefParser struct{}
+
+func (p *channelRefParser) Trigger() []byte { return []byte{'#'} }
+
+func (p *channelRefParser) Parse(parent gast.Node, block text.Reader, pc parser.Context) gast.Node {
+	line, _ := block.PeekLine()
+	if !bytes.HasPrefix(line, []byte("#**")) {
+		return nil
+	}
+	rest := line[3:]
+	end := bytes.Index(rest, []byte("**"))
+	if end < 1 || end > 100 {
+		return nil
+	}
+	label := string(rest[:end])
+	block.Advance(3 + end + 2)
+	return &channelRefNode{label: label}
 }
 
 // ---- :shortcode: emoji ----

@@ -18,7 +18,11 @@ import (
 // covering a bucket added later, and "the two paths agree on EVERY bucket" is
 // the whole claim. DryRun is the one field allowed to differ — it is the flag
 // that says which path produced the report.
-func reportDiff(a, b Report) []string {
+func reportDiff(a, b Report) []string { return reportDiffAs("dry", "write", a, b) }
+
+// reportDiffAs is the same walk under caller-chosen labels, so a test that
+// compares a DERIVED report against a run can say want/got instead.
+func reportDiffAs(labelA, labelB string, a, b Report) []string {
 	var out []string
 	ta := reflect.TypeOf(a)
 	va, vb := reflect.ValueOf(a), reflect.ValueOf(b)
@@ -35,7 +39,7 @@ func reportDiff(a, b Report) []string {
 		if tag := f.Tag.Get("json"); tag != "" && tag != "-" {
 			name = tag
 		}
-		out = append(out, fmt.Sprintf("%s: dry=%v write=%v", name, x, y))
+		out = append(out, fmt.Sprintf("%s: %s=%v %s=%v", name, labelA, x, labelB, y))
 	}
 	sort.Strings(out)
 	return out

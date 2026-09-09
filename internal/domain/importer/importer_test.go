@@ -827,6 +827,12 @@ func TestZulipImportShowcase(t *testing.T) {
 	// `source` was added (a deployment with two adapters cannot otherwise
 	// tell whose numbers these are) and Zulip's word "stream" left the
 	// skipped-messages key. Every other byte survived the IR extraction.
+	//
+	// P-27b added the three LOADER-contributed loss buckets (ir.Losses). They
+	// are zero here and must be: the Zulip loader populates none of them —
+	// it has no expired-bytes stub, no broadcast flag and no
+	// membership-notice-as-message — so a non-zero one would mean the planner
+	// is inventing numbers rather than folding in what a loader reported.
 	const wantJSON = `{
   "source": "zulip",
   "dry_run": false,
@@ -855,6 +861,9 @@ func TestZulipImportShowcase(t *testing.T) {
   "role_grants_skipped_existing_users": 0,
   "matched_existing_by_email": 0,
   "unread_below_watermark_coarsened": 1,
+  "attachment_bytes_expired": 0,
+  "broadcast_replies_flattened": 0,
+  "system_notices_dropped": 0,
   "already_imported": 0,
   "renamed_channels": {
     "general": "general-zulip1"

@@ -73,10 +73,16 @@ type resolution struct {
 	// that has ingested two exports must never see the other loader's keys.
 	users    map[string]int64
 	channels map[string]int64
-	threads  map[string]int64
-	messages map[string]int64
-	groups   map[string]int64
-	files    map[string]int64
+	// channelRoots is the kind=2 ROOT thread of each channel this source
+	// already imported, keyed by the CHANNEL's origin id. Root threads carry
+	// no provenance of their own — the channel lane creates them unkeyed — so
+	// `threads` can never find them, and a loader whose flat-feed messages
+	// land there needs the id to key its read watermarks on a re-run.
+	channelRoots map[string]int64
+	threads      map[string]int64
+	messages     map[string]int64
+	groups       map[string]int64
+	files        map[string]int64
 
 	// dmSpaces is keyed by the CANONICAL dm key (sorted weft ids), not by
 	// provenance: dm_space carries no origin columns because an imported
@@ -101,6 +107,7 @@ func loadResolution(ctx context.Context, tx pgx.Tx, orgID int64, source string) 
 		groupNameToID: map[string]int64{},
 		users:         map[string]int64{},
 		channels:      map[string]int64{},
+		channelRoots:  map[string]int64{},
 		threads:       map[string]int64{},
 		messages:      map[string]int64{},
 		groups:        map[string]int64{},
@@ -160,6 +167,16 @@ func loadResolution(ctx context.Context, tx pgx.Tx, orgID int64, source string) 
 		if err := scanPairs(ctx, tx, q, []any{orgID, source}, t.dst); err != nil {
 			return nil, err
 		}
+	}
+
+	// Channel ROOT threads, keyed by the channel's origin id (see the field
+	// note). Bounded by the channels THIS source imported, never by threads.
+	if err := scanPairs(ctx, tx, `
+		SELECT c.origin_id, t.id
+		FROM channel c JOIN thread t ON t.channel_id = c.id AND t.kind = 2
+		WHERE c.org_id = $1 AND c.origin_system = $2 AND c.origin_id IS NOT NULL`,
+		[]any{orgID, source}, rc.channelRoots); err != nil {
+		return nil, err
 	}
 
 	// DM conversations are matched by canonical key, and their root thread id
@@ -251,13 +268,21 @@ func loadResolution(ctx context.Context, tx pgx.Tx, orgID int64, source string) 
 	}
 
 	// Watermarks on the threads this import can reach: the ones it wrote
-	// before, plus every DM root (a DM conversation is matched by canonical
-	// key, so an import lands in NATIVE conversations too and a native
-	// watermark there is exactly the "already at or above" case).
+	// before, every DM root (a DM conversation is matched by canonical key,
+	// so an import lands in NATIVE conversations too and a native watermark
+	// there is exactly the "already at or above" case), and the CHANNEL ROOTS
+	// of this source's channels — the flat feed a Thread.Root message lands
+	// on. Root threads carry no origin_system of their own, so without the
+	// last arm a re-run would re-predict every flat-feed watermark it already
+	// wrote and the import would stop being idempotent.
 	wmRows, err := tx.Query(ctx, `
 		SELECT w.user_id, w.thread_id, w.last_read_message_id
-		FROM thread_read_watermark w JOIN thread t ON t.id = w.thread_id
-		WHERE t.org_id = $1 AND (t.origin_system = $2 OR t.dm_space_id IS NOT NULL)`,
+		FROM thread_read_watermark w
+		JOIN thread t ON t.id = w.thread_id
+		LEFT JOIN channel c ON c.id = t.channel_id
+		WHERE t.org_id = $1
+		  AND (t.origin_system = $2 OR t.dm_space_id IS NOT NULL
+		       OR (t.kind = 2 AND c.origin_system = $2))`,
 		orgID, source)
 	if err != nil {
 		return nil, err
@@ -375,6 +400,14 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 	rep := &pl.rep
 	var virt virtualIDs
 
+	// The one input the planner cannot derive: entities the LOADER dropped
+	// while parsing are not in the IR at all, so nothing downstream can see
+	// them. Folded in verbatim, before anything else, so both modes report
+	// the same numbers from the same place.
+	rep.AttachmentBytesExpired = ir.Losses.AttachmentBytesExpired
+	rep.BroadcastsFlattened = ir.Losses.BroadcastsFlattened
+	rep.SystemNoticesDropped = ir.Losses.SystemNoticesDropped
+
 	// --- Users. The order of the two match lanes is load-bearing and mirrors
 	// the write path exactly: an email that names a LIVE account matches it
 	// (D4) before provenance is ever consulted, which is why a re-run of an
@@ -423,6 +456,10 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 	// what makes a re-run report a phantom rename it will not perform).
 	liveNames := copyStringBool(rc.liveNames)
 	channelID := map[string]int64{}
+	// Where a channel's ROOT thread will sit. It is never counted — the
+	// channel lane creates it with the channel, and only messages routed to
+	// the flat feed (Thread.Root) need its id, to key their watermarks.
+	channelRoot := map[string]int64{}
 	for _, ch := range ir.Channels {
 		name := ch.Name
 		for i := 0; !ch.Archived && liveNames[strings.ToLower(name)]; i++ {
@@ -433,6 +470,7 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 		}
 		if id, ok := rc.channels[ch.SourceID]; ok {
 			channelID[ch.SourceID] = id
+			channelRoot[ch.SourceID] = rootLanding(rc.channelRoots[ch.SourceID], &virt)
 			rep.AlreadyImported++
 			continue
 		}
@@ -443,6 +481,7 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 		}
 		liveNames[strings.ToLower(name)] = true
 		channelID[ch.SourceID] = virt.mint()
+		channelRoot[ch.SourceID] = virt.mint()
 		pl.channelName[ch.SourceID] = name
 		rep.Channels++
 	}
@@ -594,7 +633,17 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 		if m.Thread == nil {
 			// The one invariant the IR's types cannot express. Refused HERE,
 			// before a single row is written, so a dry run answers it too.
+			// Thread.Root is how a loader says "the flat feed" ON PURPOSE;
+			// nil still means it forgot.
 			return nil, fmt.Errorf("import message %s: channel message without a thread", m.SourceID)
+		}
+		if m.Thread.Root {
+			// The flat feed. The row exists already, so no thread is created
+			// and none is counted; the message still needs its thread id for
+			// the read-state reduction below.
+			msgThread[m.SourceID] = channelRoot[m.Container.Key]
+			pl.planChannelMessage(m, rc, userID, msgLanding, &virt)
+			continue
 		}
 		thID, ok := threadID[m.Thread.Key]
 		if !ok {
@@ -613,21 +662,8 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 			}
 			threadID[m.Thread.Key] = thID
 		}
-		if id, ok := rc.messages[m.SourceID]; ok {
-			msgLanding[m.SourceID] = landing{id: id, ordinal: m.Ordinal}
-			msgThread[m.SourceID] = thID
-			rep.AlreadyImported++
-			continue // a re-run imports no edits: the message row is not new
-		}
-		if _, ok := msgLanding[m.SourceID]; ok {
-			msgThread[m.SourceID] = thID
-			rep.AlreadyImported++
-			continue
-		}
-		msgLanding[m.SourceID] = landing{id: virt.mint(), fresh: true, ordinal: m.Ordinal}
 		msgThread[m.SourceID] = thID
-		pl.planEdits(m, userID)
-		rep.Messages++
+		pl.planChannelMessage(m, rc, userID, msgLanding, &virt)
 	}
 
 	// --- Reactions. Rows affected again: the PK is (message, user, emoji),
@@ -652,6 +688,38 @@ func newPlan(ir *Import, rc *resolution) (*plan, error) {
 	pl.planReadState(ir, rc, userID, msgLanding, msgThread)
 	pl.rep.finalize()
 	return pl, nil
+}
+
+// rootLanding answers where a channel's ROOT thread sits. A channel this
+// source already imported has one; a resolution that somehow does not know it
+// gets a virtual id, which predicts a watermark write rather than a no-op —
+// the safe direction, since the upsert is monotone either way.
+func rootLanding(existing int64, virt *virtualIDs) int64 {
+	if existing != 0 {
+		return existing
+	}
+	return virt.mint()
+}
+
+// planChannelMessage decides what ONE channel message costs. Both
+// destinations — a thread of its own, and the container's flat feed — go
+// through it, so idempotency and edit accounting can never drift between
+// them. The caller has already recorded which thread the message lands in.
+func (pl *plan) planChannelMessage(m *Message, rc *resolution, userID map[string]int64,
+	msgLanding map[string]landing, virt *virtualIDs) {
+
+	if id, ok := rc.messages[m.SourceID]; ok {
+		msgLanding[m.SourceID] = landing{id: id, ordinal: m.Ordinal}
+		pl.rep.AlreadyImported++
+		return // a re-run imports no edits: the message row is not new
+	}
+	if _, ok := msgLanding[m.SourceID]; ok {
+		pl.rep.AlreadyImported++
+		return
+	}
+	msgLanding[m.SourceID] = landing{id: virt.mint(), fresh: true, ordinal: m.Ordinal}
+	pl.planEdits(m, userID)
+	pl.rep.Messages++
 }
 
 // planDirectMessage mirrors the DM lane: a conversation imports only when
