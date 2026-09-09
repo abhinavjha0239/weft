@@ -95,6 +95,12 @@ func TestGatewayReconnectStorm(t *testing.T) {
 		for i := 0; i < gap; i++ {
 			sendChannel(t, ts.URL, boot.Token, boot.ChannelID, fmt.Sprintf("%s-gap-%d", label, i))
 		}
+		// One container-less event at the END of the gap. It is org-visible by
+		// design (gateway.filter), so it reaches the outsider below and PROVES
+		// that connection is a real recipient of the shared block — without it,
+		// "the outsider heard no channel event" would be satisfied by an
+		// outsider that was simply never served at all.
+		commitEvent(t, ctx, pool, boot.OrgID, orgWideVerb, nil)
 
 		// Independently derived expectations: read out of event_log, not out of
 		// what the gateway happened to send.
@@ -109,6 +115,13 @@ func TestGatewayReconnectStorm(t *testing.T) {
 		}
 
 		tokens := bulkChannelMembers(t, ctx, pool, boot.OrgID, boot.ChannelID, label, n+1)
+		// The ACL negative, IN THE SAME STORM and on the SAME cursor: an org
+		// member who is not in the channel. A shared read means shared ROWS, so
+		// the only thing standing between this connection and the cohort's
+		// channel traffic is its own filter — the property a careless
+		// implementation of this slice breaks.
+		outsiderTok := bareOrgMember(t, ctx, pool, boot.OrgID,
+			label+"-outsider@st.test", "Outsider", label+"-outsider-tok")
 		before := readResumeReads(t)
 
 		// THE STORM: every connection dials at the same instant, which is what
@@ -118,7 +131,15 @@ func TestGatewayReconnectStorm(t *testing.T) {
 			err  error
 		}
 		results := make([]result, n+1)
+		var outsiderErr error
 		var wg sync.WaitGroup
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			c := dialClientLast(t, ctx, ts.URL, outsiderTok, fmt.Sprintf("%d", resumeAt))
+			defer c.conn.CloseNow()
+			outsiderErr = expectOnlyOrgWide(c)
+		}()
 		for i := range tokens {
 			from, want := resumeAt, wantCohort
 			if i == n { // the outlier, in the same storm
@@ -136,6 +157,9 @@ func TestGatewayReconnectStorm(t *testing.T) {
 		wg.Wait()
 		after := readResumeReads(t)
 
+		if outsiderErr != nil {
+			t.Fatalf("%s outsider: %v", label, outsiderErr)
+		}
 		for i, got := range results {
 			want := wantCohort
 			who := fmt.Sprintf("%s cohort connection %d", label, i)
@@ -243,6 +267,41 @@ func collectMessageSeqs(c *wsClient, want int) ([]int64, error) {
 		}
 	}
 	return out, nil
+}
+
+// orgWideVerb is the container-less event that bookends each storm's gap: it
+// names no channel and no DM, so gateway.filter delivers it to every connection
+// in the org, member or not.
+const orgWideVerb = "emoji.created"
+
+// expectOnlyOrgWide drains a NON-member resuming on the cohort's cursor and
+// checks the two halves of the ACL claim at once: it must receive the
+// container-less event that ends the gap (so it is PROVED to have been served
+// the shared block, not merely ignored), and it must receive none of the
+// channel traffic that precedes it in the very same block. Ordering makes the
+// negative deterministic without a sleep: the resume lane replays in id order,
+// so a wrongly-delivered channel event would arrive BEFORE the bookend.
+func expectOnlyOrgWide(c *wsClient) error {
+	deadline := time.After(30 * time.Second)
+	for {
+		select {
+		case e, ok := <-c.events:
+			if !ok {
+				return fmt.Errorf("connection closed before the org-wide event arrived")
+			}
+			switch e.Type {
+			case "message.created":
+				return fmt.Errorf("a NON-member was replayed channel event seq %d out of the "+
+					"cohort's shared block: a shared read is only safe because every "+
+					"connection still applies its OWN filter to it", e.Seq)
+			case orgWideVerb:
+				return nil
+			}
+		case <-deadline:
+			return fmt.Errorf("timed out waiting for the org-wide event; this connection was " +
+				"never served the shared block, so the silence above proves nothing")
+		}
+	}
 }
 
 // readResumeReads reads the process-global gateway_resume_reads_total counter —
