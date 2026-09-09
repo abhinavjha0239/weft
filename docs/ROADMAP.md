@@ -2970,6 +2970,42 @@ directive 8).
 >     cannot count rows WRITTEN, and a statement count is vacuously green
 >     (today's O(members) UPSERT is one statement for N rows).
 >
+> **DECISION (a) IS NOW SETTLED ON EVIDENCE (2026-09-10): narrow
+> `send_message` at CHANNEL scope, as ADR-006 always said.** A survey of
+> seven products found the poster set is per-channel UNANIMOUSLY and
+> nowhere org-wide: Zulip's `can_send_message_group` is an FK on the
+> Stream row while Realm carries ~20 `can_*_group` settings and posting
+> is deliberately not one of them; Slack's
+> `admin.conversations.setConversationPrefs` REQUIRES `channel_id`;
+> Teams, Mattermost, Discord, Google Chat and Rocket.Chat all scope it to
+> the channel/space/room. The three things that LOOK org-wide are
+> something else — Slack's org policy governs who may EDIT the
+> per-channel setting, and Mattermost's system scheme is documented
+> whole-server maintenance mode. Zulip's own migrations (0645-0648)
+> moved from a per-stream ENUM to a per-stream GROUP: toward more
+> per-channel expressiveness, never toward org scope. **So the new-verb
+> option would have shipped "announcement ORGS" under the name
+> "announcement channels".** The cost is explicit: P-44 must build the
+> channel-scope permission-assignment surface, since `AssignVerb`
+> hardcodes org scope and `perms.ChannelRef` has no non-test caller.
+>
+> **DECISION (b) IS SETTLED TOO: automations do NOT get an exemption.**
+> This REVERSES the reviewer's lean. Weft's own honest-rungs invariant
+> decides it — a posting restriction automations ignore is precisely a
+> knob whose lane does not exist. The external evidence is one-sided:
+> Slack's own bypass is a DOCUMENTED security hole its writeup concludes
+> with "Slack at its core does not prevent apps from making this
+> unauthorized post to an announcement-only channel", and Slack declined
+> to fix it — a self-hosted product selling honest governance cannot
+> borrow that answer. Zulip enforces on bots at ONE chokepoint and
+> permits exactly one bypass, defended by a runtime assert and a comment
+> calling the code security-sensitive. **The structural obstacle is real
+> and must shape the re-spec:** AU-2 deliberately removed the owning user
+> ("owned by the scope, not a user — Slack's creator-orphaning footgun
+> designed out"), so Zulip's owner-inheritance cannot be copied
+> literally. Resolve it with a scope-owned principal that itself holds
+> verbs, and amend AU-2 rather than leaving it contradicted.
+>
 > **Consequences for the queue.** P-44 is XL, not L: it needs a
 > conversion surface, a verb-assignment backfill migration, a rewritten
 > read query, replay guards, delete-lane handling across compliance, a
@@ -3202,9 +3238,14 @@ importer mapping of Zulip announcement-only streams → kind=4; the
 > - **P-27c — SPEC-READY**, the dry-run reconciliation, split out
 >   BECAUSE it cannot be behaviour-preserving (`dry.Subscriptions` is
 >   empirically 10 against the write path's 3).
-> - **P-27b — still BLOCKED**, the Slack loader, holding four of the five
->   design questions. The fifth (the email/NULL rule) was resolved as a
->   shipped BUG FIX in #140, not as a spec decision.
+> - **P-27b — now SPEC-READY** (2026-09-10). All four of its design
+>   questions were resolved on EVIDENCE by a six-thread research sweep
+>   (official docs / implementation code / user feedback, every claim
+>   citation-bound); the fifth, the email/NULL rule, was resolved as a
+>   shipped BUG FIX in #140. **Three of the four overturned the
+>   reviewer's own lean** — see the P-27b entry, which records the source
+>   behind each decision so a future reader re-checks rather than
+>   re-litigates.
 >
 > This entry stays as the audit record. Dispatch P-27a.
 
@@ -3915,6 +3956,163 @@ bucket for the same fixture (the assertion that does not exist today),
 plus a NON-virgin-org case where dry predicts the re-run's
 `already_imported` correctly. RED: restore either path's private
 accounting → the equality assert fails on the bucket that drifted.
+
+### P-27b `importer: The Slack loader.` — L — ZERO migrations — **SPEC-READY (all four blocked decisions resolved on EVIDENCE, 2026-09-10; each records its source so a future reader can re-check rather than re-litigate)**
+
+**What & why.** P-27a made the write path source-neutral and P-27c made the
+dry run derive from the same planner, so a second source is now a LOADER
+and nothing else: parse a Slack export, emit the IR, add an
+`import-slack` CLI. The `slack_incoming` compat endpoint stays split out.
+
+**Grounding.** Zulip ships a mature Slack importer —
+`~/Documents/zulip/zerver/data_import/slack.py` plus
+`slack_message_conversion.py` — and it is the format authority. Read
+both in full first. Every export-shape claim below was read out of it.
+
+**The four decisions, and the evidence behind each.** These were blocked
+for weeks; they are settled now and must NOT be re-opened by an executor.
+
+---
+
+**D1 — Channel references become a FIRST-CLASS `channel_ref` AST node,
+rendered INERT.** Neither of the two options originally posed (inert
+text, or a link).
+- Add `NodeChannelRef = "channel_ref"` to `content/content.go`, modelled
+  byte-for-byte on the existing `NodeMention` (`parse.go`): attrs
+  `label` ALWAYS, plus Weft's own `channel_id` ONLY when the reference
+  resolved. You are reusing a shape the repo already tests.
+- **Render inert in BOTH cases** — resolved and unresolved differ only by
+  a class. **Do NOT use `MarkLink`:** `SafeURL` rejects relative hrefs,
+  so `/channels/5` silently degrades to bare text, and making it work
+  means punching a hole in the one function that gates every link in a
+  renderer that is XSS-safe by construction. Not worth it for a cosmetic
+  import nicety.
+- **Emitting identical bytes to every reader is what keeps the
+  oracle-free-404 posture intact.** Zulip's import path gets this wrong
+  today: it defers to a lazy render with no acting user, which takes the
+  realm-wide branch and bakes a resolved channel name into content every
+  reader sees. Weft must not copy that.
+- Slack's wire form is `<#C123|name>`; handle the pipe-less `<#C123>`
+  too (the reference implementation ignores it), and a reference to a
+  channel absent from `channels.json` resolves to label-only.
+
+**D2 — Imported history arrives READ: mint a synthetic watermark per
+(user, thread) at the highest message the import landed, then let
+`SeedUnreadCounters` run unchanged.**
+- **The decisive argument is Weft-internal, and it is why "just skip the
+  seed" is not an option:** skipping yields zero badges only until the
+  first LIVE message creates a counter row — the reconcile sweep then
+  recomputes that row from the same `m.id > COALESCE(w.last_read_message_id, 0)`
+  aggregate, repairs it to the FULL imported history, and Warn-logs a
+  spurious divergence. The counter is a documented cache and the
+  watermark is truth, so read state must be fixed AT THE WATERMARK.
+- Vendor precedent as a **bug fix**, not a taste call: mmetl (the
+  official Slack→Mattermost ETL) PR #88 — "Since Slack exports don't
+  include per-user read state, use last_viewed_at, marking all
+  pre-existing messages as read at import time".
+- Reference parity: Zulip's single UserMessage builder hardcodes
+  `flags_mask = 1  # For read` for Slack, Mattermost, Rocket.Chat and
+  Teams alike, pinned by test.
+- The tell: remediation docs exist ONLY where code did not do this —
+  Mattermost's Slack guide ships a "Fixing unread channels and threads"
+  SQL block; the Gitter→Matrix FAQ tells users to hit "Mark all as
+  read". Zulip's and Rocket.Chat's import pages say nothing, because
+  they never needed to.
+
+**D3 — Bots keep the CURRENT skip-and-count. This is a SCOPE decision,
+not an evidence one, and the entry says so.**
+- Zulip's precedent runs the OTHER way: it imports bots as real accounts
+  (`is_bot=True, bot_type=1`, `slack.py:329-352`) and synthesizes
+  `Deleted Slack Bot <id>` placeholders for integration senders with no
+  user record (`slack.py:1493`, via a `bots.info` fallback the OFFLINE
+  rule forbids us anyway).
+- We are not following it **in this slice** because landing bots is a
+  change to the SHARED WRITE PATH, not loader work: it invalidates the
+  rule that a DM imports only when every participant is human, which an
+  existing test pins. Doing it here would make a loader slice a
+  write-path slice.
+- **Recorded gap with a named successor:** `P-27d importer: Land bot
+  authors.` — it must decide user kind (2 vs 3), what happens to the DM
+  whole-skip rule, and how integration senders with no `users.json` row
+  are synthesized offline. Until then bot messages remain a COUNTED
+  loss, which the fidelity Report already surfaces.
+
+**D4 — Files: adopt the de facto `__uploads/` convention, resolve BY ID,
+unpacked directory only.**
+- Layout `<export_root>/__uploads/<slack_file_id>/<filename>`, rooted at
+  the same unpacked directory the loader reads `channels.json` from.
+  This is **byte-identical to what slack-advanced-exporter and
+  slackdump already write**, so an operator gets a working pre-fetch
+  step from existing tooling — zero Weft-authored fetcher, zero
+  credential surface. Do not invent a private layout.
+- **Resolve by id; the filename is cosmetic.** Glob `__uploads/<id>/*`
+  and require exactly one regular file, as both tools' own readers do.
+  Do NOT compare the on-disk name to the JSON `name` — that reintroduces
+  every unicode/slash/dedup sanitization mismatch. Zero matches →
+  skipped-with-reason; two or more → a hard, named error, because
+  ambiguity must never silently pick a file.
+- **Unpacked directory, never the zip — this is FORCED, not stylistic.**
+  `archive/zip`'s `File.Open()` returns a NON-SEEKABLE reader, and
+  P-27a's IR contract is `io.ReadSeekCloser` because storage keys are
+  content-addressed (hash the stream, then rewind and hand the same one
+  to `blob.Put`).
+- A standard export carries metadata only. `mode: tombstone` /
+  `hidden_by_limit` files (free-plan exports lost the bytes permanently)
+  must be counted explicitly — that is a real fidelity loss and the
+  Report exists so nobody discovers it later.
+
+---
+
+**Format facts, verified against `slack.py` — the spec's earlier draft
+got two of these WRONG:**
+- Files: `users.json` · `channels.json` (public) · `groups.json`
+  (private) · `mpims.json` (group DMs) · `dms.json` (1:1) · one
+  directory per conversation of dated `.json` message files.
+- **`thread_ts` is on PARENTS too.** A thread root carries
+  `thread_ts == ts`. The discriminator is: `thread_ts != ts` ⇒ reply ·
+  `thread_ts == ts` ⇒ root · absent ⇒ unthreaded. "Has `thread_ts` ⇒ is
+  a reply" makes every parent its own reply.
+- `subtype: thread_broadcast` is a reply ALSO posted to the channel —
+  land it once in the thread and count the broadcast.
+- **Broadcast mentions are `<!channel>`, `<!here>`, `<!everyone>` on the
+  wire** — NOT the rendered `@channel`. They import as INERT TEXT: Weft
+  has no broadcast mentions and P-44 bans them structurally. Note the
+  raw token renders as visible corruption if untouched, so doing nothing
+  is not the same as doing this.
+- `file_share` carries its upload in `file`, not `files` — handle both.
+- ~90% of channel messages are unthreaded and land on the channel-root
+  (kind=2) thread. P-27a's `kind = 1` gate already stops the counter
+  bump there; do not re-open it.
+- **Weft's first-class threads take `thread_ts` DIRECTLY.** Zulip had to
+  synthesize topic names because it has topics, not threads. Do NOT port
+  that workaround — it is the finding that made the original grounding
+  worthwhile.
+
+**Origin ids.** `ts` is conversation-scoped, so the message origin id is
+`"<conversation ID>:<ts>"` — the **id**, not the name, so a rename does
+not break re-run idempotency. P-27a already made source ids `string`.
+
+**Users.** The email rule is already settled and SHIPPED (#140): an
+absent email is not a match key and is stored as SQL NULL. Slack single-
+channel guests map to the Weft guest role, honouring the P-5 ceiling.
+
+**Tests (`TestSlackImport`, fixture-driven, fully OFFLINE).** Assert
+STATE: row counts, thread parentage, DM participant sets, Report bucket
+totals, actor kind 4 with ZERO notification rows — and note that last
+one needs a real consumer wired, because the importer package builds
+none and the count is otherwise 0 regardless. **RED/GREEN, all four:**
+(1) ignore `thread_ts` → replies flatten onto the channel root — the
+load-bearing pin, since threading is why this maps better to Weft than
+to Zulip; (2) emit `<!channel>` as a live mention → the inert assert
+fires on NODE TYPE, not on rendered text; (3) skip the watermark mint →
+every member's badge is the whole imported history; (4) resolve a file
+by filename instead of id → the sanitization-mismatch case fails.
+
+**Gaps to record:** token-authenticated fetch behind the egress guard;
+Slack Enterprise/compliance export shapes; canvases, huddles, workflows,
+saved items; custom profile fields; per-channel notification prefs;
+shared/Connect channels (ADR-004 territory). Plus **P-27d** (bots) and
+**P-27e** (`slack_incoming`).
 
 ---
 
