@@ -149,8 +149,29 @@ func (s *Service) Run(ctx context.Context, orgID int64, dir string, dryRun bool)
 	if err != nil {
 		return Report{}, err
 	}
-	ir := ex.toImport()
+	return s.runImport(ctx, orgID, ex.toImport(), dryRun)
+}
 
+// RunSlack imports an unpacked Slack export into an existing org, on exactly
+// the terms Run documents above — the two differ only in which loader builds
+// the IR, which is the whole point of P-27a's extraction. Everything
+// downstream (idempotency, the shared planner, the dry run, the fidelity
+// report) is the same code answering about a different source.
+//
+// The export directory is the UNPACKED one, with attachment bytes pre-fetched
+// into `__uploads/<file id>/<filename>` — the layout slack-advanced-exporter
+// and slackdump already write. See LoadSlackExport for why it is a directory
+// and not the zip.
+func (s *Service) RunSlack(ctx context.Context, orgID int64, dir string, dryRun bool) (Report, error) {
+	ex, err := LoadSlackExport(dir)
+	if err != nil {
+		return Report{}, err
+	}
+	return s.runImport(ctx, orgID, ex.toImport(), dryRun)
+}
+
+// runImport is the source-neutral half of both entry points.
+func (s *Service) runImport(ctx context.Context, orgID int64, ir *Import, dryRun bool) (Report, error) {
 	if dryRun {
 		var rep Report
 		err := db.WithTx(ctx, s.pool, func(tx pgx.Tx) error {
