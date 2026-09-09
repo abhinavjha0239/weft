@@ -62,6 +62,43 @@ is correct and stable under concurrency with zero errors.
    A cell sizes its pool under its Postgres ceiling; beyond that it adds
    PgBouncer or splits.
 
+## Reconnect storms: the resume lane's read is shared per cohort
+
+S3 made a message cost ONE `event_log` read per org however many connections are
+live. The RESUME lane stayed per connection, which is right for an occasional
+reconnect and wrong for a node restart: every connection that node held comes
+back at once, so the spike S3 removed returns at every deploy.
+
+The premise was measured before the fix was built, and the obvious reason for it
+is not the real one. Connections that die together do NOT automatically resume
+together: the server-side cursor is identical for every live connection (the fan
+advances past ACL-filtered rows), but a CLIENT resumes from the last seq it was
+DELIVERED, which is per visibility class. On a 12-connection, four-channel,
+skewed-traffic fixture:
+
+```
+org head 34 — busy channel (6 conns) resumed at 28, medium (3) at 33,
+              quiet (2) at 34, SILENT-channel member at 0
+              → spread 34, four distinct cursors for twelve connections
+same fixture, checkpoint interval shortened:
+              → every one of the twelve at 34.  Spread 0.
+```
+
+What converges them is the **F-2 checkpoint**, which hands every connection the
+org-wide cursor (ACL gaps included) every `checkpointInterval`. So a cohort's
+cursor spread is bounded by one checkpoint interval of org events, and one read
+serves it: the shard keeps the last resume read as a shared block, single-flighted,
+usable only by connections that arrived before it was read (so it can never be
+staler than a connection's own read would have been) and only where it both
+starts at or below their cursor and reaches past it (so a far-behind resumer
+reads alone instead of widening anyone's read). `gateway_resume_reads_total` is
+the series; measured on the pin, 8 connections cost 3 reads and 24 cost 2, where
+the per-connection lane cost 9 and 25.
+
+Not free, and worth stating: a reconnect still costs its own `Tail.Head` plus two
+membership queries before it reaches the resume lane. This removes the heaviest
+of the four, not all four.
+
 ## Known scale-tier optimizations (not yet needed, documented for when they are)
 
 - **Gateway per-org multicast** (`perf/gateway-org-multicast`, future): today
