@@ -34,8 +34,14 @@ func TestReportMatchesTheRowsItLands(t *testing.T) {
 		got    int
 		query  string
 	}{
+		// The reserved 'system' origin namespace is the PLATFORM's own
+		// provenance, not an import's: P-44b's automation principal is keyed
+		// ('system', 'automation-principal') and exists in every org from
+		// bootstrap, so a bare `origin_system IS NOT NULL` would count a row
+		// no importer ever wrote.
 		{"users", rep.Users,
-			`SELECT count(*) FROM user_account WHERE org_id = $1 AND origin_system IS NOT NULL`},
+			`SELECT count(*) FROM user_account
+			  WHERE org_id = $1 AND origin_system IS NOT NULL AND origin_system <> 'system'`},
 		{"channels", rep.Channels,
 			`SELECT count(*) FROM channel WHERE org_id = $1 AND origin_system IS NOT NULL`},
 		{"threads", rep.Threads,

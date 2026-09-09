@@ -121,6 +121,23 @@ func (s *Service) Bootstrap(ctx context.Context, p BootstrapParams) (BootstrapRe
 		if err := s.perms.SeedOrg(ctx, tx, out.OrgID, out.UserID); err != nil {
 			return err
 		}
+		// P-44b: the org's automation principal exists from birth and holds
+		// its verbs through role:automations. It used to be created lazily on
+		// the first automation run, which was fine while its posts were
+		// ungated; now that they resolve send_message like anyone else's, an
+		// account in no group would mean DENY, so placement happens here —
+		// once, in the bootstrap transaction — and never on the run path.
+		principalID, err := AutomationPrincipal(ctx, tx, out.OrgID)
+		if err != nil {
+			return err
+		}
+		automationsGroupID, err := s.perms.SystemGroupID(ctx, tx, out.OrgID, perms.GroupAutomations)
+		if err != nil {
+			return err
+		}
+		if err := s.perms.AddUserToGroup(ctx, tx, out.OrgID, automationsGroupID, principalID); err != nil {
+			return err
+		}
 		var rootThreadID int64
 		if err := tx.QueryRow(ctx, `
 			INSERT INTO channel (org_id, workspace_id, name, creator_id)

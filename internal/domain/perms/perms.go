@@ -206,7 +206,8 @@ func (s *Service) HoldersAt(ctx context.Context, tx pgx.Tx, orgID int64, verb st
 // default org-scope assignments, and builds the closure. Runs in the
 // bootstrap transaction.
 func (s *Service) SeedOrg(ctx context.Context, tx pgx.Tx, orgID, ownerUserID int64) error {
-	names := []string{GroupEveryone, GroupMembers, GroupModerators, GroupAdmins, GroupOwners}
+	names := []string{GroupEveryone, GroupMembers, GroupModerators, GroupAdmins,
+		GroupOwners, GroupAutomations}
 	ids := map[string]int64{}
 	for _, n := range names {
 		var id int64
@@ -217,10 +218,13 @@ func (s *Service) SeedOrg(ctx context.Context, tx pgx.Tx, orgID, ownerUserID int
 		}
 		ids[n] = id
 	}
-	// owners ⊂ admins ⊂ moderators ⊂ members ⊂ everyone
+	// owners ⊂ admins ⊂ moderators ⊂ members ⊂ everyone, and the automation
+	// principal's group hangs off everyone (P-44b — see GroupAutomations for
+	// why it inherits rather than carrying its own org-scope assignment).
 	nesting := [][2]string{
 		{GroupAdmins, GroupOwners}, {GroupModerators, GroupAdmins},
 		{GroupMembers, GroupModerators}, {GroupEveryone, GroupMembers},
+		{GroupEveryone, GroupAutomations},
 	}
 	for _, n := range nesting {
 		if _, err := tx.Exec(ctx,

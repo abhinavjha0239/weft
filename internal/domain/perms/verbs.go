@@ -127,6 +127,23 @@ const (
 	GroupModerators = "role:moderators"
 	GroupAdmins     = "role:admins"
 	GroupOwners     = "role:owners"
+	// GroupAutomations holds the org's automation principal — the kind-2
+	// account the runner authors as when a rule names no human (ADR-014 AU-2:
+	// "owned by the scope, not a user"). P-44b gives that principal REAL
+	// verbs so its posts can be gated like anyone else's, and a group is the
+	// only thing (verb, scope) assignments can point at.
+	//
+	// It is nested UNDER role:everyone rather than carrying its own
+	// assignment, because permission_assignment is UNIQUE on
+	// (org, verb, scope) and send_message at ORG scope already belongs to
+	// role:everyone: a second org-scope row is impossible, and repointing the
+	// existing one would strip send_message from every human in the org. So
+	// the principal inherits the org default exactly the way role:owners
+	// inherits it, and an admin narrows automation posting by assigning
+	// send_message at a NARROWER scope (P-44a's channel rung) to a group the
+	// principal is not in — or by removing it from this group, which revokes
+	// automation posting org-wide.
+	GroupAutomations = "role:automations"
 )
 
 // defaultAssignments seeds org-scope defaults at bootstrap. Deliberately
@@ -227,3 +244,25 @@ ON CONFLICT (org_id, verb, scope_type, scope_id) DO NOTHING`
 // be a wire-contract change, not a cleanup. Exported for the same
 // no-drift reason as the backfill.
 const UnseedManageBillingSQL = `DELETE FROM permission_assignment WHERE verb = 'manage_billing'`
+
+// BackfillAutomationsGroupSQL is the perms half of migration 0027 (P-44b):
+// the role:automations group and its nesting under role:everyone, for the
+// orgs that already exist. It is SeedOrg's upgrade twin — SeedOrg writes both
+// rows EXPLICITLY, so (P-47's lesson, restated) the seed helps FUTURE orgs
+// only: without this statement every existing org's automation principal
+// would resolve to DENY the moment the gate lands, silently stopping every
+// rule on the cell.
+//
+// Exported and embedded byte-for-byte by the migration so the shipped upgrade
+// and the test that exercises it cannot drift — the normal harness migrates an
+// EMPTY database, where this matches zero orgs and proves nothing.
+const BackfillAutomationsGroupSQL = `INSERT INTO user_group (org_id, name, is_system)
+SELECT o.id, 'role:automations', true FROM org o
+ON CONFLICT (org_id, name) DO NOTHING;
+
+INSERT INTO user_group_subgroup (group_id, subgroup_id)
+SELECT e.id, a.id
+FROM user_group e
+JOIN user_group a ON a.org_id = e.org_id AND a.name = 'role:automations'
+WHERE e.name = 'role:everyone'
+ON CONFLICT DO NOTHING`

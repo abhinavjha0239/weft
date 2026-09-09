@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/abhinavjha0239/weft/internal/db"
+	"github.com/abhinavjha0239/weft/internal/domain/identity"
 	"github.com/abhinavjha0239/weft/internal/domain/messaging"
 	"github.com/abhinavjha0239/weft/internal/domain/notification"
 	"github.com/abhinavjha0239/weft/internal/domain/perms"
@@ -422,9 +423,16 @@ func (r *Runner) execute(ctx context.Context, orgID int64, rl rule, ev eventlog.
 				Error:  fmt.Sprintf("chain depth %d reached the cap (%d)", depth, maxChainDepth)}})
 		}
 
+		// Who the steps author as: the rule's CONSENTED human, or the org's
+		// automation principal (F-13's scope identity). Either way the post
+		// resolves send_message for THAT account (P-44b) — the principal has
+		// no exemption, and neither does the human whose name a rule borrows.
+		// The upsert stays lazy for the orgs that predate P-44b's bootstrap
+		// seeding; it grants nothing, so an account it has to create is one
+		// migration 0027 should already have placed in role:automations.
 		authorID := rl.ActorUserID
 		if authorID == nil {
-			pid, err := automationPrincipal(ctx, tx, orgID)
+			pid, err := identity.AutomationPrincipal(ctx, tx, orgID)
 			if err != nil {
 				return err
 			}
@@ -580,27 +588,6 @@ func finishRun(ctx context.Context, tx pgx.Tx, runID int64, status int16, traces
 		return fmt.Errorf("automation: finish run: %w", err)
 	}
 	return nil
-}
-
-// automationPrincipal is the per-org agent account automations author as
-// when no human actor is named (F-13's scope identity) — created lazily,
-// race-safe via the user_account origin key.
-func automationPrincipal(ctx context.Context, tx pgx.Tx, orgID int64) (int64, error) {
-	if _, err := tx.Exec(ctx, `
-		INSERT INTO user_account (org_id, kind, full_name, role, origin_system, origin_id)
-		VALUES ($1, 2, 'Automations', 50, 'system', 'automation-principal')
-		ON CONFLICT (org_id, origin_system, origin_id) WHERE origin_system IS NOT NULL
-		DO NOTHING`, orgID); err != nil {
-		return 0, fmt.Errorf("automation: principal insert: %w", err)
-	}
-	var id int64
-	if err := tx.QueryRow(ctx, `
-		SELECT id FROM user_account
-		WHERE org_id = $1 AND origin_system = 'system' AND origin_id = 'automation-principal'`,
-		orgID).Scan(&id); err != nil {
-		return 0, fmt.Errorf("automation: principal lookup: %w", err)
-	}
-	return id, nil
 }
 
 // scheduleLane fires due schedules on a fixed tick, beside sweep. Each

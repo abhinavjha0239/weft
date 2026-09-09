@@ -157,7 +157,8 @@ func TestWriteDrainsANeutralImport(t *testing.T) {
 	var wrongSystem int
 	if err := pool.QueryRow(ctx, `
 		SELECT (SELECT count(*) FROM user_account WHERE org_id = $1
-		          AND origin_system IS NOT NULL AND origin_system <> 'acme')
+		          AND origin_system IS NOT NULL AND origin_system <> 'acme'
+		          AND origin_system <> 'system')
 		     + (SELECT count(*) FROM channel WHERE org_id = $1
 		          AND origin_system IS NOT NULL AND origin_system <> 'acme')
 		     + (SELECT count(*) FROM thread WHERE org_id = $1
