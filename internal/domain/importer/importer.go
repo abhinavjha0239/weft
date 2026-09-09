@@ -80,6 +80,14 @@ type Report struct {
 	// read; sparse unread gaps BELOW that point are coarsened away. Counted,
 	// never silent.
 	ReadCoarsened int `json:"unread_below_watermark_coarsened"`
+	// Losses only a LOADER can see, folded in by the planner so both modes
+	// report them identically (ir.go's Losses documents each one). They live
+	// here rather than in the loader's own output because the fidelity
+	// contract is one report, and an entity dropped before the IR would
+	// otherwise land in no bucket at all.
+	AttachmentBytesExpired int `json:"attachment_bytes_expired"`
+	BroadcastsFlattened    int `json:"broadcast_replies_flattened"`
+	SystemNoticesDropped   int `json:"system_notices_dropped"`
 
 	// Idempotency: rows already present from a previous run.
 	AlreadyImported int `json:"already_imported"`
@@ -276,7 +284,8 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 
 	// --- Streams → channels (+ root thread). Name collisions with existing
 	// channels are renamed visibly (never silently merged).
-	channelMap := map[string]int64{} // source channel id → our channel id
+	channelMap := map[string]int64{}  // source channel id → our channel id
+	channelRoot := map[string]int64{} // source channel id → its kind=2 root thread
 	for _, ch := range ir.Channels {
 		// Live-name collisions were resolved by the plan, in Go and visibly
 		// (never silent merges). The name is NOT re-derived here: the walk
@@ -287,7 +296,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 		if name == "" {
 			name = ch.Name
 		}
-		var id int64
+		var id, rootID int64
 		reRun := false
 		err := tx.QueryRow(ctx, `
 			INSERT INTO channel (org_id, name, visibility, description,
@@ -300,10 +309,12 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 			orgID, name, ch.Visibility, ch.Description, ch.CreatedAt,
 			ch.Archived, ir.Source, ch.SourceID).Scan(&id)
 		if err == pgx.ErrNoRows { // re-run
+			// The root thread id comes back too: a loader whose flat-feed
+			// messages land there needs it on every run, not only the first.
 			if err := tx.QueryRow(ctx, `
-				SELECT id FROM channel WHERE org_id = $1
+				SELECT id, COALESCE(root_thread_id, 0) FROM channel WHERE org_id = $1
 				 AND origin_system = $2 AND origin_id = $3`,
-				orgID, ir.Source, ch.SourceID).Scan(&id); err != nil {
+				orgID, ir.Source, ch.SourceID).Scan(&id, &rootID); err != nil {
 				return fmt.Errorf("resolve imported channel %s: %w", ch.SourceID, err)
 			}
 			reRun = true
@@ -312,9 +323,9 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 		}
 		if reRun {
 			channelMap[ch.SourceID] = id
+			channelRoot[ch.SourceID] = rootID
 			continue
 		}
-		var rootID int64
 		if err := tx.QueryRow(ctx,
 			`INSERT INTO thread (org_id, channel_id, kind) VALUES ($1, $2, 2) RETURNING id`,
 			orgID, id).Scan(&rootID); err != nil {
@@ -333,6 +344,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 			return err
 		}
 		channelMap[ch.SourceID] = id
+		channelRoot[ch.SourceID] = rootID
 	}
 
 	// --- Memberships → channel_member. The loader already decided what
@@ -460,7 +472,7 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 		m := &ir.Messages[i]
 		if m.Container.Kind != ContainerChannel {
 			if err := s.importDirectMessage(ctx, tx, orgID, ir, m, convByKey,
-				userMap, nameMap, dmCache, fileIDs, messageMap, msgThread); err != nil {
+				userMap, nameMap, channelMap, dmCache, fileIDs, messageMap, msgThread); err != nil {
 				return err
 			}
 			continue
@@ -471,14 +483,28 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 			continue
 		}
 		if m.Thread == nil {
-			// Unreachable: the plan refuses this IR before any row is written
-			// (channel messages land in a titled thread, never on the
-			// channel's kind=2 root). Kept as a belt so the lane can never
-			// write a message with no thread id.
+			// Unreachable: the plan refuses this IR before any row is written.
+			// A loader that MEANS the flat feed says so with Thread.Root; nil
+			// means it forgot, and this is the belt that stops the lane from
+			// writing a message with no thread id.
 			return fmt.Errorf("import message %s: channel message without a thread", m.SourceID)
 		}
-		thID, ok := threadMap[m.Thread.Key]
-		if !ok {
+		var thID int64
+		if m.Thread.Root {
+			// The flat feed: the channel's own kind=2 root, which the channel
+			// lane above already created (or resolved on a re-run). Nothing is
+			// inserted and no thread.created event fires — roots are silent,
+			// exactly as they are for a natively created channel. The F-15
+			// bump below is gated on kind = 1 and no-ops here.
+			thID = channelRoot[m.Container.Key]
+			if thID == 0 {
+				return fmt.Errorf("import message %s: channel %s has no root thread",
+					m.SourceID, m.Container.Key)
+			}
+			threadMap[m.Thread.Key] = thID
+		} else if id, ok := threadMap[m.Thread.Key]; ok {
+			thID = id
+		} else {
 			err := tx.QueryRow(ctx, `
 				INSERT INTO thread (org_id, channel_id, kind, title,
 					last_activity_at, origin_system, origin_id)
@@ -511,7 +537,8 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 		}
 
 		src, hasAttach := ir.rewriteBody(m.Body, fileIDs)
-		doc := content.Parse(src, mentionResolver(m, nameMap, userMap))
+		doc := content.Parse(src, mentionResolver(m, nameMap, userMap),
+			content.WithChannelRefs(channelRefResolver(m, channelMap)))
 		var msgID int64
 		err := tx.QueryRow(ctx, `
 			INSERT INTO message (org_id, thread_id, channel_id, author_id,
@@ -566,7 +593,8 @@ func (s *Service) write(ctx context.Context, tx pgx.Tx, orgID int64, ir *Import,
 			return err
 		}
 		if err := s.importEditHistory(ctx, tx, msgID, m,
-			userMap, mentionResolver(m, nameMap, userMap)); err != nil {
+			userMap, mentionResolver(m, nameMap, userMap),
+			content.WithChannelRefs(channelRefResolver(m, channelMap))); err != nil {
 			return err
 		}
 	}
@@ -676,7 +704,7 @@ type dmInfo struct{ spaceID, threadID int64 }
 // different conversation.
 func (s *Service) importDirectMessage(ctx context.Context, tx pgx.Tx, orgID int64,
 	ir *Import, m *Message, convByKey map[string][]string, userMap map[string]int64,
-	nameMap map[string]int64, dmCache map[string]dmInfo, fileIDs map[string]int64,
+	nameMap, channelMap map[string]int64, dmCache map[string]dmInfo, fileIDs map[string]int64,
 	messageMap, msgThread map[string]int64) error {
 
 	sourceIDs, ok := convByKey[m.Container.Key]
@@ -759,7 +787,8 @@ func (s *Service) importDirectMessage(ctx context.Context, tx pgx.Tx, orgID int6
 
 	src, hasAttach := ir.rewriteBody(m.Body, fileIDs)
 	resolve := mentionResolver(m, nameMap, userMap)
-	doc := content.Parse(src, resolve)
+	doc := content.Parse(src, resolve,
+		content.WithChannelRefs(channelRefResolver(m, channelMap)))
 	var msgID int64
 	err := tx.QueryRow(ctx, `
 		INSERT INTO message (org_id, thread_id, dm_space_id, author_id,
@@ -798,7 +827,8 @@ func (s *Service) importDirectMessage(ctx context.Context, tx pgx.Tx, orgID int6
 	}); err != nil {
 		return err
 	}
-	if err := s.importEditHistory(ctx, tx, msgID, m, userMap, resolve); err != nil {
+	if err := s.importEditHistory(ctx, tx, msgID, m, userMap, resolve,
+		content.WithChannelRefs(channelRefResolver(m, channelMap))); err != nil {
 		return err
 	}
 	return nil
@@ -906,7 +936,7 @@ func (s *Service) importAttachments(ctx context.Context, tx pgx.Tx, orgID int64,
 // revisions, oldest first, re-parsing prior content through our engine.
 // Entries without an attributable editor are skipped and counted; entries
 // that are not content revisions at all never reach the IR.
-func (s *Service) importEditHistory(ctx context.Context, tx pgx.Tx, msgID int64, m *Message, userMap map[string]int64, resolve func(string) (int64, bool)) error {
+func (s *Service) importEditHistory(ctx context.Context, tx pgx.Tx, msgID int64, m *Message, userMap map[string]int64, resolve func(string) (int64, bool), chRefs content.Option) error {
 	if len(m.Edits) == 0 {
 		return nil
 	}
@@ -926,7 +956,7 @@ func (s *Service) importEditHistory(ctx context.Context, tx pgx.Tx, msgID int64,
 			continue
 		}
 		revNo++
-		prevDoc := content.Parse(e.PrevBody, resolve)
+		prevDoc := content.Parse(e.PrevBody, resolve, chRefs)
 		if _, err := tx.Exec(ctx, `
 			INSERT INTO message_revision
 				(message_id, revision_no, kind, prev_source, prev_ast, edited_by, edited_at)

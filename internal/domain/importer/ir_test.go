@@ -285,6 +285,210 @@ func TestWriteDrainsANeutralImport(t *testing.T) {
 	}
 }
 
+// TestWriteLandsFlatChannelMessagesOnTheRoot pins the three IR affordances a
+// second source needs, over a hand-built import so no loader can be the thing
+// under test:
+//
+//  1. Thread.Root routes a channel message to the container's FLAT FEED — the
+//     kind=2 root the channel lane already created — and F-15 still holds
+//     there: no message_count, no last_activity_at, and above all no
+//     root_message_id, which messaging/move.go reads without filtering by
+//     kind and would turn into "permanently unmovable".
+//  2. A channel reference resolves through the loader's SOURCE-ID lane into an
+//     inert channel_ref node, and an unpaired label stays unresolved.
+//  3. Losses the loader observed reach the report verbatim.
+//
+// The re-run half is where the root lane could quietly break: root threads
+// carry no provenance of their own, so a resolution that could not find one
+// would re-predict every watermark and stop the import being idempotent.
+func TestWriteLandsFlatChannelMessagesOnTheRoot(t *testing.T) {
+	pool, orgID := testPool(t)
+	ctx := context.Background()
+	store, err := blob.Open("fs", t.TempDir())
+	if err != nil {
+		t.Fatalf("blob: %v", err)
+	}
+	svc := New(pool, store)
+	sent := time.Date(2022, 2, 3, 4, 5, 6, 0, time.UTC)
+
+	build := func() *Import {
+		return &Import{
+			Source: "acme",
+			Users: []User{
+				{SourceID: "U-1", DisplayName: "One", Role: 40, Active: true},
+				{SourceID: "U-2", DisplayName: "Two", Role: 40, Active: true},
+			},
+			Channels: []Channel{
+				{SourceID: "C-FLAT", Name: "flat-room", Visibility: 1},
+				{SourceID: "C-OTHER", Name: "other-room", Visibility: 1},
+			},
+			Memberships: []Membership{
+				{ChannelID: "C-FLAT", UserID: "U-1"}, {ChannelID: "C-FLAT", UserID: "U-2"}},
+			Messages: []Message{
+				{SourceID: "M-FLAT-1", Ordinal: 1, AuthorID: "U-1", SentAt: sent,
+					Container: Container{Kind: ContainerChannel, Key: "C-FLAT"},
+					Thread:    &Thread{Key: "root:C-FLAT", Root: true},
+					Body:      "flat one, see #**other-room** and #**stranger**",
+					ChannelRefsBySourceID: map[string]string{
+						"other-room": "C-OTHER",
+						// "stranger" is deliberately absent: an unpaired label
+						// must stay an UNRESOLVED reference, never resolve by
+						// name against whatever the org happens to call things.
+					}},
+				{SourceID: "M-FLAT-2", Ordinal: 2, AuthorID: "U-2", SentAt: sent.Add(time.Minute),
+					Container: Container{Kind: ContainerChannel, Key: "C-FLAT"},
+					Thread:    &Thread{Key: "root:C-FLAT", Root: true},
+					Body:      "flat two"},
+				{SourceID: "M-THREAD", Ordinal: 3, AuthorID: "U-1", SentAt: sent.Add(2 * time.Minute),
+					Container: Container{Kind: ContainerChannel, Key: "C-FLAT"},
+					Thread:    &Thread{Key: "t-1", SourceID: "T-1", Title: ""},
+					Body:      "in a thread of its own"},
+			},
+			// U-2 has read the whole flat feed; the reducer must land the
+			// watermark on the highest message IN THAT THREAD (M-FLAT-2), not
+			// on M-THREAD, which is in a different one.
+			ReadState: []ReadState{
+				{UserID: "U-2", MessageID: "M-FLAT-1", Read: true},
+				{UserID: "U-2", MessageID: "M-FLAT-2", Read: true},
+			},
+			Losses: Losses{AttachmentBytesExpired: 2, BroadcastsFlattened: 1, SystemNoticesDropped: 4},
+		}
+	}
+
+	run := func() Report {
+		t.Helper()
+		rep := Report{Source: "acme",
+			RenamedChannels: map[string]string{}, RenamedGroups: map[string]string{}}
+		if err := db.WithTx(ctx, pool, func(tx pgx.Tx) error {
+			return svc.write(ctx, tx, orgID, build(), &rep)
+		}); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		return rep
+	}
+	rep := run()
+
+	// (3) The loader's own accounting survives into the report untouched.
+	if rep.AttachmentBytesExpired != 2 || rep.BroadcastsFlattened != 1 ||
+		rep.SystemNoticesDropped != 4 {
+		t.Fatalf("loader losses did not reach the report: %+v", rep)
+	}
+	// ONE thread is created — the message that asked for its own. The two
+	// flat-feed messages create none, because the root already exists.
+	if rep.Threads != 1 || rep.Messages != 3 {
+		t.Fatalf("threads = %d messages = %d, want 1/3 (%+v)", rep.Threads, rep.Messages, rep)
+	}
+
+	var rootID, otherID, flatChID int64
+	if err := pool.QueryRow(ctx, `
+		SELECT c.root_thread_id, c.id,
+		       (SELECT id FROM channel WHERE org_id = $1 AND origin_id = 'C-OTHER')
+		FROM channel c WHERE c.org_id = $1 AND c.origin_id = 'C-FLAT'`,
+		orgID).Scan(&rootID, &flatChID, &otherID); err != nil {
+		t.Fatalf("channels: %v", err)
+	}
+	// (1) Both flat messages sit on the channel's kind=2 root; the threaded
+	// one does not.
+	var flatOnRoot, rootKind int
+	if err := pool.QueryRow(ctx, `
+		SELECT (SELECT count(*) FROM message WHERE org_id = $1
+		          AND origin_id IN ('M-FLAT-1','M-FLAT-2') AND thread_id = $2),
+		       (SELECT kind FROM thread WHERE id = $2)`,
+		orgID, rootID).Scan(&flatOnRoot, &rootKind); err != nil {
+		t.Fatalf("flat feed: %v", err)
+	}
+	if flatOnRoot != 2 || rootKind != 2 {
+		t.Fatalf("flat messages on the kind=2 root = %d (kind %d), want 2 (kind 2)",
+			flatOnRoot, rootKind)
+	}
+	var threadedElsewhere bool
+	_ = pool.QueryRow(ctx, `
+		SELECT m.thread_id <> $2 AND t.kind = 1
+		FROM message m JOIN thread t ON t.id = m.thread_id
+		WHERE m.org_id = $1 AND m.origin_id = 'M-THREAD'`, orgID, rootID).Scan(&threadedElsewhere)
+	if !threadedElsewhere {
+		t.Fatal("a message that named its own thread landed on the channel root")
+	}
+	// F-15 on the root the flat feed just filled. root_message_id is the
+	// dangerous one — a message some thread names as its root can never be
+	// moved again, kind unfiltered.
+	var count int
+	var lastActivity *time.Time
+	var rootMsg *int64
+	if err := pool.QueryRow(ctx,
+		`SELECT message_count, last_activity_at, root_message_id FROM thread WHERE id = $1`,
+		rootID).Scan(&count, &lastActivity, &rootMsg); err != nil {
+		t.Fatalf("root counters: %v", err)
+	}
+	if count != 0 || lastActivity != nil || rootMsg != nil {
+		t.Fatalf("the flat feed put F-15 counters on a kind=2 root: count=%d activity=%v root_message=%v",
+			count, lastActivity, rootMsg)
+	}
+	// Roots are silent: two messages landed there and no thread.created fired
+	// for it. One thread was created, so exactly one event exists.
+	if got := importerEventCensus(t, ctx, pool, orgID)["thread.created"]; got != 1 {
+		t.Fatalf("thread.created = %d, want 1 (the root is silent)", got)
+	}
+
+	// (2) The channel reference resolved through the SOURCE-ID lane into an
+	// inert channel_ref node; the unpaired label stayed unresolved.
+	var ast, rendered string
+	if err := pool.QueryRow(ctx,
+		`SELECT ast::text, rendered FROM message WHERE org_id = $1 AND origin_id = 'M-FLAT-1'`,
+		orgID).Scan(&ast, &rendered); err != nil {
+		t.Fatalf("flat message: %v", err)
+	}
+	wantResolved := fmt.Sprintf(`<span class="channel-ref" data-channel-id="%d">#other-room</span>`, otherID)
+	if !strings.Contains(rendered, wantResolved) {
+		t.Fatalf("channel reference did not resolve to channel %d: %s", otherID, rendered)
+	}
+	if !strings.Contains(rendered, `<span class="channel-ref channel-ref-unresolved">#stranger</span>`) {
+		t.Fatalf("an unpaired label must stay unresolved: %s", rendered)
+	}
+	if strings.Contains(rendered, "<a ") {
+		t.Fatalf("a channel reference rendered as a link: %s", rendered)
+	}
+	if !strings.Contains(ast, `"channel_ref"`) {
+		t.Fatalf("no channel_ref node in the stored AST: %s", ast)
+	}
+
+	// The watermark landed on the flat feed's OWN thread, at its last message.
+	var wmThread, wmMsg, flat2 int64
+	if err := pool.QueryRow(ctx, `
+		SELECT w.thread_id, w.last_read_message_id,
+		       (SELECT id FROM message WHERE org_id = $1 AND origin_id = 'M-FLAT-2')
+		FROM thread_read_watermark w
+		JOIN user_account u ON u.id = w.user_id
+		WHERE u.org_id = $1 AND u.origin_id = 'U-2'`, orgID).Scan(&wmThread, &wmMsg, &flat2); err != nil {
+		t.Fatalf("watermark: %v", err)
+	}
+	if wmThread != rootID || wmMsg != flat2 {
+		t.Fatalf("watermark = (thread %d, message %d), want (%d, %d)",
+			wmThread, wmMsg, rootID, flat2)
+	}
+	if rep.Watermarks != 1 {
+		t.Fatalf("watermarks = %d, want 1", rep.Watermarks)
+	}
+
+	// The RE-RUN. A root thread has no origin_id, so the plan can only find it
+	// through the CHANNEL's provenance; without that it would re-predict the
+	// watermark it already wrote and the import would stop being idempotent.
+	rep2 := run()
+	if rep2.Messages != 0 || rep2.Threads != 0 || rep2.Watermarks != 0 {
+		t.Fatalf("re-run was not a no-op: %+v", rep2)
+	}
+	if rep2.AlreadyImported == 0 {
+		t.Fatalf("re-run counted nothing as already imported: %+v", rep2)
+	}
+	var msgs int
+	_ = pool.QueryRow(ctx,
+		`SELECT count(*) FROM message WHERE org_id = $1 AND origin_system = 'acme'`,
+		orgID).Scan(&msgs)
+	if msgs != 3 {
+		t.Fatalf("after re-run message count = %d, want 3", msgs)
+	}
+}
+
 // TestWriteRejectsAChannelMessageWithNoThread pins the one invariant the IR
 // cannot express in its types: a channel message must name the thread it
 // belongs to. Landing it on the channel's ROOT instead would set

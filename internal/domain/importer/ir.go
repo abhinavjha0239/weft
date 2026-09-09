@@ -72,6 +72,39 @@ type Import struct {
 	//
 	// nil means "this source has no upload dialect": bodies pass through.
 	RewriteAttachmentLinks func(body string, fileIDs map[string]int64) (string, bool)
+
+	// Losses the LOADER observed. See the type.
+	Losses Losses
+}
+
+// Losses is the accounting only a LOADER can contribute, because the fact is
+// visible while PARSING and nowhere afterwards: the planner sees the IR, and
+// an entity the loader dropped is not in it. The planner folds these into the
+// report verbatim, so the dry run and the write report them identically and
+// the fidelity contract — every source entity lands in exactly one bucket —
+// still holds for the entities that never reach the write path.
+//
+// The vocabulary stays source-neutral, like every other name here. Anything
+// whose value depends on what the WRITE lands belongs in the planner instead:
+// a loader cannot know that.
+type Losses struct {
+	// AttachmentBytesExpired: the SOURCE itself says the bytes are gone —
+	// Slack's `mode: tombstone` / `hidden_by_limit` (the free-plan cap) and
+	// its access-denied stubs. Deliberately not folded into
+	// AttachmentFilesMissing, which means "the export tree does not carry a
+	// file it referenced": that one is fixed by re-exporting and this one
+	// never can be.
+	AttachmentBytesExpired int
+	// BroadcastsFlattened: a reply the source ALSO showed in the container's
+	// flat feed (Slack's `thread_broadcast`). Weft has one place for a
+	// message, so it lands once, in its thread, and the double placement is
+	// counted rather than silently halved.
+	BroadcastsFlattened int
+	// SystemNoticesDropped: join/leave/pin/rename notices the source stores
+	// AS MESSAGES. They are container events, not conversation, and Weft
+	// keeps those on the event log — dropped on purpose, counted so a
+	// message-count difference against the source has an explanation.
+	SystemNoticesDropped int
 }
 
 // User is one source account. Role is already a WEFT preset (10 owner · 20
@@ -178,7 +211,23 @@ type Thread struct {
 	Key      string
 	SourceID string
 	Title    string
-	Meta     map[string]any
+	// Root routes the message to its CONTAINER's root thread — the flat
+	// channel feed — instead of a thread of its own. That row already exists
+	// (the channel lane creates it with the channel), so nothing is created,
+	// nothing is counted, and SourceID/Title are ignored.
+	//
+	// It is a distinct flag rather than "a nil Thread means the root",
+	// because a nil Thread means the LOADER FORGOT and that stays an error:
+	// a channel message must always SAY where it goes. Slack needs this
+	// because most of its channel messages are unthreaded, and it is where
+	// Weft's own send path puts an unthreaded channel message
+	// (messaging.go: threadID == 0 → channel.root_thread_id, kind 2). F-15
+	// is what makes it safe: every bump, native and imported, is gated on
+	// `kind = 1`, so a root never takes a counter or a root_message_id —
+	// the last of which messaging/move.go reads WITHOUT filtering by kind
+	// and would turn into "permanently unmovable".
+	Root bool
+	Meta map[string]any
 }
 
 // Message is one source message.
@@ -205,7 +254,14 @@ type Message struct {
 	// already names people leaves this nil and the display-name lane
 	// answers.
 	MentionsBySourceID map[string]string
-	Meta               map[string]any
+	// ChannelRefsBySourceID maps a channel-reference label appearing in Body
+	// to a source CHANNEL id — the same shape MentionsBySourceID uses for
+	// people. Resolution goes through the ID and never the name, so a
+	// reference written before a rename still points at the right channel,
+	// and a label the loader did not pair with a source channel stays an
+	// UNRESOLVED reference, which is still rendered (inert, label only).
+	ChannelRefsBySourceID map[string]string
+	Meta                  map[string]any
 }
 
 // Edit is one content revision, oldest first. An EMPTY EditorID means the
@@ -292,6 +348,23 @@ func mentionResolver(m *Message, byName, bySourceID map[string]int64) func(strin
 			}
 		}
 		id, ok := byName[label]
+		return id, ok
+	}
+}
+
+// channelRefResolver turns a message's channel-reference lane into the
+// label→channel-id function the content engine takes. There is no by-name
+// fallback on purpose: a reference resolves through the source id the loader
+// paired with the label, or it stays unresolved. Resolving a bare label
+// against live channel names would let a channel created AFTER the export
+// capture a reference that never meant it.
+func channelRefResolver(m *Message, bySourceID map[string]int64) func(string) (int64, bool) {
+	return func(label string) (int64, bool) {
+		src, ok := m.ChannelRefsBySourceID[label]
+		if !ok {
+			return 0, false
+		}
+		id, ok := bySourceID[src]
 		return id, ok
 	}
 }
