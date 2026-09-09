@@ -4192,7 +4192,7 @@ allow `manage_permissions` at channel scope → the escalation pin fires.
 
 ---
 
-### P-44b `automation: Gate posts on a scope-owned principal.` — M — migration 0027 — **SPEC-READY (implements P-44's decision (b); AU-2 is AMENDED here, not left contradicted)**
+### P-44b `automation: Gate posts on a scope-owned principal.` — S/M — migration 0027 (the GROUP, not the account) — **SPEC-READY, CORRECTED BY PRE-FLIGHT (implements P-44's decision (b); AU-2 is AMENDED here, not left contradicted)**
 
 **What & why.** Decision (b), settled on evidence in #147: automations
 do **not** get an exemption from posting restrictions. Today
@@ -4213,11 +4213,49 @@ user — Slack's creator-orphaning footgun designed out" — so Zulip's
 owner-inheritance **cannot be copied literally**. The resolution is a
 principal that is not a user and still holds verbs:
 
-- **One agent principal per org** (`user_account` kind 2), seeded at
-  bootstrap alongside the role groups, and placed in a new seeded
-  `role:automations` group. Migration 0027 seeds it for existing orgs —
-  and note P-47's lesson: `SeedOrg` writes explicit rows, so **existing
-  orgs need a backfill; the seed helps future orgs only.**
+> **PRE-FLIGHT AUDIT, 2026-09-10 — read this before the bullets; it
+> disproved four of them.** Grounded against dev @ #150.
+>
+> 1. **The per-org agent principal ALREADY EXISTS.**
+>    `automation.automationPrincipal` (`runner.go:588`) upserts a
+>    `user_account` kind 2, role 50, keyed
+>    `(org_id, origin_system='system', origin_id='automation-principal')`,
+>    LAZILY inside the run tx, and the runner already authors as it
+>    whenever `rl.ActorUserID` is nil. So "seed the principal, migration
+>    0027 backfills it" is work that is already done. **What is missing
+>    is not the account — it is that the account is in NO GROUP, and
+>    therefore holds NO VERBS.** Migration 0027 seeds the
+>    `role:automations` GROUP and its membership row, not the account.
+> 2. **The gate must be verb-only — do NOT reuse `RequireChannelSend`.**
+>    That exported chokepoint (`messaging/threads.go:579`) is
+>    `send_message` on the chain **plus `requireMember` plus
+>    `requireLiveChannel`**. The principal is a member of no channel, so
+>    reusing it refuses every automation post even after the verb is
+>    granted. Resolve `perms.Require(..., VerbSendMessage,
+>    perms.ChannelScope(...))` and keep the existing live-channel check.
+>    Say WHY in the comment, because "reuse the existing gate" is the
+>    instinct this repo otherwise trains.
+> 3. **`AddUserToGroup` takes `lockOrgClosure` and bumps the closure
+>    version.** It must NOT be called from the run path — that would put
+>    an org-wide lock on every automation run and invalidate every
+>    closure reader in the org. Membership is established at bootstrap
+>    and by the migration ONLY; the lazy account upsert stays as it is.
+> 4. **The `rl.ActorUserID` branch is unaddressed and must be decided.**
+>    When a rule carries an actor user the post authors as that HUMAN,
+>    not the principal. Gate that branch on the actor user (stricter, and
+>    consistent with "the principal's verbs govern where it may post") —
+>    but it is a behaviour change for existing rules, so it needs its own
+>    test and its own line in the PR body.
+>
+> P-47's lesson still applies to the group: `SeedOrg` writes explicit
+> rows, so **existing orgs need the backfill; the seed helps future orgs
+> only.**
+
+- **One agent principal per org** (`user_account` kind 2) — ALREADY
+  SHIPPED, see the audit note; this slice places it in a new seeded
+  `role:automations` group and grants that group `send_message` at org
+  scope so existing automations keep working, leaving an admin free to
+  narrow it per channel once P-44a lands.
 - **`PostToChannelAsAutomation` resolves `send_message` for that
   principal at the TARGET channel** and refuses when it is not granted.
   Because the principal is a group member, an admin controls automation
@@ -4231,9 +4269,11 @@ principal that is not a user and still holds verbs:
   loop guard's input and a wire contract. **Do not repoint it at the
   principal.**
 
-**Edge cases:** an org whose principal is missing (a pre-migration row,
-or a hand-deleted account) must **fail closed** — the post is refused,
-never allowed; the automation run records the refusal with a reason
+**Edge cases:** the principal is created lazily and cannot normally be
+missing, so the fail-closed case that matters is the principal present
+but holding NO `send_message` (group row absent — a pre-migration org,
+or an admin who revoked the grant). That must **fail closed** — the post
+is refused, never allowed; the automation run records the refusal with a reason
 rather than failing silently, since a rule that quietly stops posting is
 worse than one that visibly errors. Deactivating the principal disables
 all automation posting org-wide — decide whether that is permitted and
@@ -4244,7 +4284,10 @@ lacks `send_message` is REFUSED with a recorded reason; the same rule
 where it is granted posts normally. The refusal must not stall the
 runner's cursor. **RED/GREEN:** remove the gate → the refused post lands,
 which is today's behaviour and the thing this slice removes; delete the
-principal → the post is refused rather than allowed (fail-closed).
+principal's `role:automations` membership row → the post is refused
+rather than allowed (fail-closed). Note the second pin was specified as
+"delete the principal", which the lazy upsert would simply recreate —
+the membership row is what actually makes it red.
 
 ---
 
