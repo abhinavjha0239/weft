@@ -529,13 +529,44 @@ func (s *Service) insertThreadMessageAs(ctx context.Context, tx pgx.Tx, actor au
 
 // PostToChannelAsAutomation posts into a channel's root thread on behalf of
 // an automation, inside the CALLER'S transaction — the runner commits the
-// run row, the message, and its event atomically. No permission gate: the
-// scope's admin authorized the rule at creation (AU-2); the org pin and the
-// live-channel check still hold. The event carries ActorAutomation + the
-// automation's id (the loop guard's signal) and the chain depth as a hint.
+// run row, the message, and its event atomically. The event carries
+// ActorAutomation + the automation's id (the loop guard's signal) and the
+// chain depth as a hint.
+//
+// The gate is send_message resolved for the AUTHOR at the target channel's
+// scope chain (P-44b). ADR-014 AU-2 used to justify no gate at all — "the
+// scope's admin authorized the rule at creation" — but an org-scope rule sees
+// every channel, so that made a per-channel posting restriction a knob
+// automations ignore, exactly the honest-rungs violation this project keeps
+// removing. AU-2 is amended: the scope's authorization governs which RULES may
+// exist; the author's verbs govern where they may POST. That binds both
+// authors — the org's automation principal, and the consented human whose name
+// a rule borrows.
+//
+// It is deliberately NOT RequireChannelSend, even though that is the exported
+// chokepoint and reusing it is what this codebase otherwise trains you to do.
+// RequireChannelSend is send_message PLUS requireMember: the automation
+// principal is a member of no channel and joining it to every channel it may
+// post in would be a second, silently-diverging ACL, so reusing that gate
+// would refuse every automation post however the verbs were granted. This is
+// the verb half of the same gate, with the live-channel check kept.
 func (s *Service) PostToChannelAsAutomation(ctx context.Context, tx pgx.Tx, orgID, authorID, automationID, channelID int64, depth int, source string) (int64, error) {
+	chain, err := s.perms.ChannelScope(ctx, tx, orgID, channelID)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.perms.Require(ctx, tx,
+		auth.Identity{UserID: authorID, OrgID: orgID}, perms.VerbSendMessage, chain); err != nil {
+		// Name WHO was refused WHERE. This error's only reader is the run's
+		// step trace (the runner is the sole caller — it never reaches an HTTP
+		// client, so there is no oracle to leak to), and "the rule quietly
+		// stopped posting" is the failure mode a bare verb name would produce.
+		return 0, apperr.Forbidden(fmt.Sprintf(
+			"automation author %d lacks %s in channel %d",
+			authorID, perms.VerbSendMessage, channelID))
+	}
 	var rootThreadID int64
-	err := tx.QueryRow(ctx, `
+	err = tx.QueryRow(ctx, `
 		SELECT root_thread_id FROM channel
 		WHERE id = $1 AND org_id = $2 AND archived_at IS NULL`,
 		channelID, orgID).Scan(&rootThreadID)
