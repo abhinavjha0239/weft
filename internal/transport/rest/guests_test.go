@@ -125,7 +125,8 @@ func TestGuestVisibility(t *testing.T) {
 	// bob still sees the whole org.
 	var dir struct {
 		Users []struct {
-			ID int64 `json:"id"`
+			ID   int64 `json:"id"`
+			Kind int16 `json:"kind"`
 		} `json:"users"`
 	}
 	if code := getJSON(t, ts.URL+"/api/v1/users", gina.Token, &dir); code != 200 || len(dir.Users) != 2 {
@@ -136,8 +137,22 @@ func TestGuestVisibility(t *testing.T) {
 			t.Fatal("guest directory must not show bob")
 		}
 	}
-	if code := getJSON(t, ts.URL+"/api/v1/users", bobTok, &dir); code != 200 || len(dir.Users) != 3 {
-		t.Fatalf("member directory = %d %+v, want all three", code, dir.Users)
+	// A member sees the whole org: three humans plus the org's automation
+	// principal, which Directory lists by design (kind IN (1,2)) and which
+	// P-44b seeds at bootstrap. Gina's guest view above proves the same
+	// principal stays hidden from a guest — it shares no channel with her.
+	dir.Users = nil
+	if code := getJSON(t, ts.URL+"/api/v1/users", bobTok, &dir); code != 200 || len(dir.Users) != 4 {
+		t.Fatalf("member directory = %d %+v, want three humans + the agent principal", code, dir.Users)
+	}
+	agents := 0
+	for _, u := range dir.Users {
+		if u.Kind == 2 {
+			agents++
+		}
+	}
+	if agents != 1 {
+		t.Fatalf("member directory has %d agent principals, want exactly 1: %+v", agents, dir.Users)
 	}
 	// Batch resolution: bob's id is silently absent for gina.
 	if code := getJSON(t, fmt.Sprintf("%s/api/v1/users?ids=%d,%d", ts.URL, bobID, boot.UserID),

@@ -125,8 +125,11 @@ func TestImportEmaillessUsersStayDistinct(t *testing.T) {
 		t.Fatalf("re-run created %d users, want 0 (idempotent by origin id)", rep2.Users)
 	}
 	var total int
-	if err := pool.QueryRow(ctx,
-		`SELECT count(*) FROM user_account WHERE org_id = $1 AND origin_system IS NOT NULL`,
+	// Excludes the reserved 'system' origin namespace — the platform's own
+	// provenance (P-44b's automation principal), never an imported row.
+	if err := pool.QueryRow(ctx, `
+		SELECT count(*) FROM user_account
+		WHERE org_id = $1 AND origin_system IS NOT NULL AND origin_system <> 'system'`,
 		orgID).Scan(&total); err != nil {
 		t.Fatalf("count users: %v", err)
 	}

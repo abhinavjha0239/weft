@@ -264,7 +264,11 @@ func TestZulipImportShowcase(t *testing.T) {
 	// dry run — and the message table is the LAST thing the write path
 	// reaches, so a half-executed write would slip past it entirely.
 	for _, tbl := range []struct{ name, q string }{
-		{"user_account", `SELECT count(*) FROM user_account WHERE org_id = $1 AND origin_system IS NOT NULL`},
+		// The reserved 'system' origin namespace is platform provenance
+		// (P-44b's automation principal, present from bootstrap), never an
+		// imported row — the census must measure what the DRY RUN wrote.
+		{"user_account", `SELECT count(*) FROM user_account
+			WHERE org_id = $1 AND origin_system IS NOT NULL AND origin_system <> 'system'`},
 		{"channel", `SELECT count(*) FROM channel WHERE org_id = $1 AND origin_system IS NOT NULL`},
 		{"thread", `SELECT count(*) FROM thread WHERE org_id = $1 AND origin_system IS NOT NULL`},
 		{"user_group", `SELECT count(*) FROM user_group WHERE org_id = $1 AND origin_system IS NOT NULL`},

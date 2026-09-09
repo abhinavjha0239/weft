@@ -93,6 +93,7 @@ func TestUserProfiles(t *testing.T) {
 		Users []struct {
 			ID          int64  `json:"id"`
 			FullName    string `json:"full_name"`
+			Kind        int16  `json:"kind"`
 			Deactivated bool   `json:"deactivated"`
 		} `json:"users"`
 	}
@@ -130,12 +131,17 @@ func TestUserProfiles(t *testing.T) {
 	}
 
 	// Directory form (no ids): live members ordered by name; the
-	// deactivated user is absent.
+	// deactivated user is absent. Directory lists humans AND agents (kind
+	// IN (1,2)) by design, so the org's automation principal — seeded at
+	// bootstrap since P-44b — joins Alice, ordered by lower(full_name).
+	got.Users = nil
 	if code := getJSON(t, ts.URL+"/api/v1/users", boot.Token, &got); code != http.StatusOK {
 		t.Fatalf("directory: %d, want 200", code)
 	}
-	if len(got.Users) != 1 || got.Users[0].FullName != "Alice Chen" {
-		t.Fatalf("directory = %+v, want just Alice (Bob deactivated)", got.Users)
+	if len(got.Users) != 2 ||
+		got.Users[0].FullName != "Alice Chen" || got.Users[0].Kind != 1 ||
+		got.Users[1].FullName != "Automations" || got.Users[1].Kind != 2 {
+		t.Fatalf("directory = %+v, want Alice + the agent principal (Bob deactivated)", got.Users)
 	}
 
 	// Guards: malformed id, over-cap list.
