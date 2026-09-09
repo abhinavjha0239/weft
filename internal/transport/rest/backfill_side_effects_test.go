@@ -37,13 +37,17 @@ import (
 // The COLUMN LIST below is copied verbatim from the importer's channel
 // message lane (source/ast/rendered/has_link plus origin_system/origin_id)
 // and is what makes the resulting event indistinguishable from a real
-// backfill; P-27a's IR extraction left it byte for byte unchanged. The
-// CONTAINER is NOT copied: this lands in the channel's kind=2 root thread for
-// test convenience, and the importer never does that — its channel lane
-// always materializes a titled kind=1 thread, and since P-27a a channel
-// message with no thread is a hard error rather than a root landing. Nothing
-// here bumps a counter, so F-15 still holds; do not carry the container
-// choice back the other way.
+// backfill; P-27a's IR extraction left it byte for byte unchanged, and so did
+// P-27b's Slack loader.
+//
+// The CONTAINER is chosen here, not copied: this lands in the channel's kind=2
+// root thread for test convenience. RE-READ AT P-27b, because half of what
+// this note used to say stopped being true — the importer DOES land channel
+// messages on the root now, whenever a loader names the flat feed with
+// Thread.Root (Slack's unthreaded messages, which are most of them). The half
+// that still holds is the one worth keeping: a channel message with NO thread
+// is a hard error, never a silent root landing. Nothing here bumps a counter,
+// so F-15 holds either way.
 func importMessage(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	orgID, channelID int64, authorID int64, originID, src string) int64 {
 	t.Helper()
