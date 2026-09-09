@@ -9,9 +9,12 @@
 // SINGLE txid-gated event-log read per event-batch and fans the shared rows to
 // that org's live connections in memory, each applying its own O(1) ACL filter
 // — so per-message DB cost is O(1) per org, independent of connection count.
-// A connection that reconnects behind the org head runs its OWN bounded
-// catch-up (the per-connection pump) only until it reaches the head, then joins
-// the live lane; the per-connection query survives for the resume gap alone.
+// A connection that reconnects behind the org head runs a bounded catch-up (the
+// resume pump) only until it reaches the head, then joins the live lane. That
+// read is shared too: connections that reconnect together resume from cursors
+// the F-2 checkpoint has already converged, so a RECONNECT COHORT — a node
+// restart's whole population — issues about one read between them rather than
+// one each (catchup.go), while a genuinely far-behind resumer reads alone.
 //
 // The ACL STATE those filters read is placed by the same rule. What is
 // per-USER — channel membership, DM participation, the protected-history floor
@@ -123,6 +126,13 @@ type client struct {
 	// at is immutable once published, so sharing it across the org's
 	// connections needs no lock on the read path.
 	spaces *spaceView
+	// arrivedAt is when this connection's request reached Serve — the freshness
+	// anchor for the org's shared catch-up block (see blockServes). It is
+	// sampled BEFORE the head lookup, so it precedes every read this connection
+	// could itself have issued, and it is stable for the connection's whole
+	// life because the resume lane is a CONNECT-time lane: register decides the
+	// lane and resume only ever promotes to live, never back.
+	arrivedAt time.Time
 	// Inbound signal-frame budget (typing storms, abuse).
 	frameLimit *rate.Limiter
 	// Serializes all writes to conn (coder/websocket forbids concurrent Write).
@@ -293,6 +303,20 @@ type orgShard struct {
 	// ONE query between them — each waiter re-checks `spaces` under the lock
 	// and takes the winner's result.
 	spaceMu sync.Mutex
+	// catchup is the org's shared RESUME read — the last catch-up block a
+	// resuming connection published, held here so a reconnect cohort issues one
+	// read between them instead of one each (see catchup.go). Atomic and
+	// immutable-once-published for the same reason `spaces` is: it is read on
+	// the resume path without a lock, and mu is the fan lock.
+	//
+	// It lives on the SHARD, so it dies with the org's last connection and no
+	// hub-wide map can hand one org's event rows to another's connection; the
+	// 5s sweep drops it earlier (dropStaleCatchup) once it can serve nobody.
+	catchup atomic.Pointer[catchupBlock]
+	// catchupMu single-flights the read that fills `catchup`, exactly as
+	// spaceMu does for the space view, and deliberately NOT mu: it is held
+	// across a pool round trip, and the fan lock must never be.
+	catchupMu sync.Mutex
 	// Per-user derived presence (connection count + last activity + idle flag);
 	// per-process, never stored (the UNLOGGED presence table is unused).
 	userConns map[int64]*userPresence // userID → presence
@@ -343,10 +367,10 @@ type Hub struct {
 	runCtx context.Context
 
 	// Metrics (S0), optional (default Nop). pumpQueries counts event-log
-	// catch-up reads: after S3 the per-org multicast reader runs ONE per
-	// event-batch (O(1) per org), plus one per resume-lane pump (rare, bounded
-	// by the replay gap) — so it no longer scales with connection count. Set
-	// once at wiring (docs/PERF.md).
+	// catch-up reads on BOTH lanes: the per-org multicast reader runs ONE per
+	// event-batch (S3, O(1) per org) and the resume lane one per COHORT rather
+	// than per resuming connection (see catchup.go) — so neither term scales
+	// with connection count. Set once at wiring (docs/PERF.md).
 	pumpQueries metrics.Counter
 	deliveries  metrics.Counter
 	connections metrics.Gauge
@@ -355,6 +379,12 @@ type Hub struct {
 	// rises O(events), not O(connections). A regression to per-connection
 	// marshaling makes it rise ~O(connections) (the red/green pin).
 	encoded metrics.Counter
+	// resumeReads counts the RESUME lane's catch-up reads alone — the subset of
+	// pumpQueries a reconnect storm produces. It is its own series because the
+	// two lanes now have different shapes: the live read is one per org per
+	// event-batch, and this one is one per org per COHORT, so a regression to
+	// one per resuming connection is visible here and invisible in the sum.
+	resumeReads metrics.Counter
 	// spaceQueries counts reads of the space-visibility set. Since the set is
 	// held per ORG it rises once per org's first connection plus once per
 	// space.created — CONSTANT in the number of live connections, which is the
@@ -488,6 +518,7 @@ func (h *Hub) deregister(c *client) (wentOffline bool) {
 // Nop, so an un-instrumented hub pays nothing. Call once before Run/Serve.
 func (h *Hub) SetMetrics(reg metrics.Registry) {
 	h.pumpQueries = reg.Counter("gateway_pump_queries_total")
+	h.resumeReads = reg.Counter("gateway_resume_reads_total")
 	h.deliveries = reg.Counter("fanout_deliveries_total")
 	h.connections = reg.Gauge("gateway_connections", "org")
 	h.encoded = reg.Counter("gateway_envelopes_encoded_total")
@@ -495,10 +526,11 @@ func (h *Hub) SetMetrics(reg metrics.Registry) {
 }
 
 // encodeEnvelope is the SINGLE Envelope-marshal choke point, so the encoded
-// counter measures exactly how many times an event was JSON-encoded. The live
-// multicast lane calls this once per event for the whole org (marshal-once);
-// the resume-lane fallback calls it once per delivered row. Default Nop
-// registry makes the count a no-op when metrics are off.
+// counter measures exactly how many times an event was JSON-encoded. Both
+// shared lanes call it once per event for the whole org (marshal-once) — the
+// live multicast batch and the shared catch-up block; only a row neither
+// published is encoded per delivery. Default Nop registry makes the count a
+// no-op when metrics are off.
 func (h *Hub) encodeEnvelope(e Envelope) ([]byte, error) {
 	h.encoded.Add(1)
 	return json.Marshal(e)
@@ -556,10 +588,19 @@ func (h *Hub) sweep(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case <-t.C:
-			for _, sh := range h.shards() {
-				sh.wakeReader()
-			}
+			h.sweepOnce(time.Now())
 		}
+	}
+}
+
+// sweepOnce is one pass of the poll fallback, with the clock injected so a test
+// can drive it (the worker convention): wake every live org's reader in case a
+// NOTIFY was missed, and release any shared catch-up block the cohort that
+// produced it has long since drained (see dropStaleCatchup).
+func (h *Hub) sweepOnce(now time.Time) {
+	for _, sh := range h.shards() {
+		sh.wakeReader()
+		sh.dropStaleCatchup(now)
 	}
 }
 
@@ -580,6 +621,11 @@ func (sh *orgShard) wakeReader() {
 
 // Serve upgrades the request and streams events. ?last_id=N resumes.
 func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
+	// Stamped FIRST, before the head lookup below: it is the freshness anchor
+	// for the org's shared catch-up block (blockServes), and anchoring it ahead
+	// of every read this connection could itself have issued is what makes a
+	// shared read provably no staler than a solo one.
+	arrivedAt := time.Now()
 	lastID, _ := strconv.ParseInt(r.URL.Query().Get("last_id"), 10, 64)
 	// The org's current event cursor, from the feed driver: the POSITION seeds
 	// a NEW shard's live reader (so it only ever reads fresh events) and the id
@@ -612,7 +658,7 @@ func (h *Hub) Serve(w http.ResponseWriter, r *http.Request, id auth.Identity) {
 	// failed, can only ever under-deliver. loadChannels and syncSpaceView below
 	// are the only things that relax any of it.
 	c := &client{conn: ws, id: id, cancel: cancel, lastID: lastID,
-		feed: make(chan []eventRow, feedBuffer),
+		arrivedAt: arrivedAt, feed: make(chan []eventRow, feedBuffer),
 		wake: make(chan struct{}, 1), frameLimit: newFrameLimiter()}
 
 	// Setup order matters (fixes a startup race): load the membership view and
@@ -894,12 +940,13 @@ type eventRow struct {
 	// the other — a zero entityType is not space-scoped, so scoped events
 	// would fan org-wide; a zero boundaryAt precedes every floor.
 	entityType enum.EntityType
-	// enc is the row's Envelope pre-marshaled ONCE by the multicast reader
-	// (the Envelope is identical for every connection in the org — same seq,
-	// verb, payload, org id), so the fan reuses these bytes instead of
-	// re-encoding per connection: O(1) marshal per event, not O(connections).
-	// nil on the resume lane (per-connection pump), where deliverShared
-	// marshals its own fallback — rare, bounded by the replay gap.
+	// enc is the row's Envelope pre-marshaled ONCE for the whole org (the
+	// Envelope is identical for every connection in it — same seq, verb,
+	// payload, org id), so the fan reuses these bytes instead of re-encoding per
+	// connection: O(1) marshal per event, not O(connections). Both shared lanes
+	// fill it — the multicast reader for a live batch, catchUp for a shared
+	// resume block — and it stays nil only on rows nothing published, where
+	// deliverShared marshals its own.
 	enc []byte
 }
 
@@ -928,35 +975,33 @@ func fanRows(rows []eventlog.Row) []eventRow {
 	return out
 }
 
-// pump is the RESUME lane: a connection behind the org head runs its OWN
-// bounded catch-up read, draining its gap batch by batch. It survives only for
-// the reconnect gap (F-2's replay window); steady-state live traffic flows
-// through the per-org multicast reader, never here.
+// pump is the RESUME lane: a connection behind the org head drains its gap
+// batch by batch. It survives only for the reconnect gap (F-2's replay window);
+// steady-state live traffic flows through the per-org multicast reader, never
+// here.
 //
-// It reads HISTORY — id-ordered, after the client's last_id — because a resume
-// cursor is an event id, not a driver position. Whether that read is
-// visibility-gated is the driver's business (eventlog.Tail.History), not this
-// lane's.
+// The batch comes from catchUp, which reads HISTORY — id-ordered, after the
+// client's last_id, because a resume cursor is an event id, not a driver
+// position — and SHARES that read with the rest of a reconnect cohort when it
+// can (catchup.go). Whether the read is visibility-gated is the driver's
+// business (eventlog.Tail.History), not this lane's.
+//
+// The loop condition is the READ's `more`, not the length of this connection's
+// own suffix: a shared block that hit batchLimit means there is more behind it
+// even for a connection only a few of its rows were new to.
 func (h *Hub) pump(ctx context.Context, c *client) error {
 	for {
-		// One catch-up read for THIS connection's resume gap. The reader's
-		// hoisted org-scope read is the steady-state path; both increment
-		// gateway_pump_queries_total, and the S3 proof tells them apart by
-		// count — O(1) per org vs the old O(connections) (docs/PERF.md).
-		h.pumpQueries.Add(1)
-		rows, err := h.tail.History(ctx, c.id.OrgID, c.lastID, batchLimit)
+		batch, more, err := h.catchUp(ctx, c)
 		if err != nil {
 			return err
 		}
-		if len(rows) == 0 {
+		if len(batch) == 0 {
 			return nil
 		}
-		// enc stays nil: the resume lane is per-connection, so deliverShared
-		// marshals its own — rare, bounded by the replay gap.
-		if err := h.deliverShared(ctx, c, fanRows(rows)); err != nil {
+		if err := h.deliverShared(ctx, c, batch); err != nil {
 			return err
 		}
-		if len(rows) < batchLimit {
+		if !more {
 			return nil
 		}
 	}
@@ -992,8 +1037,8 @@ func (h *Hub) deliverShared(ctx context.Context, c *client, batch []eventRow) er
 			}
 		}
 		if out.deliver {
-			// Live lane: reuse the reader's marshal-once bytes. Resume lane
-			// (enc nil) marshals its own — rare, bounded by the replay gap.
+			// Reuse the shared marshal-once bytes (the live batch's or the
+			// shared catch-up block's); a row nothing published marshals here.
 			var err error
 			if r.enc != nil {
 				err = h.sendRaw(c, r.enc)
