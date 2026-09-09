@@ -49,7 +49,7 @@ func TestCatchupSharesOneReadPerCohort(t *testing.T) {
 	// side of it. Each connection is checked to have received its OWN suffix as
 	// well, so the read count cannot fall by under-delivering.
 	const head, gap, classes = 400, 20, 3
-	reads := func(cohort int) int {
+	measure := func(cohort int) (reads int, encodes float64) {
 		f := newCohortFixture(t, head)
 		arrived := time.Now()
 		for i := 0; i < cohort; i++ {
@@ -62,10 +62,11 @@ func TestCatchupSharesOneReadPerCohort(t *testing.T) {
 			}
 			f.expect(t, c, want)
 		}
-		return f.tail.calls()
+		return f.tail.calls(), f.delivered.value("gateway_envelopes_encoded_total")
 	}
 	const small, large = 4, 16
-	smallReads, largeReads := reads(small), reads(large)
+	smallReads, smallEncodes := measure(small)
+	largeReads, largeEncodes := measure(large)
 	if largeReads > 2*smallReads {
 		t.Fatalf("catch-up reads scaled with the cohort: %d connections cost %d reads, "+
 			"%d connections cost %d — a reconnect storm must cost O(cohort reads), "+
@@ -78,8 +79,21 @@ func TestCatchupSharesOneReadPerCohort(t *testing.T) {
 	if smallReads < 1 {
 		t.Fatal("the cohort issued NO catch-up read; the resume gap would never be replayed")
 	}
-	t.Logf("cohort catch-up reads: %d connections → %d, %d connections → %d",
-		small, smallReads, large, largeReads)
+	// A shared read is a shared ENCODE too (#119's marshal-once, applied to the
+	// resume lane): the block's Envelopes are identical for every connection in
+	// the org, so a storm costs O(gap) marshals and not O(connections x gap).
+	if largeEncodes > 2*smallEncodes {
+		t.Fatalf("envelope encodes scaled with the cohort: %d connections cost %g, %d cost %g "+
+			"— the shared block must be marshaled once for the org, not once per connection",
+			small, smallEncodes, large, largeEncodes)
+	}
+	if largeEncodes < gap {
+		t.Fatalf("the cohort's %d-event gap was encoded %g times; the block must be encoded",
+			gap, largeEncodes)
+	}
+	t.Logf("cohort catch-up reads: %d connections → %d, %d connections → %d; "+
+		"envelope encodes: %g and %g for a %d-event gap",
+		small, smallReads, large, largeReads, smallEncodes, largeEncodes, gap)
 }
 
 // TestCatchupFarBehindResumerReadsAlone pins both halves of "sharing a read must

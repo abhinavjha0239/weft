@@ -138,6 +138,15 @@ func blockAfter(b *catchupBlock, lastID int64) []eventRow {
 // one read per read-latency instead of one per connection. The lock is NOT
 // sh.mu: this does a pool round trip, and holding the fan lock across it would
 // stall the org's whole multicast (S3's rule).
+//
+// The cost of holding it ACROSS the read is that one org's catch-up reads
+// serialise, and that is bounded by the same quantity the read count is — the
+// number of distinct CURSOR CLASSES resuming, never the number of connections.
+// A cursor is "the last event you could see", so a whole channel shares one
+// (measured: 12 connections, 4 classes; with a checkpoint in the window, 1). A
+// connection needing several batches releases the lock between them, so no
+// single resumer holds the lane, and the serialisation doubles as a bulkhead:
+// a storm can no longer put one parallel read per connection into the pool.
 func (h *Hub) catchUp(ctx context.Context, c *client) (batch []eventRow, more bool, err error) {
 	sh := c.shard
 	// Shared state is where cross-org bugs live, and this shares ROWS. The
