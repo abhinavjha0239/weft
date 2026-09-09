@@ -557,6 +557,15 @@ func (s *Service) PostToChannelAsAutomation(ctx context.Context, tx pgx.Tx, orgI
 	}
 	if err := s.perms.Require(ctx, tx,
 		auth.Identity{UserID: authorID, OrgID: orgID}, perms.VerbSendMessage, chain); err != nil {
+		// Only a REFUSAL is rewritten. Require also returns Internal (a failed
+		// closure query), and calling that "lacks send_message" would record a
+		// transient database fault in the step trace as a permission problem —
+		// the operator then hunts a grant that was never missing. Same rule the
+		// sibling channel-scope surface follows: mask the Forbidden, let the
+		// Internal ride through as itself.
+		if apperr.KindOf(err) != apperr.KindForbidden {
+			return 0, err
+		}
 		// Name WHO was refused WHERE. This error's only reader is the run's
 		// step trace (the runner is the sole caller — it never reaches an HTTP
 		// client, so there is no oracle to leak to), and "the rule quietly
